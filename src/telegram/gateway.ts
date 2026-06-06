@@ -11,7 +11,16 @@ import type { CodexEvent, ApprovalDecision } from "../types/events.js";
 import type { CodexModelSummary, CodexThreadSummary, CollaborationModeKind } from "../types/control.js";
 import { SessionManager } from "../runtime/session-manager.js";
 import { listWorkspaceProjects, resolveWorkspacePath, type WorkspaceProject } from "../runtime/workspace.js";
-import { appendAgentMessageChunk, formatAction, formatAgentMessage, formatLogs, formatSessions, truncateMiddle } from "./format.js";
+import {
+  appendAgentMessageChunk,
+  formatAction,
+  formatAgentMessage,
+  formatLogs,
+  formatSessions,
+  formatStatus,
+  formatUsage,
+  truncateMiddle
+} from "./format.js";
 import type { ProbeResult, TmuxPane } from "../adapters/pty-adapter.js";
 import { requestUserInputQuestions } from "../adapters/app-server-protocol.js";
 
@@ -49,6 +58,7 @@ export class TelegramGateway {
     void this.forwardCodexEvents();
     await this.bot.api.setMyCommands([
       { command: "status", description: "Show active Codex session" },
+      { command: "panel", description: "Show session control panel" },
       { command: "sessions", description: "List local sessions" },
       { command: "new", description: "Start a new Codex session" },
       { command: "resume", description: "Resume a previous Codex thread" },
@@ -64,6 +74,7 @@ export class TelegramGateway {
       { command: "tmux", description: "Attach tmux fallback session" },
       { command: "testinput", description: "Test tmux fallback input" },
       { command: "log", description: "Show recent session log" },
+      { command: "usage", description: "Show active session token usage" },
       { command: "transcript", description: "Export active session transcript" },
       { command: "approve", description: "Approve a pending request by id" },
       { command: "deny", description: "Deny a pending request by id" },
@@ -83,6 +94,7 @@ export class TelegramGateway {
       await ctx.reply(
         [
           "/status - active session",
+          "/panel - session control panel",
           "/sessions - list and control sessions",
           "/new - pick a workspace project",
           "/new <project-or-path> - start app-server session in a workspace folder",
@@ -100,6 +112,7 @@ export class TelegramGateway {
           "/tmux - list tmux panes to attach as a fallback",
           "/testinput - test tmux input/submit readiness",
           "/log [n] - recent logs",
+          "/usage - current token usage",
           "/transcript - export full active transcript",
           "/pause and /unpause - toggle forwarding",
           "/kill - interrupt active session",
@@ -110,7 +123,11 @@ export class TelegramGateway {
 
     this.bot.command("status", async (ctx) => {
       const active = this.sessions.getActiveSession();
-      await ctx.reply(active ? formatSessions([active]) : "No active Codex session.");
+      await ctx.reply(active ? this.statusText(active) : "No active Codex session.");
+    });
+
+    this.bot.command("panel", async (ctx) => {
+      await this.showPanel(ctx);
     });
 
     this.bot.command("sessions", async (ctx) => {
@@ -253,6 +270,15 @@ export class TelegramGateway {
       await ctx.reply(formatLogs(logs));
     });
 
+    this.bot.command("usage", async (ctx) => {
+      const active = this.sessions.getActiveSession();
+      if (!active) {
+        await ctx.reply("No active session.");
+        return;
+      }
+      await ctx.reply(formatUsage(this.store.getTokenUsage(active.id)));
+    });
+
     this.bot.command("transcript", async (ctx) => {
       await this.sendTranscript(ctx);
     });
@@ -318,6 +344,76 @@ export class TelegramGateway {
         await ctx.answerCallbackQuery({ text: error instanceof Error ? error.message : "Rejected.", show_alert: true });
       }
     });
+
+    this.bot.callbackQuery(/^panel:/, async (ctx) => {
+      const [, action] = String(ctx.callbackQuery.data).split(":");
+      try {
+        if (action === "refresh") {
+          await ctx.answerCallbackQuery({ text: "Refreshed." });
+          await this.editOrReplyPanel(ctx);
+          return;
+        }
+        if (action === "status") {
+          const active = this.sessions.getActiveSession();
+          await ctx.answerCallbackQuery();
+          await ctx.reply(active ? this.statusText(active) : "No active session.");
+          return;
+        }
+        if (action === "usage") {
+          const active = this.sessions.getActiveSession();
+          await ctx.answerCallbackQuery();
+          await ctx.reply(active ? formatUsage(this.store.getTokenUsage(active.id)) : "No active session.");
+          return;
+        }
+        if (action === "new") {
+          await ctx.answerCallbackQuery({ text: "Choose a project." });
+          await this.showWorkspacePicker(ctx);
+          return;
+        }
+        if (action === "resume") {
+          await ctx.answerCallbackQuery({ text: "Choose a thread." });
+          await this.showThreadPicker(ctx);
+          return;
+        }
+        if (action === "models") {
+          await ctx.answerCallbackQuery({ text: "Choose a model." });
+          await this.showModelPicker(ctx);
+          return;
+        }
+        if (action === "plan") {
+          await this.sessions.setMode("plan");
+          await ctx.answerCallbackQuery({ text: "Plan mode enabled." });
+          await this.editOrReplyPanel(ctx);
+          return;
+        }
+        if (action === "default") {
+          await this.sessions.setMode("default");
+          await ctx.answerCallbackQuery({ text: "Default mode enabled." });
+          await this.editOrReplyPanel(ctx);
+          return;
+        }
+        if (action === "pause") {
+          this.sessions.pause();
+          await ctx.answerCallbackQuery({ text: "Paused." });
+          await this.editOrReplyPanel(ctx);
+          return;
+        }
+        if (action === "unpause") {
+          this.sessions.resume();
+          await ctx.answerCallbackQuery({ text: "Input resumed." });
+          await this.editOrReplyPanel(ctx);
+          return;
+        }
+        if (action === "transcript") {
+          await ctx.answerCallbackQuery({ text: "Exporting transcript." });
+          await this.sendTranscript(ctx);
+          return;
+        }
+      } catch (error) {
+        await ctx.answerCallbackQuery({ text: error instanceof Error ? error.message : "Panel action failed.", show_alert: true });
+      }
+    });
+
 
     this.bot.callbackQuery(/^replyhint:/, async (ctx) => {
       await ctx.answerCallbackQuery({
@@ -477,6 +573,41 @@ export class TelegramGateway {
   private async showWorkspacePicker(ctx: Context): Promise<void> {
     const [text, options] = await this.workspacePickerMessage();
     await ctx.reply(text, options);
+  }
+
+  private async showPanel(ctx: Context): Promise<void> {
+    const active = this.sessions.getActiveSession();
+    await ctx.reply(active ? this.panelText(active) : "No active Codex session.", { reply_markup: panelKeyboard(active) });
+  }
+
+  private async editOrReplyPanel(ctx: Context): Promise<void> {
+    const active = this.sessions.getActiveSession();
+    const text = active ? this.panelText(active) : "No active Codex session.";
+    try {
+      await ctx.editMessageText(text, { reply_markup: panelKeyboard(active) });
+    } catch {
+      await ctx.reply(text, { reply_markup: panelKeyboard(active) });
+    }
+  }
+
+  private statusText(session: StoredSession): string {
+    return formatStatus(session, this.store.countPendingActions(session.id), this.store.getTokenUsage(session.id));
+  }
+
+  private panelText(session: StoredSession): string {
+    const usage = this.store.getTokenUsage(session.id);
+    const pending = this.store.countPendingActions(session.id);
+    return [
+      "tele-codex panel",
+      "",
+      `${session.label}`,
+      `${session.adapter} | ${session.status}${session.paused ? " | paused" : ""}`,
+      session.cwd,
+      `pending: ${pending}`,
+      usage ? `usage: ${usage.total.totalTokens.toLocaleString("en-US")} tokens` : "usage: none yet"
+    ]
+      .filter(Boolean)
+      .join("\n");
   }
 
   private async sendStartupPicker(): Promise<void> {
@@ -756,6 +887,28 @@ function sessionsKeyboard(sessions: StoredSession[]): InlineKeyboard {
       .text("Kill", `sess:kill:${session.id}`)
       .row();
   });
+  return keyboard;
+}
+
+function panelKeyboard(session?: StoredSession): InlineKeyboard {
+  const keyboard = new InlineKeyboard()
+    .text("Refresh", "panel:refresh")
+    .text("Status", "panel:status")
+    .text("Usage", "panel:usage")
+    .row()
+    .text("New", "panel:new")
+    .text("Resume", "panel:resume")
+    .text("Model", "panel:models")
+    .row()
+    .text("Plan", "panel:plan")
+    .text("Default", "panel:default")
+    .row();
+  if (session) {
+    keyboard
+      .text(session.paused ? "Resume input" : "Pause input", `panel:${session.paused ? "unpause" : "pause"}`)
+      .text("Transcript", "panel:transcript")
+      .row();
+  }
   return keyboard;
 }
 

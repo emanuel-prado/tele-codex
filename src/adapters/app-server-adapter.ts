@@ -11,7 +11,8 @@ import type { StoredSession } from "../store/store.js";
 import {
   buildMcpElicitationResponse,
   buildRequestUserInputResponse,
-  formatRequestUserInput
+  formatRequestUserInput,
+  parseTokenUsage
 } from "./app-server-protocol.js";
 
 export class AppServerAdapter implements CodexAdapter {
@@ -365,6 +366,20 @@ export class AppServerAdapter implements CodexAdapter {
     if (message.method === "thread/status/changed") {
       const status = typeof params.status === "string" ? params.status : "updated";
       this.store.appendLog({ sessionId, type: "thread.status", severity: "info", text: status });
+      return;
+    }
+
+    if (message.method === "thread/tokenUsage/updated") {
+      const usage = parseTokenUsage(params);
+      if (usage) {
+        this.store.setTokenUsage(sessionId, usage);
+        this.store.appendLog({
+          sessionId,
+          type: "thread.usage",
+          severity: "debug",
+          text: `total ${usage.total.totalTokens}, last ${usage.last.totalTokens}`
+        });
+      }
       return;
     }
 

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { appendAgentMessageChunk, formatAgentMessage, truncateMiddle } from "../src/telegram/format.js";
+import { appendAgentMessageChunk, formatAgentMessage, formatStatus, formatUsage, truncateMiddle } from "../src/telegram/format.js";
 
 describe("Telegram formatting", () => {
   it("keeps short messages unchanged", () => {
@@ -70,5 +70,67 @@ describe("Telegram formatting", () => {
     const text = ["first", "second"].reduce((buffer, chunk) => appendAgentMessageChunk(buffer, chunk, session), "");
 
     expect(text).toBe("first\nsecond");
+  });
+
+  it("formats session status with pending count and usage", () => {
+    const formatted = formatStatus(
+      {
+        id: "s",
+        adapter: "appserver",
+        label: "project",
+        status: "active",
+        paused: false,
+        createdAt: 1,
+        updatedAt: 2,
+        cwd: "/workspace/project",
+        codexThreadId: "thread_1"
+      },
+      2,
+      {
+        total: {
+          totalTokens: 1000,
+          inputTokens: 700,
+          cachedInputTokens: 300,
+          outputTokens: 300,
+          reasoningOutputTokens: 20
+        },
+        last: {
+          totalTokens: 100,
+          inputTokens: 80,
+          cachedInputTokens: 50,
+          outputTokens: 20,
+          reasoningOutputTokens: 5
+        },
+        modelContextWindow: 2000,
+        updatedAt: 3
+      }
+    );
+
+    expect(formatted).toContain("pending: 2");
+    expect(formatted).toContain("usage: 1,000 / 2,000 tokens; last 100");
+  });
+
+  it("formats token usage details", () => {
+    const formatted = formatUsage({
+      total: {
+        totalTokens: 1000,
+        inputTokens: 700,
+        cachedInputTokens: 300,
+        outputTokens: 300,
+        reasoningOutputTokens: 20
+      },
+      last: {
+        totalTokens: 100,
+        inputTokens: 80,
+        cachedInputTokens: 50,
+        outputTokens: 20,
+        reasoningOutputTokens: 5
+      },
+      updatedAt: 3
+    });
+
+    expect(formatted).toContain("total: 1,000");
+    expect(formatted).toContain("input: 700 (300 cached)");
+    expect(formatted).toContain("last turn: 100 total");
   });
 });

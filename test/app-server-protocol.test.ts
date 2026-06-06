@@ -3,6 +3,7 @@ import {
   buildMcpElicitationResponse,
   buildRequestUserInputResponse,
   formatRequestUserInput,
+  parseTokenUsage,
   requestUserInputQuestions
 } from "../src/adapters/app-server-protocol.js";
 import type { PendingAction } from "../src/types/events.js";
@@ -84,6 +85,50 @@ describe("app-server protocol helpers", () => {
       action: "decline",
       content: null,
       _meta: null
+    });
+  });
+
+  it("parses app-server token usage notifications", () => {
+    expect(
+      parseTokenUsage(
+        {
+          tokenUsage: {
+            total: {
+              totalTokens: 100,
+              inputTokens: 70,
+              cachedInputTokens: 20,
+              outputTokens: 30,
+              reasoningOutputTokens: 5
+            },
+            last: {
+              totalTokens: 25,
+              inputTokens: 15,
+              cachedInputTokens: 10,
+              outputTokens: 10,
+              reasoningOutputTokens: 2
+            },
+            modelContextWindow: 1000
+          }
+        },
+        123
+      )
+    ).toEqual({
+      total: {
+        totalTokens: 100,
+        inputTokens: 70,
+        cachedInputTokens: 20,
+        outputTokens: 30,
+        reasoningOutputTokens: 5
+      },
+      last: {
+        totalTokens: 25,
+        inputTokens: 15,
+        cachedInputTokens: 10,
+        outputTokens: 10,
+        reasoningOutputTokens: 2
+      },
+      modelContextWindow: 1000,
+      updatedAt: 123
     });
   });
 });

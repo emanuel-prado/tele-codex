@@ -1,4 +1,5 @@
 import Database from "better-sqlite3";
+import type { SessionTokenUsage } from "../types/control.js";
 import type { AdapterKind, LogEntry, PendingAction, SessionRef, SessionStatus } from "../types/events.js";
 
 export interface StoredSession extends SessionRef {
@@ -157,6 +158,60 @@ export class Store {
     return row ? mapPendingAction(row) : undefined;
   }
 
+  countPendingActions(sessionId: string): number {
+    const row = this.db
+      .prepare("select count(*) as count from pending_actions where session_id = ? and status = 'pending' and expires_at > ?")
+      .get(sessionId, Date.now()) as { count: number };
+    return Number(row.count);
+  }
+
+  setTokenUsage(sessionId: string, usage: Omit<SessionTokenUsage, "updatedAt"> & { updatedAt?: number }): void {
+    this.db
+      .prepare(
+        `insert into token_usage
+          (session_id, updated_at, total_tokens, input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens,
+           last_total_tokens, last_input_tokens, last_cached_input_tokens, last_output_tokens, last_reasoning_output_tokens,
+           model_context_window)
+         values
+          (@sessionId, @updatedAt, @totalTokens, @inputTokens, @cachedInputTokens, @outputTokens, @reasoningOutputTokens,
+           @lastTotalTokens, @lastInputTokens, @lastCachedInputTokens, @lastOutputTokens, @lastReasoningOutputTokens,
+           @modelContextWindow)
+         on conflict(session_id) do update set
+           updated_at=excluded.updated_at,
+           total_tokens=excluded.total_tokens,
+           input_tokens=excluded.input_tokens,
+           cached_input_tokens=excluded.cached_input_tokens,
+           output_tokens=excluded.output_tokens,
+           reasoning_output_tokens=excluded.reasoning_output_tokens,
+           last_total_tokens=excluded.last_total_tokens,
+           last_input_tokens=excluded.last_input_tokens,
+           last_cached_input_tokens=excluded.last_cached_input_tokens,
+           last_output_tokens=excluded.last_output_tokens,
+           last_reasoning_output_tokens=excluded.last_reasoning_output_tokens,
+           model_context_window=excluded.model_context_window`
+      )
+      .run({
+        sessionId,
+        updatedAt: usage.updatedAt ?? Date.now(),
+        totalTokens: usage.total.totalTokens,
+        inputTokens: usage.total.inputTokens,
+        cachedInputTokens: usage.total.cachedInputTokens,
+        outputTokens: usage.total.outputTokens,
+        reasoningOutputTokens: usage.total.reasoningOutputTokens,
+        lastTotalTokens: usage.last.totalTokens,
+        lastInputTokens: usage.last.inputTokens,
+        lastCachedInputTokens: usage.last.cachedInputTokens,
+        lastOutputTokens: usage.last.outputTokens,
+        lastReasoningOutputTokens: usage.last.reasoningOutputTokens,
+        modelContextWindow: usage.modelContextWindow ?? null
+      });
+  }
+
+  getTokenUsage(sessionId: string): SessionTokenUsage | undefined {
+    const row = this.db.prepare("select * from token_usage where session_id = ?").get(sessionId) as Row | undefined;
+    return row ? mapTokenUsage(row) : undefined;
+  }
+
   resolvePendingAction(actionId: string, status: "resolved" | "expired" | "cancelled"): void {
     this.db
       .prepare("update pending_actions set status = ?, resolved_at = ? where id = ?")
@@ -289,6 +344,22 @@ export class Store {
         text text not null,
         metadata_json text
       );
+
+      create table if not exists token_usage (
+        session_id text primary key,
+        updated_at integer not null,
+        total_tokens integer not null,
+        input_tokens integer not null,
+        cached_input_tokens integer not null,
+        output_tokens integer not null,
+        reasoning_output_tokens integer not null,
+        last_total_tokens integer not null,
+        last_input_tokens integer not null,
+        last_cached_input_tokens integer not null,
+        last_output_tokens integer not null,
+        last_reasoning_output_tokens integer not null,
+        model_context_window integer
+      );
     `);
     this.addColumnIfMissing("sessions", "attach_status", "text");
     this.addColumnIfMissing("sessions", "submit_strategy", "text");
@@ -354,4 +425,26 @@ function mapLog(row: Row): LogEntry {
     text: String(row.text),
     payload: payloadJson ? JSON.parse(payloadJson) : undefined
   };
+}
+
+function mapTokenUsage(row: Row): SessionTokenUsage {
+  const usage: SessionTokenUsage = {
+    total: {
+      totalTokens: Number(row.total_tokens),
+      inputTokens: Number(row.input_tokens),
+      cachedInputTokens: Number(row.cached_input_tokens),
+      outputTokens: Number(row.output_tokens),
+      reasoningOutputTokens: Number(row.reasoning_output_tokens)
+    },
+    last: {
+      totalTokens: Number(row.last_total_tokens),
+      inputTokens: Number(row.last_input_tokens),
+      cachedInputTokens: Number(row.last_cached_input_tokens),
+      outputTokens: Number(row.last_output_tokens),
+      reasoningOutputTokens: Number(row.last_reasoning_output_tokens)
+    },
+    updatedAt: Number(row.updated_at)
+  };
+  if (row.model_context_window) usage.modelContextWindow = Number(row.model_context_window);
+  return usage;
 }

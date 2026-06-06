@@ -1,4 +1,5 @@
 import type { PendingAction } from "../types/events.js";
+import type { SessionTokenUsage, TokenUsageBreakdown } from "../types/control.js";
 
 export interface UserInputQuestion {
   id: string;
@@ -66,6 +67,17 @@ export function buildMcpElicitationResponse(decision: string): unknown {
   };
 }
 
+export function parseTokenUsage(payload: unknown, updatedAt = Date.now()): SessionTokenUsage | undefined {
+  const record = asRecord(payload);
+  const usage = asRecord(record.tokenUsage);
+  const total = parseBreakdown(usage.total);
+  const last = parseBreakdown(usage.last);
+  if (!total || !last) return undefined;
+  const parsed: SessionTokenUsage = { total, last, updatedAt };
+  if (typeof usage.modelContextWindow === "number") parsed.modelContextWindow = usage.modelContextWindow;
+  return parsed;
+}
+
 function formatQuestion(question: UserInputQuestion): string {
   const lines = [
     question.header ? `${question.header}` : undefined,
@@ -95,6 +107,22 @@ function parseQuestionOptions(raw: unknown): UserInputOption[] {
     if (typeof record.description === "string" && record.description.trim()) parsed.description = record.description;
     return [parsed];
   });
+}
+
+function parseBreakdown(value: unknown): TokenUsageBreakdown | undefined {
+  const record = asRecord(value);
+  if (typeof record.totalTokens !== "number") return undefined;
+  return {
+    totalTokens: record.totalTokens,
+    inputTokens: numberField(record.inputTokens),
+    cachedInputTokens: numberField(record.cachedInputTokens),
+    outputTokens: numberField(record.outputTokens),
+    reasoningOutputTokens: numberField(record.reasoningOutputTokens)
+  };
+}
+
+function numberField(value: unknown): number {
+  return typeof value === "number" ? value : 0;
 }
 
 function actionParams(payload: unknown): Record<string, unknown> {

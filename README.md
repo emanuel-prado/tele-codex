@@ -78,6 +78,7 @@ Manual project paths passed to `/new` must stay inside `TELE_CODEX_WORKSPACE_ROO
 Core:
 
 - `/status` shows the active session.
+- `/panel` shows a Telegram control panel for common actions.
 - `/sessions` lists local bridge sessions with controls.
 - `/new` opens a workspace project picker.
 - `/new <project-or-path>` starts an app-server session in a workspace folder.
@@ -100,6 +101,7 @@ App-server controls:
 Session utilities:
 
 - `/log [n]` shows recent logs.
+- `/usage` shows the latest token usage reported by app-server.
 - `/transcript` exports the active session transcript.
 - `/pause` and `/unpause` toggle Telegram input forwarding.
 - `/kill` interrupts the active session after confirmation.
@@ -147,5 +149,7 @@ The project is intentionally small:
 ## Adapter Notes
 
 App-server is the primary adapter because it exposes structured JSON-RPC events and controls for approvals, thread resume, model selection, collaboration mode, and compaction.
+
+Token usage is captured from app-server `thread/tokenUsage/updated` notifications. `/usage`, `/status`, and `/panel` show the latest usage snapshot once Codex has reported one for the active thread.
 
 PTY/tmux is fallback-only. Terminal output parsing and submit-key behavior depend on the Codex TUI and the local terminal stack, so tmux attachment remains best-effort.
