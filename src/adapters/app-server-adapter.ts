@@ -8,6 +8,11 @@ import { AsyncQueue } from "../utils/async-queue.js";
 import { createId, createNonce, nowMs } from "../utils/ids.js";
 import { Store } from "../store/store.js";
 import type { StoredSession } from "../store/store.js";
+import {
+  buildMcpElicitationResponse,
+  buildRequestUserInputResponse,
+  formatRequestUserInput
+} from "./app-server-protocol.js";
 
 export class AppServerAdapter implements CodexAdapter {
   readonly kind = "appserver" as const;
@@ -148,8 +153,9 @@ export class AppServerAdapter implements CodexAdapter {
     if (!action?.requestId) throw new Error("Pending app-server action not found.");
 
     if (action.kind === "question") {
-      const answers = decision.text ? { reply: { type: "text", text: decision.text } } : {};
-      this.rpc.respond(action.requestId, { answers });
+      this.rpc.respond(action.requestId, buildRequestUserInputResponse(action, decision.text ?? ""));
+    } else if (action.kind === "mcpElicitation") {
+      this.rpc.respond(action.requestId, buildMcpElicitationResponse(decision.decision));
     } else {
       const responseDecision = decision.decision === "acceptForSession" ? "acceptForSession" : decision.decision;
       this.rpc.respond(action.requestId, { decision: responseDecision });
@@ -408,7 +414,7 @@ function makeActionFromServerRequest(
   const title = kind === "question" ? "Codex asks" : "Codex approval required";
   const body =
     kind === "question"
-      ? formatQuestion(params)
+      ? formatRequestUserInput({ params })
       : [reason, command ? `Command:\n${command}` : undefined, params.cwd ? `cwd: ${String(params.cwd)}` : undefined]
           .filter(Boolean)
           .join("\n\n");
@@ -428,18 +434,6 @@ function makeActionFromServerRequest(
   if (typeof params.turnId === "string") action.turnId = params.turnId;
   if (typeof params.itemId === "string") action.itemId = params.itemId;
   return action;
-}
-
-function formatQuestion(params: Record<string, unknown>): string {
-  const questions = Array.isArray(params.questions) ? params.questions : [];
-  if (questions.length === 0) return JSON.stringify(params);
-  return questions
-    .map((question, index) => {
-      const record = asRecord(question);
-      const label = typeof record.question === "string" ? record.question : `Question ${index + 1}`;
-      return `${index + 1}. ${label}`;
-    })
-    .join("\n");
 }
 
 function asRecord(value: unknown): Record<string, unknown> {

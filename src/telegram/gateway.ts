@@ -13,6 +13,7 @@ import { SessionManager } from "../runtime/session-manager.js";
 import { listWorkspaceProjects, resolveWorkspacePath, type WorkspaceProject } from "../runtime/workspace.js";
 import { appendAgentMessageChunk, formatAction, formatAgentMessage, formatLogs, formatSessions, truncateMiddle } from "./format.js";
 import type { ProbeResult, TmuxPane } from "../adapters/pty-adapter.js";
+import { requestUserInputQuestions } from "../adapters/app-server-protocol.js";
 
 export class TelegramGateway {
   private readonly bot: Bot;
@@ -316,6 +317,13 @@ export class TelegramGateway {
       } catch (error) {
         await ctx.answerCallbackQuery({ text: error instanceof Error ? error.message : "Rejected.", show_alert: true });
       }
+    });
+
+    this.bot.callbackQuery(/^replyhint:/, async (ctx) => {
+      await ctx.answerCallbackQuery({
+        text: "Send your answer as a normal Telegram message. It will answer the pending Codex question.",
+        show_alert: true
+      });
     });
 
     this.bot.callbackQuery(/^kill:/, async (ctx) => {
@@ -711,13 +719,15 @@ export class TelegramGateway {
   private actionKeyboard(action: { id: string; nonce: string; kind: string; payload?: unknown }): InlineKeyboard {
     if (action.kind === "question") {
       const keyboard = new InlineKeyboard();
-      const choices = extractQuestionChoices(action.payload);
-      choices.slice(0, 8).forEach((choice) => {
-        const selectionId = Math.random().toString(36).slice(2, 10);
-        this.answerSelections.set(selectionId, { actionId: action.id, nonce: action.nonce, text: choice });
-        keyboard.text(choice.slice(0, 48), `answer:${selectionId}`).row();
-      });
-      keyboard.text("Reply in chat", `act:${action.id}:${action.nonce}:cancel`);
+      const questions = requestUserInputQuestions(action.payload);
+      if (questions.length === 1) {
+        questions[0]!.options.slice(0, 8).forEach((choice) => {
+          const selectionId = Math.random().toString(36).slice(2, 10);
+          this.answerSelections.set(selectionId, { actionId: action.id, nonce: action.nonce, text: choice.label });
+          keyboard.text(choice.label.slice(0, 48), `answer:${selectionId}`).row();
+        });
+      }
+      keyboard.text("Reply in chat", `replyhint:${action.id}`);
       return keyboard;
     }
     return new InlineKeyboard()
@@ -832,35 +842,4 @@ function parseAdapterCommand(match: string | undefined): { adapter?: "appserver"
   if (value.startsWith("appserver ")) return { adapter: "appserver", rest: value.slice(10).trim() };
   if (value === "pty" || value === "appserver") return { adapter: value, rest: "" };
   return { rest: value };
-}
-
-function extractQuestionChoices(payload: unknown): string[] {
-  const record = asRecord(payload);
-  const params = asRecord(record.params);
-  const questions = Array.isArray(params.questions) ? params.questions : [];
-  const choices: string[] = [];
-  for (const question of questions) {
-    const item = asRecord(question);
-    const rawChoices = Array.isArray(item.options)
-      ? item.options
-      : Array.isArray(item.choices)
-        ? item.choices
-        : Array.isArray(item.answers)
-          ? item.answers
-          : [];
-    for (const rawChoice of rawChoices) {
-      if (typeof rawChoice === "string") {
-        choices.push(rawChoice);
-      } else {
-        const choice = asRecord(rawChoice);
-        const label = choice.label ?? choice.value ?? choice.text ?? choice.title;
-        if (typeof label === "string") choices.push(label);
-      }
-    }
-  }
-  return [...new Set(choices)];
-}
-
-function asRecord(value: unknown): Record<string, unknown> {
-  return value && typeof value === "object" ? (value as Record<string, unknown>) : {};
 }
