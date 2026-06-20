@@ -21,4 +21,16 @@ describe("JsonRpcClient", () => {
 
     await expect(client.request("initialize")).rejects.toThrow(/Codex app-server (stdin failed|exited before responding)/);
   });
+
+  it("bounds requests when app-server stays silent", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "tele-codex-rpc-timeout-"));
+    const command = join(dir, "fake-codex");
+    await writeFile(command, "#!/bin/sh\nsleep 5\n");
+    await chmod(command, 0o755);
+
+    const client = new JsonRpcClient(logger as never, 20);
+    await client.connectStdio(command);
+    await expect(client.request("initialize")).rejects.toThrow(/timed out after 20ms/);
+    client.close();
+  });
 });

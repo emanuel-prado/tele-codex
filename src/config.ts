@@ -14,6 +14,8 @@ const envSchema = z.object({
   TELE_CODEX_DEFAULT_ADAPTER: adapterSchema.optional().default("appserver"),
   TELE_CODEX_LOG_LEVEL: z.string().optional().default("info"),
   TELE_CODEX_APPROVAL_TIMEOUT_MS: z.coerce.number().int().positive().optional().default(900_000),
+  TELE_CODEX_RPC_TIMEOUT_MS: z.coerce.number().int().positive().optional().default(30_000),
+  TELE_CODEX_RATE_LIMIT_WARN_PERCENT: z.coerce.number().min(1).max(100).optional().default(80),
   TELE_CODEX_ALLOW_SESSION_GRANTS: z
     .enum(["true", "false"])
     .optional()
@@ -35,6 +37,8 @@ export interface AppConfig {
   defaultAdapter: AdapterKind;
   logLevel: string;
   approvalTimeoutMs: number;
+  rpcTimeoutMs: number;
+  rateLimitWarnPercent: number;
   allowSessionGrants: boolean;
   codexCommand: string;
   ptySubmitKey: string;
@@ -57,6 +61,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     defaultAdapter: parsed.TELE_CODEX_DEFAULT_ADAPTER,
     logLevel: parsed.TELE_CODEX_LOG_LEVEL,
     approvalTimeoutMs: parsed.TELE_CODEX_APPROVAL_TIMEOUT_MS,
+    rpcTimeoutMs: parsed.TELE_CODEX_RPC_TIMEOUT_MS,
+    rateLimitWarnPercent: parsed.TELE_CODEX_RATE_LIMIT_WARN_PERCENT,
     allowSessionGrants: parsed.TELE_CODEX_ALLOW_SESSION_GRANTS,
     codexCommand: parsed.TELE_CODEX_CODEX_COMMAND,
     ptySubmitKey: parsed.TELE_CODEX_PTY_SUBMIT_KEY,

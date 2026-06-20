@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { appendAgentMessageChunk, formatAgentMessage, formatStatus, formatUsage, truncateMiddle } from "../src/telegram/format.js";
+import {
+  appendAgentMessageChunk,
+  formatAgentMessage,
+  formatStatus,
+  formatThreads,
+  formatUsage,
+  truncateMiddle
+} from "../src/telegram/format.js";
 
 describe("Telegram formatting", () => {
   it("keeps short messages unchanged", () => {
@@ -132,5 +139,22 @@ describe("Telegram formatting", () => {
     expect(formatted).toContain("total: 1,000");
     expect(formatted).toContain("input: 700 (300 cached)");
     expect(formatted).toContain("last turn: 100 total");
+  });
+
+  it("formats resumable sessions with workspace and update context", () => {
+    const formatted = formatThreads([
+      {
+        id: "thread_1",
+        name: "Resume command",
+        cwd: "/home/me/Workspace/tele-codex",
+        updatedAt: 1_700_000_000
+      }
+    ]);
+
+    expect(formatted).toContain("Previous Codex sessions");
+    expect(formatted).toContain("Resume command");
+    expect(formatted).toContain("/home/me/Workspace/tele-codex");
+    expect(formatted).toContain("2023-11-14T22:13:20.000Z");
+    expect(formatted).toContain("/resume last");
   });
 });

@@ -14,20 +14,25 @@ export interface JsonRpcMessage {
 interface PendingRequest {
   resolve: (value: unknown) => void;
   reject: (error: Error) => void;
+  timer: NodeJS.Timeout;
 }
 
 export class JsonRpcClient extends EventEmitter {
   private nextId = 1;
   private readonly pending = new Map<string | number, PendingRequest>();
-  private child?: ChildProcessWithoutNullStreams;
-  private socket?: WebSocket;
+  private child: ChildProcessWithoutNullStreams | undefined;
+  private socket: WebSocket | undefined;
   private buffer = "";
 
-  constructor(private readonly logger: Logger) {
+  constructor(
+    private readonly logger: Logger,
+    private readonly requestTimeoutMs = 30_000
+  ) {
     super();
   }
 
   async connectStdio(command: string): Promise<void> {
+    this.close();
     this.child = spawn(command, ["app-server", "--listen", "stdio://"], {
       stdio: ["pipe", "pipe", "pipe"],
       env: process.env
@@ -43,20 +48,34 @@ export class JsonRpcClient extends EventEmitter {
     this.child.stdin.on("error", (error) => {
       this.rejectPending(new Error(`Codex app-server stdin failed: ${error.message}`));
     });
+    this.child.on("error", (error) => {
+      this.rejectPending(new Error(`Codex app-server failed to start: ${error.message}`));
+      this.child = undefined;
+      this.emit("close", { error });
+    });
     this.child.on("exit", (code, signal) => {
       this.rejectPending(new Error(`Codex app-server exited before responding: code=${code ?? "unknown"} signal=${signal ?? "none"}`));
+      this.child = undefined;
       this.emit("close", { code, signal });
     });
   }
 
   async connectWebSocket(url: string, token?: string): Promise<void> {
+    this.close();
     await new Promise<void>((resolve, reject) => {
       const headers = token ? { Authorization: `Bearer ${token}` } : undefined;
       this.socket = new WebSocket(url, { headers });
       this.socket.on("open", () => resolve());
-      this.socket.on("error", reject);
+      this.socket.on("error", (error) => {
+        this.rejectPending(error);
+        reject(error);
+      });
       this.socket.on("message", (data) => this.consume(data.toString()));
-      this.socket.on("close", (code, reason) => this.emit("close", { code, reason: reason.toString() }));
+      this.socket.on("close", (code, reason) => {
+        this.rejectPending(new Error(`Codex app-server websocket closed: ${code} ${reason.toString()}`));
+        this.socket = undefined;
+        this.emit("close", { code, reason: reason.toString() });
+      });
     });
   }
 
@@ -66,8 +85,18 @@ export class JsonRpcClient extends EventEmitter {
     if (params !== undefined) message.params = params;
 
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
-      this.send(message);
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`Codex app-server request timed out after ${this.requestTimeoutMs}ms: ${method}`));
+      }, this.requestTimeoutMs);
+      this.pending.set(id, { resolve, reject, timer });
+      try {
+        this.send(message);
+      } catch (error) {
+        clearTimeout(timer);
+        this.pending.delete(id);
+        reject(error);
+      }
     });
   }
 
@@ -88,6 +117,8 @@ export class JsonRpcClient extends EventEmitter {
   close(): void {
     this.socket?.close();
     this.child?.kill();
+    this.socket = undefined;
+    this.child = undefined;
   }
 
   private send(message: JsonRpcMessage): void {
@@ -97,6 +128,7 @@ export class JsonRpcClient extends EventEmitter {
       return;
     }
     if (this.child) {
+      if (this.child.killed || this.child.stdin.destroyed) throw new Error("JSON-RPC stdio transport is closed.");
       const ok = this.child.stdin.write(serialized);
       if (!ok) {
         this.child.stdin.once("drain", () => undefined);
@@ -109,6 +141,7 @@ export class JsonRpcClient extends EventEmitter {
   private rejectPending(error: Error): void {
     for (const [id, pending] of this.pending.entries()) {
       this.pending.delete(id);
+      clearTimeout(pending.timer);
       pending.reject(error);
     }
   }
@@ -138,6 +171,7 @@ export class JsonRpcClient extends EventEmitter {
       const pending = this.pending.get(message.id);
       if (!pending) return;
       this.pending.delete(message.id);
+      clearTimeout(pending.timer);
       if (message.error) pending.reject(new Error(message.error.message));
       else pending.resolve(message.result);
       return;

@@ -13,9 +13,12 @@ The default path is Codex app-server over JSON-RPC. A PTY/tmux adapter is availa
 - Telegram bot over long polling, with no public webhook.
 - Telegram user allow-list, with optional chat ID restriction.
 - App-server session creation from project folders under `~/Workspace`.
-- Previous app-server thread listing and resume.
+- Previous Codex session listing and resume across workspaces.
 - Model selection, plan/default mode switching, context compaction, and thread archive controls.
 - Approval, question, completion, error, and blocked-state notifications.
+- Sequential multi-question and MCP form completion from Telegram.
+- Durable high-signal notification delivery with retry and restart recovery.
+- Goals, account limits, turn plans/diffs, thread search, and background-process controls.
 - SQLite persistence for sessions, pending actions, event logs, transcripts, and session grants.
 - Full transcript export with Telegram-safe message truncation for live output.
 - Fallback PTY/tmux attachment with input probing.
@@ -56,6 +59,13 @@ npm run build
 npm start
 ```
 
+To check local setup without starting the Telegram bot:
+
+```bash
+npm run build
+node dist/cli.js doctor
+```
+
 ## Configuration
 
 | Variable | Default | Purpose |
@@ -70,6 +80,8 @@ npm start
 | `TELE_CODEX_APP_SERVER_URL` | unset | Optional remote app-server websocket URL. |
 | `TELE_CODEX_PTY_SUBMIT_KEY` | `enter` | Submit strategy for PTY/tmux fallback. |
 | `TELE_CODEX_ALLOW_SESSION_GRANTS` | `true` | Enables “approve for session.” |
+| `TELE_CODEX_RPC_TIMEOUT_MS` | `30000` | Maximum wait for an app-server JSON-RPC response. |
+| `TELE_CODEX_RATE_LIMIT_WARN_PERCENT` | `80` | First account-limit warning threshold. |
 
 Manual project paths passed to `/new` must stay inside `TELE_CODEX_WORKSPACE_ROOT`.
 
@@ -87,9 +99,10 @@ Core:
 
 App-server controls:
 
-- `/resume` lists previous app-server threads.
-- `/resume <threadId|localSessionId>` resumes a previous app-server thread.
-- `/threads` lists previous app-server threads.
+- `/resume` lists recent interactive Codex sessions across all workspaces.
+- `/resume last` resumes the most recently updated Codex session.
+- `/resume <threadId|localSessionId>` resumes a previous Codex session directly.
+- `/threads` lists previous Codex sessions.
 - `/model` lists available models.
 - `/model <model-id>` changes the active app-server session model for subsequent turns.
 - `/models` lists available models.
@@ -102,6 +115,14 @@ Session utilities:
 
 - `/log [n]` shows recent logs.
 - `/usage` shows the latest token usage reported by app-server.
+- `/doctor` runs local setup health checks.
+- `/health` shows app-server, pending interaction, and delivery-outbox health.
+- `/pending` lists unresolved questions and approvals across sessions.
+- `/search <term>` searches previous Codex sessions.
+- `/limits` shows current account limits.
+- `/progress` shows the latest turn plan; `/diff` exports the latest turn diff.
+- `/goal start <objective>` starts a goal and one Codex turn; `/goal pause|resume|clear` controls goal metadata.
+- `/processes` lists and safely terminates background terminals.
 - `/transcript` exports the active session transcript.
 - `/pause` and `/unpause` toggle Telegram input forwarding.
 - `/kill` interrupts the active session after confirmation.
@@ -119,8 +140,8 @@ This is designed for a single trusted user controlling a local machine. Do not e
 
 - Unauthorized Telegram users are rejected before command handling.
 - If `TELE_CODEX_ALLOWED_CHAT_IDS` is set, both user ID and chat ID must match.
-- Approval callbacks include an action ID and nonce.
-- Expired or nonce-mismatched approvals are rejected.
+- Approval callbacks contain short opaque tokens; action details and intended chat IDs remain in SQLite.
+- Expired, cross-chat, duplicate, and already-resolved interactions are rejected transactionally.
 - Session-level approval grants can be disabled with:
 
 ```bash
@@ -135,6 +156,8 @@ Never commit `.env`, bot tokens, app-server tokens, SQLite databases, or transcr
 npm run typecheck
 npm test
 npm run build
+# optional: verify the installed Codex app-server contract
+npm run test:appserver
 ```
 
 The project is intentionally small:
@@ -153,3 +176,24 @@ App-server is the primary adapter because it exposes structured JSON-RPC events 
 Token usage is captured from app-server `thread/tokenUsage/updated` notifications. `/usage`, `/status`, and `/panel` show the latest usage snapshot once Codex has reported one for the active thread.
 
 PTY/tmux is fallback-only. Terminal output parsing and submit-key behavior depend on the Codex TUI and the local terminal stack, so tmux attachment remains best-effort.
+
+## Unattended Linux Operation
+
+Build first, then install the user service from the compiled CLI:
+
+```bash
+npm run build
+node dist/cli.js service install --env-file "$PWD/.env"
+node dist/cli.js service status
+```
+
+The installer writes `~/.config/systemd/user/tele-codex.service`, enables it immediately, restarts it after failures, and keeps Codex child processes in the same systemd control group. If lingering is disabled, follow the reported `loginctl enable-linger` instruction so the user manager survives logout and starts at boot.
+
+Useful operations:
+
+```bash
+journalctl --user -u tele-codex.service -f
+node dist/cli.js service uninstall
+```
+
+The unattended guarantee applies to structured app-server sessions. High-signal notifications are persisted and delivered at least once while the host, Telegram, and Codex are reachable. Threads are deliberately not resumed automatically after a process or host restart; Telegram sends a durable recovery card requiring explicit selection. Secret question answers are refused because Telegram bot chats are not end-to-end encrypted.

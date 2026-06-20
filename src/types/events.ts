@@ -1,3 +1,5 @@
+import type { RateLimitSummary, ThreadGoalSummary } from "./control.js";
+
 export type AdapterKind = "appserver" | "pty";
 
 export type SessionStatus =
@@ -114,6 +116,27 @@ export type CodexEvent =
       detail?: string;
     }
   | {
+      type: "goalChanged";
+      sessionId: string;
+      goal: ThreadGoalSummary;
+    }
+  | {
+      type: "rateLimitsChanged";
+      sessionId: string;
+      limits: RateLimitSummary;
+      recovered?: boolean;
+    }
+  | {
+      type: "actionResolved";
+      sessionId: string;
+      actionId: string;
+    }
+  | {
+      type: "warning";
+      sessionId: string;
+      message: string;
+    }
+  | {
       type: "logChunk";
       sessionId: string;
       text: string;
@@ -134,5 +157,9 @@ export interface UserDecision {
   actionId: string;
   decision: ApprovalDecision;
   text?: string;
+  answers?: Record<string, { answers: string[] }>;
+  content?: unknown;
+  permissionScope?: "turn" | "session";
+  protocolDecision?: unknown;
   grantForSession?: boolean;
 }

@@ -36,3 +36,41 @@ export interface SessionTokenUsage {
   modelContextWindow?: number;
   updatedAt: number;
 }
+
+export interface RateLimitSummary {
+  usedPercent: number;
+  resetsAt?: number;
+  windowDurationMins?: number;
+  planType?: string;
+  updatedAt: number;
+}
+
+export interface TurnPlanStep {
+  step: string;
+  status: "pending" | "inProgress" | "completed";
+}
+
+export interface SessionProgress {
+  explanation?: string;
+  plan: TurnPlanStep[];
+  updatedAt: number;
+}
+
+export interface ThreadGoalSummary {
+  objective: string;
+  status: "active" | "paused" | "blocked" | "usageLimited" | "budgetLimited" | "complete";
+  tokenBudget?: number;
+  tokensUsed: number;
+  timeUsedSeconds: number;
+  updatedAt: number;
+}
+
+export interface BackgroundTerminalSummary {
+  itemId: string;
+  processId: string;
+  command: string;
+  cwd: string;
+  osPid?: number;
+  cpuPercent?: number;
+  rssKb?: number;
+}

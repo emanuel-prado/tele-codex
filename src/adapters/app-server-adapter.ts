@@ -3,13 +3,23 @@ import { JsonRpcClient, type JsonRpcMessage } from "./json-rpc-client.js";
 import type { AppConfig } from "../config.js";
 import type { CodexAdapter } from "../types/adapter.js";
 import type { AttachSession, CodexEvent, LogEntry, PendingAction, SessionRef, StartSession, UserDecision } from "../types/events.js";
-import type { CodexModelSummary, CodexThreadSummary, CollaborationModeKind, SessionControlOptions } from "../types/control.js";
+import type {
+  BackgroundTerminalSummary,
+  CodexModelSummary,
+  CodexThreadSummary,
+  CollaborationModeKind,
+  RateLimitSummary,
+  SessionControlOptions,
+  SessionProgress,
+  ThreadGoalSummary
+} from "../types/control.js";
 import { AsyncQueue } from "../utils/async-queue.js";
 import { createId, createNonce, nowMs } from "../utils/ids.js";
 import { Store } from "../store/store.js";
 import type { StoredSession } from "../store/store.js";
 import {
   buildMcpElicitationResponse,
+  buildPermissionsResponse,
   buildRequestUserInputResponse,
   formatRequestUserInput,
   parseTokenUsage
@@ -23,19 +33,29 @@ export class AppServerAdapter implements CodexAdapter {
   private readonly activeTurns = new Map<string, string>();
   private readonly sessionModels = new Map<string, string>();
   private connected = false;
+  private connectPromise: Promise<void> | undefined;
+  private reconnectTimer: NodeJS.Timeout | undefined;
+  private reconnectAttempt = 0;
+  private stopping = false;
 
   constructor(
     private readonly config: AppConfig,
     private readonly store: Store,
     private readonly logger: Logger
   ) {
-    this.rpc = new JsonRpcClient(logger);
+    const orphaned = this.store.orphanOpenActions();
+    if (orphaned > 0) {
+      this.store.setRuntimeValue("startup_orphaned_actions", orphaned);
+      this.logger.warn({ orphaned }, "orphaned pending actions from a previous app-server connection");
+    }
+    this.rpc = new JsonRpcClient(logger, config.rpcTimeoutMs);
     this.rpc.on("message", (message: JsonRpcMessage) => void this.handleMessage(message));
     this.rpc.on("stderr", (chunk: string) => {
       for (const session of this.store.listSessions().filter((item) => item.adapter === "appserver")) {
         this.store.appendLog({ sessionId: session.id, type: "appserver.stderr", severity: "debug", text: chunk });
       }
     });
+    this.rpc.on("close", () => this.handleDisconnect());
   }
 
   async start(opts: StartSession): Promise<SessionRef> {
@@ -154,15 +174,16 @@ export class AppServerAdapter implements CodexAdapter {
     if (!action?.requestId) throw new Error("Pending app-server action not found.");
 
     if (action.kind === "question") {
-      this.rpc.respond(action.requestId, buildRequestUserInputResponse(action, decision.text ?? ""));
+      this.rpc.respond(action.requestId, buildRequestUserInputResponse(action, decision.answers ?? decision.text ?? ""));
     } else if (action.kind === "mcpElicitation") {
-      this.rpc.respond(action.requestId, buildMcpElicitationResponse(decision.decision));
+      this.rpc.respond(action.requestId, buildMcpElicitationResponse(decision.decision, decision.content));
+    } else if (action.kind === "permissionsApproval") {
+      this.rpc.respond(action.requestId, buildPermissionsResponse(action, decision.decision, decision.permissionScope));
     } else {
-      const responseDecision = decision.decision === "acceptForSession" ? "acceptForSession" : decision.decision;
+      const responseDecision = decision.protocolDecision ?? (decision.decision === "acceptForSession" ? "acceptForSession" : decision.decision);
       this.rpc.respond(action.requestId, { decision: responseDecision });
     }
 
-    this.store.resolvePendingAction(action.id, "resolved");
     if (decision.decision === "acceptForSession") {
       this.store.grantSession(action.id, action.sessionId, action.payload, Date.now() + 24 * 60 * 60 * 1000);
     }
@@ -221,6 +242,70 @@ export class AppServerAdapter implements CodexAdapter {
     return data.map((item) => summarizeThread(asRecord(item))).filter((thread) => thread.id);
   }
 
+  async searchThreads(term: string, limit = 10): Promise<CodexThreadSummary[]> {
+    await this.ensureConnected();
+    const result = asRecord(await this.rpc.request("thread/search", {
+      limit,
+      sortKey: "updated_at",
+      sortDirection: "desc",
+      archived: false,
+      searchTerm: term
+    }));
+    const data = Array.isArray(result.data) ? result.data : [];
+    return data.map((item) => summarizeThread(asRecord(asRecord(item).thread))).filter((thread) => thread.id);
+  }
+
+  async readRateLimits(): Promise<RateLimitSummary | undefined> {
+    await this.ensureConnected();
+    const result = asRecord(await this.rpc.request("account/rateLimits/read"));
+    const limits = parseRateLimits(asRecord(result.rateLimits));
+    if (limits) this.store.setRateLimits(limits);
+    return limits;
+  }
+
+  async getGoal(sessionId: string): Promise<ThreadGoalSummary | undefined> {
+    const session = this.requireSession(sessionId);
+    const result = asRecord(await this.rpc.request("thread/goal/get", { threadId: session.codexThreadId }));
+    const goal = parseGoal(result.goal);
+    this.store.setGoal(sessionId, goal);
+    return goal;
+  }
+
+  async setGoal(sessionId: string, objective?: string, status?: ThreadGoalSummary["status"]): Promise<ThreadGoalSummary> {
+    const session = this.requireSession(sessionId);
+    const params: Record<string, unknown> = { threadId: session.codexThreadId };
+    if (objective !== undefined) params.objective = objective;
+    if (status !== undefined) params.status = status;
+    const result = asRecord(await this.rpc.request("thread/goal/set", params));
+    const goal = parseGoal(result.goal);
+    if (!goal) throw new Error("Codex did not return the updated goal.");
+    this.store.setGoal(sessionId, goal);
+    return goal;
+  }
+
+  async clearGoal(sessionId: string): Promise<boolean> {
+    const session = this.requireSession(sessionId);
+    const result = asRecord(await this.rpc.request("thread/goal/clear", { threadId: session.codexThreadId }));
+    this.store.setGoal(sessionId, undefined);
+    return Boolean(result.cleared);
+  }
+
+  async listBackgroundTerminals(sessionId: string): Promise<BackgroundTerminalSummary[]> {
+    const session = this.requireSession(sessionId);
+    const result = asRecord(await this.rpc.request("thread/backgroundTerminals/list", { threadId: session.codexThreadId, limit: 20 }));
+    const data = Array.isArray(result.data) ? result.data : [];
+    return data.map(parseBackgroundTerminal).filter((item): item is BackgroundTerminalSummary => Boolean(item));
+  }
+
+  async terminateBackgroundTerminal(sessionId: string, processId: string): Promise<boolean> {
+    const session = this.requireSession(sessionId);
+    const result = asRecord(await this.rpc.request("thread/backgroundTerminals/terminate", {
+      threadId: session.codexThreadId,
+      processId
+    }));
+    return Boolean(result.terminated);
+  }
+
   async compactThread(sessionId: string): Promise<void> {
     const session = this.requireSession(sessionId);
     await this.rpc.request("thread/compact/start", { threadId: session.codexThreadId });
@@ -252,8 +337,24 @@ export class AppServerAdapter implements CodexAdapter {
     return this.queue;
   }
 
+  close(): void {
+    this.stopping = true;
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = undefined;
+    this.connected = false;
+    this.rpc.close();
+  }
+
   private async ensureConnected(): Promise<void> {
     if (this.connected) return;
+    if (this.connectPromise) return this.connectPromise;
+    this.connectPromise = this.connect().finally(() => {
+      this.connectPromise = undefined;
+    });
+    return this.connectPromise;
+  }
+
+  private async connect(): Promise<void> {
     if (this.config.appServerUrl) {
       await this.rpc.connectWebSocket(this.config.appServerUrl, process.env.TELE_CODEX_APP_SERVER_TOKEN);
     } else {
@@ -265,6 +366,50 @@ export class AppServerAdapter implements CodexAdapter {
     });
     this.rpc.notify("initialized");
     this.connected = true;
+    this.reconnectAttempt = 0;
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = undefined;
+  }
+
+  private handleDisconnect(): void {
+    if (this.stopping) return;
+    if (!this.connected && this.reconnectTimer) return;
+    this.connected = false;
+    this.activeTurns.clear();
+    const orphaned = this.store.orphanOpenActions();
+    const sessions = this.store.listSessions().filter((item) => item.adapter === "appserver" && item.status !== "stopped");
+    for (const session of sessions) {
+      this.store.setSessionStatus(session.id, "error");
+      this.queue.push({
+        type: "error",
+        sessionId: session.id,
+        message: `App-server disconnected${orphaned ? `; ${orphaned} pending request(s) were orphaned` : ""}. Reconnection will restore controls, but resuming the thread requires your confirmation.`,
+        willRetry: true
+      });
+    }
+    this.scheduleReconnect();
+  }
+
+  private scheduleReconnect(): void {
+    if (this.reconnectTimer) return;
+    const delay = Math.min(30_000, 1_000 * 2 ** this.reconnectAttempt++);
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = undefined;
+      void this.ensureConnected()
+        .then(() => {
+          for (const session of this.store.listSessions().filter((item) => item.adapter === "appserver" && item.status !== "stopped")) {
+            this.queue.push({
+              type: "blocked",
+              sessionId: session.id,
+              reason: "App-server transport recovered. Use Resume in Telegram to reattach this thread."
+            });
+          }
+        })
+        .catch((error) => {
+          this.logger.warn({ error, delay }, "app-server reconnect failed");
+          this.scheduleReconnect();
+        });
+    }, delay);
   }
 
   private async handleMessage(message: JsonRpcMessage): Promise<void> {
@@ -282,6 +427,16 @@ export class AppServerAdapter implements CodexAdapter {
     const sessionId = threadId ? this.sessionsByThread.get(threadId) : undefined;
     if (!sessionId) {
       this.rpc.fail(message.id as string | number, -32001, "No Telegram session is attached to this Codex thread.");
+      return;
+    }
+
+    if (!isSupportedInteractiveRequest(message.method)) {
+      this.rpc.fail(message.id as string | number, -32601, `Unsupported app-server request: ${message.method}`);
+      this.queue.push({
+        type: "error",
+        sessionId,
+        message: `tele-codex safely rejected unsupported app-server request ${message.method}. Update the bridge before relying on this capability.`
+      });
       return;
     }
 
@@ -304,6 +459,31 @@ export class AppServerAdapter implements CodexAdapter {
     const params = asRecord(message.params);
     const threadId = typeof params.threadId === "string" ? params.threadId : undefined;
     const sessionId = threadId ? this.sessionsByThread.get(threadId) : undefined;
+    if (message.method === "account/rateLimits/updated") {
+      const limits = parseRateLimits(asRecord(params.rateLimits));
+      if (limits) {
+        const previous = this.store.getRateLimits();
+        this.store.setRateLimits(limits);
+        const active = this.store.listSessions().find((item) => item.adapter === "appserver" && item.status !== "stopped");
+        if (active) {
+          const event: Extract<CodexEvent, { type: "rateLimitsChanged" }> = { type: "rateLimitsChanged", sessionId: active.id, limits };
+          if (previous && previous.usedPercent >= this.config.rateLimitWarnPercent && limits.usedPercent < this.config.rateLimitWarnPercent) {
+            event.recovered = true;
+          }
+          this.queue.push(event);
+        }
+      }
+      return;
+    }
+    if (message.method === "deprecationNotice" || message.method === "configWarning") {
+      const active = this.store.listSessions().find((item) => item.adapter === "appserver" && item.status !== "stopped");
+      if (active) {
+        const summary = String(params.summary ?? params.message ?? "Codex configuration warning");
+        const details = typeof params.details === "string" ? `\n${params.details}` : "";
+        this.queue.push({ type: "warning", sessionId: active.id, message: `${summary}${details}` });
+      }
+      return;
+    }
     if (!sessionId) return;
 
     this.store.appendLog({
@@ -364,8 +544,56 @@ export class AppServerAdapter implements CodexAdapter {
     }
 
     if (message.method === "thread/status/changed") {
-      const status = typeof params.status === "string" ? params.status : "updated";
+      const statusRecord = asRecord(params.status);
+      const status = typeof params.status === "string" ? params.status : String(statusRecord.type ?? "updated");
       this.store.appendLog({ sessionId, type: "thread.status", severity: "info", text: status });
+      return;
+    }
+
+    if (message.method === "turn/plan/updated") {
+      const plan: SessionProgress["plan"] = Array.isArray(params.plan)
+        ? params.plan.flatMap((item) => {
+            const record = asRecord(item);
+            if (typeof record.step !== "string") return [];
+            const rawStatus = String(record.status ?? "pending");
+            const status = rawStatus === "in_progress" ? "inProgress" : rawStatus;
+            if (status !== "pending" && status !== "inProgress" && status !== "completed") return [];
+            return [{ step: record.step, status: status as SessionProgress["plan"][number]["status"] }];
+          })
+        : [];
+      const progress: SessionProgress = {
+        plan,
+        updatedAt: Date.now()
+      };
+      if (typeof params.explanation === "string") progress.explanation = params.explanation;
+      this.store.setProgress(sessionId, progress);
+      return;
+    }
+
+    if (message.method === "turn/diff/updated" && typeof params.diff === "string") {
+      this.store.setDiff(sessionId, params.diff);
+      return;
+    }
+
+    if (message.method === "thread/goal/updated") {
+      const goal = parseGoal(params.goal);
+      if (goal) {
+        this.store.setGoal(sessionId, goal);
+        this.queue.push({ type: "goalChanged", sessionId, goal });
+      }
+      return;
+    }
+
+    if (message.method === "thread/goal/cleared") {
+      this.store.setGoal(sessionId, undefined);
+      return;
+    }
+
+    if (message.method === "warning" || message.method === "guardianWarning" || message.method === "model/rerouted") {
+      const text = message.method === "model/rerouted"
+        ? `Model rerouted from ${String(params.fromModel ?? "unknown")} to ${String(params.toModel ?? "unknown")}: ${String(params.reason ?? "no reason")}`
+        : String(params.message ?? "Codex warning");
+      this.queue.push({ type: "warning", sessionId, message: text });
       return;
     }
 
@@ -379,6 +607,15 @@ export class AppServerAdapter implements CodexAdapter {
           severity: "debug",
           text: `total ${usage.total.totalTokens}, last ${usage.last.totalTokens}`
         });
+      }
+      return;
+    }
+
+    if (message.method === "serverRequest/resolved") {
+      const requestId = params.requestId;
+      if (typeof requestId === "string" || typeof requestId === "number") {
+        const actionId = this.store.resolvePendingActionByRequestId(requestId);
+        if (actionId) this.queue.push({ type: "actionResolved", sessionId, actionId });
       }
       return;
     }
@@ -417,13 +654,13 @@ function makeActionFromServerRequest(
 ): PendingAction {
   const command = typeof params.command === "string" ? params.command : undefined;
   const reason = typeof params.reason === "string" ? params.reason : undefined;
-  const kind = method.includes("requestUserInput")
+  const kind = method === "item/tool/requestUserInput"
     ? "question"
-    : method.includes("fileChange")
+    : method === "item/fileChange/requestApproval" || method === "applyPatchApproval"
       ? "fileChangeApproval"
-      : method.includes("permissions")
+      : method === "item/permissions/requestApproval"
         ? "permissionsApproval"
-        : method.includes("elicitation")
+        : method === "mcpServer/elicitation/request"
           ? "mcpElicitation"
           : "commandApproval";
   const title = kind === "question" ? "Codex asks" : "Codex approval required";
@@ -443,12 +680,27 @@ function makeActionFromServerRequest(
     body: body || JSON.stringify(params),
     payload: { method, params },
     nonce: createNonce(),
-    expiresAt: nowMs() + timeoutMs
+    expiresAt: nowMs() + actionTimeout(params, timeoutMs)
   };
   if (typeof params.threadId === "string") action.threadId = params.threadId;
   if (typeof params.turnId === "string") action.turnId = params.turnId;
   if (typeof params.itemId === "string") action.itemId = params.itemId;
   return action;
+}
+
+function isSupportedInteractiveRequest(method: string | undefined): boolean {
+  return method === "item/commandExecution/requestApproval" ||
+    method === "item/fileChange/requestApproval" ||
+    method === "item/tool/requestUserInput" ||
+    method === "mcpServer/elicitation/request" ||
+    method === "item/permissions/requestApproval" ||
+    method === "applyPatchApproval" ||
+    method === "execCommandApproval";
+}
+
+function actionTimeout(params: Record<string, unknown>, configuredMs: number): number {
+  const automatic = params.autoResolutionMs;
+  return typeof automatic === "number" && automatic > 0 ? Math.min(configuredMs, automatic) : configuredMs;
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -474,6 +726,48 @@ function summarizeThread(thread: Record<string, unknown>): CodexThreadSummary {
   if (typeof thread.cwd === "string") summary.cwd = thread.cwd;
   if (typeof thread.modelProvider === "string") summary.modelProvider = thread.modelProvider;
   if (typeof thread.status === "string") summary.status = thread.status;
+  else if (typeof asRecord(thread.status).type === "string") summary.status = String(asRecord(thread.status).type);
   if (typeof thread.updatedAt === "number") summary.updatedAt = thread.updatedAt;
   return summary;
+}
+
+function parseRateLimits(value: Record<string, unknown>, updatedAt = Date.now()): RateLimitSummary | undefined {
+  const primary = asRecord(value.primary);
+  if (typeof primary.usedPercent !== "number") return undefined;
+  const limits: RateLimitSummary = { usedPercent: primary.usedPercent, updatedAt };
+  if (typeof primary.resetsAt === "number") limits.resetsAt = primary.resetsAt;
+  if (typeof primary.windowDurationMins === "number") limits.windowDurationMins = primary.windowDurationMins;
+  if (typeof value.planType === "string") limits.planType = value.planType;
+  return limits;
+}
+
+function parseGoal(value: unknown): ThreadGoalSummary | undefined {
+  const goal = asRecord(value);
+  if (typeof goal.objective !== "string" || typeof goal.status !== "string") return undefined;
+  const allowed = new Set(["active", "paused", "blocked", "usageLimited", "budgetLimited", "complete"]);
+  if (!allowed.has(goal.status)) return undefined;
+  const parsed: ThreadGoalSummary = {
+    objective: goal.objective,
+    status: goal.status as ThreadGoalSummary["status"],
+    tokensUsed: typeof goal.tokensUsed === "number" ? goal.tokensUsed : 0,
+    timeUsedSeconds: typeof goal.timeUsedSeconds === "number" ? goal.timeUsedSeconds : 0,
+    updatedAt: typeof goal.updatedAt === "number" ? goal.updatedAt * 1000 : Date.now()
+  };
+  if (typeof goal.tokenBudget === "number") parsed.tokenBudget = goal.tokenBudget;
+  return parsed;
+}
+
+function parseBackgroundTerminal(value: unknown): BackgroundTerminalSummary | undefined {
+  const item = asRecord(value);
+  if (typeof item.itemId !== "string" || typeof item.processId !== "string" || typeof item.command !== "string") return undefined;
+  const parsed: BackgroundTerminalSummary = {
+    itemId: item.itemId,
+    processId: item.processId,
+    command: item.command,
+    cwd: typeof item.cwd === "string" ? item.cwd : ""
+  };
+  if (typeof item.osPid === "number") parsed.osPid = item.osPid;
+  if (typeof item.cpuPercent === "number") parsed.cpuPercent = item.cpuPercent;
+  if (typeof item.rssKb === "number") parsed.rssKb = item.rssKb;
+  return parsed;
 }

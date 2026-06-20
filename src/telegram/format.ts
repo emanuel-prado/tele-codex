@@ -1,5 +1,5 @@
 import type { PendingAction } from "../types/events.js";
-import type { SessionTokenUsage } from "../types/control.js";
+import type { CodexThreadSummary, SessionTokenUsage } from "../types/control.js";
 import type { StoredSession } from "../store/store.js";
 
 const TELEGRAM_TEXT_LIMIT = 4096;
@@ -57,6 +57,21 @@ export function formatUsage(usage: SessionTokenUsage | undefined): string {
   ]
     .filter(Boolean)
     .join("\n");
+}
+
+export function formatThreads(threads: CodexThreadSummary[]): string {
+  return [
+    "Previous Codex sessions",
+    "",
+    ...threads.map((thread, index) => {
+      const title = thread.name || thread.preview || thread.id;
+      const updated = thread.updatedAt ? new Date(thread.updatedAt * 1000).toISOString() : "unknown";
+      const cwd = thread.cwd ? `\n${thread.cwd}` : "";
+      return `${index + 1}. ${title.slice(0, 120)}\n${thread.id}\nupdated: ${updated}${cwd}`;
+    }),
+    "",
+    "Use /resume last for the newest session or /resume <threadId> to resume one directly."
+  ].join("\n\n");
 }
 
 export function formatLogs(lines: Array<{ timestamp: number; type: string; severity: string; text: string }>): string {
@@ -125,13 +140,27 @@ function actionBody(action: PendingAction): string {
   const cwd = typeof record.cwd === "string" ? record.cwd : undefined;
   const reason = typeof record.reason === "string" ? record.reason : undefined;
   const changes = Array.isArray(record.changes) ? `changes: ${record.changes.length}` : undefined;
+  const permissions = record.permissions && typeof record.permissions === "object"
+    ? `requested permissions:\n${JSON.stringify(record.permissions, null, 2)}`
+    : undefined;
+  const additionalPermissions = record.additionalPermissions && typeof record.additionalPermissions === "object"
+    ? `additional permissions:\n${JSON.stringify(record.additionalPermissions, null, 2)}`
+    : undefined;
+  const networkContext = record.networkApprovalContext && typeof record.networkApprovalContext === "object"
+    ? `network request:\n${JSON.stringify(record.networkApprovalContext, null, 2)}`
+    : undefined;
+  const grantRoot = typeof record.grantRoot === "string" ? `grant root: ${record.grantRoot}` : undefined;
   return [
     method ? `method: ${method}` : undefined,
     reason,
     cwd ? `cwd: ${cwd}` : undefined,
     command ? `command:\n${command}` : undefined,
     changes,
-    !command && !reason && !cwd && !changes ? action.body : undefined
+    permissions,
+    additionalPermissions,
+    networkContext,
+    grantRoot,
+    !command && !reason && !cwd && !changes && !permissions && !additionalPermissions && !networkContext && !grantRoot ? action.body : undefined
   ]
     .filter(Boolean)
     .join("\n\n");

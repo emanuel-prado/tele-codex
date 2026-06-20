@@ -7,31 +7,48 @@ import type { AppConfig } from "../config.js";
 import { PolicyEngine } from "../security/policy.js";
 import { Store } from "../store/store.js";
 import type { StoredSession } from "../store/store.js";
-import type { CodexEvent, ApprovalDecision } from "../types/events.js";
-import type { CodexModelSummary, CodexThreadSummary, CollaborationModeKind } from "../types/control.js";
+import type { CodexEvent, ApprovalDecision, SessionRef } from "../types/events.js";
+import type {
+  CodexModelSummary,
+  CodexThreadSummary,
+  CollaborationModeKind,
+  RateLimitSummary,
+  SessionProgress,
+  ThreadGoalSummary
+} from "../types/control.js";
 import { SessionManager } from "../runtime/session-manager.js";
 import { listWorkspaceProjects, resolveWorkspacePath, type WorkspaceProject } from "../runtime/workspace.js";
 import {
   appendAgentMessageChunk,
+  escapeMd,
   formatAction,
   formatAgentMessage,
   formatLogs,
   formatSessions,
   formatStatus,
+  formatThreads,
   formatUsage,
   truncateMiddle
 } from "./format.js";
 import type { ProbeResult, TmuxPane } from "../adapters/pty-adapter.js";
-import { requestUserInputQuestions } from "../adapters/app-server-protocol.js";
+import { formatDoctorReport, runDoctor } from "../runtime/doctor.js";
+import { parseResumeCommand } from "./resume-command.js";
+import { PendingInteractionManager, type InteractionView } from "./pending-interaction.js";
+import { createId } from "../utils/ids.js";
 
 export class TelegramGateway {
   private readonly bot: Bot;
+  private readonly runtimeId = createId("runtime");
   private readonly messageBuffers = new Map<string, { text: string; timer: NodeJS.Timeout }>();
   private readonly paneSelections = new Map<string, TmuxPane>();
   private readonly projectSelections = new Map<string, WorkspaceProject>();
   private readonly threadSelections = new Map<string, CodexThreadSummary>();
   private readonly modelSelections = new Map<string, CodexModelSummary>();
-  private readonly answerSelections = new Map<string, { actionId: string; nonce: string; text: string }>();
+  private readonly processSelections = new Map<string, { sessionId: string; processId: string; command: string }>();
+  private readonly interactions: PendingInteractionManager;
+  private outboxTimer: NodeJS.Timeout | undefined;
+  private actionSweepTimer: NodeJS.Timeout | undefined;
+  private drainingOutbox = false;
 
   constructor(
     private readonly config: AppConfig,
@@ -41,6 +58,7 @@ export class TelegramGateway {
     private readonly logger: Logger
   ) {
     this.bot = new Bot(config.botToken);
+    this.interactions = new PendingInteractionManager(store, config.allowSessionGrants);
     this.bot.use(async (ctx, next) => {
       if (!this.policy.authorizeTelegramUser(ctx.from?.id, ctx.chat?.id)) {
         this.logger.warn({ userId: ctx.from?.id, chatId: ctx.chat?.id }, "rejected unauthorized Telegram update");
@@ -48,21 +66,32 @@ export class TelegramGateway {
       }
       await next();
     });
-    this.bot.catch((error) => {
+    this.bot.catch(async (error) => {
       this.logger.error({ error }, "Telegram bot middleware failed");
+      const detail = error.error instanceof Error ? error.error.message : "Telegram command failed.";
+      try {
+        await error.ctx.reply(`tele-codex error: ${detail}`);
+      } catch (replyError) {
+        this.logger.warn({ replyError }, "could not report Telegram command failure");
+      }
     });
     this.registerHandlers();
   }
 
   async start(): Promise<void> {
     void this.forwardCodexEvents();
+    this.outboxTimer = setInterval(() => void this.drainOutbox(), 1_000);
+    this.actionSweepTimer = setInterval(() => {
+      void this.sessions.expirePendingActions().catch((error) => this.logger.error({ error }, "pending action sweep failed"));
+    }, 1_000);
+    void this.drainOutbox();
     await this.bot.api.setMyCommands([
       { command: "status", description: "Show active Codex session" },
       { command: "panel", description: "Show session control panel" },
       { command: "sessions", description: "List local sessions" },
       { command: "new", description: "Start a new Codex session" },
-      { command: "resume", description: "Resume a previous Codex thread" },
-      { command: "threads", description: "List previous app-server threads" },
+      { command: "resume", description: "Resume a previous Codex session" },
+      { command: "threads", description: "List previous Codex sessions" },
       { command: "model", description: "Change active session model" },
       { command: "models", description: "List available models" },
       { command: "plan", description: "Switch active session to plan mode" },
@@ -75,6 +104,16 @@ export class TelegramGateway {
       { command: "testinput", description: "Test tmux fallback input" },
       { command: "log", description: "Show recent session log" },
       { command: "usage", description: "Show active session token usage" },
+      { command: "pending", description: "Show pending Codex interactions" },
+      { command: "health", description: "Show unattended-operation health" },
+      { command: "retrydelivery", description: "Retry failed notifications" },
+      { command: "search", description: "Search previous Codex sessions" },
+      { command: "limits", description: "Show Codex account limits" },
+      { command: "progress", description: "Show the active turn plan" },
+      { command: "diff", description: "Export the latest turn diff" },
+      { command: "goal", description: "Control the active thread goal" },
+      { command: "processes", description: "Show background processes" },
+      { command: "doctor", description: "Run local health checks" },
       { command: "transcript", description: "Export active session transcript" },
       { command: "approve", description: "Approve a pending request by id" },
       { command: "deny", description: "Deny a pending request by id" },
@@ -89,6 +128,17 @@ export class TelegramGateway {
     });
   }
 
+  async stop(): Promise<void> {
+    if (this.outboxTimer) clearInterval(this.outboxTimer);
+    if (this.actionSweepTimer) clearInterval(this.actionSweepTimer);
+    this.outboxTimer = undefined;
+    this.actionSweepTimer = undefined;
+    for (const buffer of this.messageBuffers.values()) clearTimeout(buffer.timer);
+    for (const sessionId of [...this.messageBuffers.keys()]) await this.flushAgentMessage(sessionId);
+    await this.drainOutbox();
+    this.bot.stop();
+  }
+
   private registerHandlers(): void {
     this.bot.command("help", async (ctx) => {
       await ctx.reply(
@@ -98,9 +148,10 @@ export class TelegramGateway {
           "/sessions - list and control sessions",
           "/new - pick a workspace project",
           "/new <project-or-path> - start app-server session in a workspace folder",
-          "/resume - list previous app-server threads",
+          "/resume - list previous Codex sessions",
+          "/resume last - resume the most recent Codex session",
           "/resume <threadId|localSessionId> - resume a previous session",
-          "/threads - list previous app-server threads",
+          "/threads - list previous Codex sessions",
           "/model - list models; /model <id> changes active session model",
           "/plan [on|off] - switch active app-server session mode",
           "/mode <plan|default> - switch active app-server session mode",
@@ -113,6 +164,16 @@ export class TelegramGateway {
           "/testinput - test tmux input/submit readiness",
           "/log [n] - recent logs",
           "/usage - current token usage",
+          "/pending - pending questions and approvals",
+          "/health - app-server and delivery health",
+          "/retrydelivery - retry failed high-signal notifications",
+          "/search <term> - search previous Codex sessions",
+          "/limits - account rate limits",
+          "/progress - active turn plan",
+          "/diff - latest turn diff",
+          "/goal [start <objective>|pause|resume|clear] - durable goal controls",
+          "/processes - background terminals",
+          "/doctor - local setup health checks",
           "/transcript - export full active transcript",
           "/pause and /unpause - toggle forwarding",
           "/kill - interrupt active session",
@@ -162,14 +223,21 @@ export class TelegramGateway {
     });
 
     this.bot.command("resume", async (ctx) => {
-      const target = String(ctx.match ?? "").trim();
-      if (!target) {
+      const command = parseResumeCommand(ctx.match);
+      if (command.kind === "picker") {
         await this.showThreadPicker(ctx);
         return;
       }
-      const local = this.store.getSession(target);
-      const session = local ? await this.sessions.resumeSession(local.id) : await this.sessions.resumeThread(target);
-      await ctx.reply(`Resumed app-server session:\n${session.label}\n${session.id}`);
+      try {
+        const session =
+          command.kind === "last"
+            ? await this.sessions.resumeLatestThread()
+            : await this.resumeTarget(command.target);
+        await ctx.reply(`Resumed Codex session:\n${session.label}\n${session.id}`);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Unable to resume the Codex session.";
+        await ctx.reply(message);
+      }
     });
 
     this.bot.command("models", async (ctx) => {
@@ -279,6 +347,133 @@ export class TelegramGateway {
       await ctx.reply(formatUsage(this.store.getTokenUsage(active.id)));
     });
 
+    this.bot.command("pending", async (ctx) => {
+      const actions = this.store.listPendingActions();
+      if (actions.length === 0) {
+        await ctx.reply("No pending Codex interactions.");
+        return;
+      }
+      for (const action of actions) {
+        const view = this.interactions.actionView(action, ctx.chat.id);
+        await ctx.reply(`${formatAction(action)}\n\n${escapeMd(view.text)}`, {
+          parse_mode: "MarkdownV2",
+          reply_markup: interactionKeyboard(view)
+        });
+      }
+    });
+
+    this.bot.command("health", async (ctx) => {
+      const outbox = this.store.outboxCounts();
+      const active = this.sessions.getActiveSession();
+      await ctx.reply([
+        "tele-codex health",
+        "",
+        `session: ${active ? `${active.status} (${active.label})` : "none active"}`,
+        `pending interactions: ${this.store.listPendingActions().length}`,
+        `delivery queue: ${outbox.pending} pending, ${outbox.failed} failed`,
+        outbox.failed ? "Use /retrydelivery after correcting Telegram connectivity." : "high-signal delivery: healthy"
+      ].join("\n"));
+    });
+
+    this.bot.command("retrydelivery", async (ctx) => {
+      const count = this.store.retryFailedOutbox();
+      void this.drainOutbox();
+      await ctx.reply(`Queued ${count} failed notification(s) for retry.`);
+    });
+
+    this.bot.command("search", async (ctx) => {
+      const term = String(ctx.match ?? "").trim();
+      if (!term) {
+        await ctx.reply("Usage: /search <term>");
+        return;
+      }
+      const threads = await this.sessions.searchRemoteThreads(term, 12);
+      if (threads.length === 0) {
+        await ctx.reply(`No Codex sessions match: ${term}`);
+        return;
+      }
+      await this.sendThreadPicker(ctx, threads);
+    });
+
+    this.bot.command("limits", async (ctx) => {
+      const limits = await this.sessions.rateLimits();
+      await ctx.reply(formatLimits(limits));
+    });
+
+    this.bot.command("progress", async (ctx) => {
+      const progress = this.sessions.progress();
+      await ctx.reply(progress ? formatProgress(progress) : "No plan has been reported for the active session.");
+    });
+
+    this.bot.command("diff", async (ctx) => {
+      const diff = this.sessions.diff();
+      if (!diff) {
+        await ctx.reply("No turn diff has been reported for the active session.");
+        return;
+      }
+      if (diff.length < 3800) {
+        await ctx.reply(diff);
+      } else {
+        const path = join(tmpdir(), `tele-codex-diff-${Date.now()}.patch`);
+        await writeFile(path, diff);
+        await ctx.replyWithDocument(new InputFile(path, "codex-turn.patch"));
+      }
+    });
+
+    this.bot.command("goal", async (ctx) => {
+      const input = String(ctx.match ?? "").trim();
+      if (input.startsWith("start ")) {
+        const objective = input.slice(6).trim();
+        if (!objective) throw new Error("Goal objective cannot be empty.");
+        await ctx.reply(formatGoal(await this.sessions.startGoal(objective)));
+        return;
+      }
+      if (input === "pause") {
+        await ctx.reply(formatGoal(await this.sessions.setGoalStatus("paused")));
+        return;
+      }
+      if (input === "resume") {
+        await ctx.reply(formatGoal(await this.sessions.setGoalStatus("active")));
+        return;
+      }
+      if (input === "clear") {
+        await ctx.reply((await this.sessions.clearGoal()) ? "Goal cleared." : "No goal was active.");
+        return;
+      }
+      if (input) {
+        await ctx.reply("Usage: /goal OR /goal start <objective> OR /goal pause|resume|clear");
+        return;
+      }
+      const goal = await this.sessions.goal();
+      await ctx.reply(goal ? formatGoal(goal) : "No goal is set for the active session.");
+    });
+
+    this.bot.command("processes", async (ctx) => {
+      const session = this.sessions.getActiveSession();
+      if (!session) {
+        await ctx.reply("No active session.");
+        return;
+      }
+      const processes = await this.sessions.backgroundTerminals(session.id);
+      if (processes.length === 0) {
+        await ctx.reply("No background terminals for the active session.");
+        return;
+      }
+      const keyboard = new InlineKeyboard();
+      const lines = processes.map((process, index) => {
+        const id = Math.random().toString(36).slice(2, 10);
+        this.processSelections.set(id, { sessionId: session.id, processId: process.processId, command: process.command });
+        keyboard.text(`Stop ${index + 1}`, `proc:${id}:ask`).row();
+        return `${index + 1}. ${process.command}\npid: ${process.osPid ?? process.processId}\ncwd: ${process.cwd}`;
+      });
+      await ctx.reply(`Background terminals\n\n${lines.join("\n\n")}`, { reply_markup: keyboard });
+    });
+
+    this.bot.command("doctor", async (ctx) => {
+      const report = await runDoctor(this.config);
+      await ctx.reply(formatDoctorReport(report));
+    });
+
     this.bot.command("transcript", async (ctx) => {
       await this.sendTranscript(ctx);
     });
@@ -306,42 +501,28 @@ export class TelegramGateway {
     this.bot.command("approve", async (ctx) => this.manualDecision(ctx, "accept"));
     this.bot.command("deny", async (ctx) => this.manualDecision(ctx, "decline"));
 
-    this.bot.callbackQuery(/^act:/, async (ctx) => {
-      const [, actionId, nonce, decision] = String(ctx.callbackQuery.data).split(":");
-      const action = actionId ? this.store.getPendingAction(actionId) : undefined;
-      if (!action || !nonce || !decision) {
-        await ctx.answerCallbackQuery({ text: "Unknown action.", show_alert: true });
-        return;
-      }
+    this.bot.callbackQuery(/^cb:/, async (ctx) => {
+      const token = String(ctx.callbackQuery.data).slice(3);
+      const userId = ctx.from.id;
+      const chatId = ctx.chat?.id;
+      if (!chatId) return;
       try {
-        this.policy.validateDecision(action, { actionId: action.id, decision: decision as ApprovalDecision }, nonce);
-        await this.sessions.respondAction({ actionId: action.id, decision: decision as ApprovalDecision });
-        await ctx.editMessageReplyMarkup();
-        await ctx.answerCallbackQuery({ text: "Sent to Codex." });
+        const result = this.interactions.handleCallback(token, chatId, userId);
+        if (result.kind === "notice") {
+          await ctx.answerCallbackQuery({ text: result.text, show_alert: true });
+          return;
+        }
+        if (result.kind === "submit") {
+          await this.sessions.respondAction(result.decision);
+          await this.clearActionKeyboards(result.decision.actionId);
+          await ctx.answerCallbackQuery({ text: result.text });
+          await ctx.editMessageText(result.text);
+          return;
+        }
+        await ctx.answerCallbackQuery();
+        await ctx.editMessageText(result.view.text, { reply_markup: interactionKeyboard(result.view) });
       } catch (error) {
-        await ctx.answerCallbackQuery({ text: error instanceof Error ? error.message : "Rejected.", show_alert: true });
-      }
-    });
-
-    this.bot.callbackQuery(/^answer:/, async (ctx) => {
-      const [, selectionId] = String(ctx.callbackQuery.data).split(":");
-      const selection = selectionId ? this.answerSelections.get(selectionId) : undefined;
-      if (!selection) {
-        await ctx.answerCallbackQuery({ text: "Answer selection expired.", show_alert: true });
-        return;
-      }
-      const action = this.store.getPendingAction(selection.actionId);
-      if (!action) {
-        await ctx.answerCallbackQuery({ text: "Question is no longer pending.", show_alert: true });
-        return;
-      }
-      try {
-        this.policy.validateDecision(action, { actionId: action.id, decision: "accept", text: selection.text }, selection.nonce);
-        await this.sessions.respondAction({ actionId: action.id, decision: "accept", text: selection.text });
-        await ctx.editMessageReplyMarkup();
-        await ctx.answerCallbackQuery({ text: "Sent to Codex." });
-      } catch (error) {
-        await ctx.answerCallbackQuery({ text: error instanceof Error ? error.message : "Rejected.", show_alert: true });
+        await ctx.answerCallbackQuery({ text: error instanceof Error ? error.message : "Interaction failed.", show_alert: true });
       }
     });
 
@@ -414,14 +595,6 @@ export class TelegramGateway {
       }
     });
 
-
-    this.bot.callbackQuery(/^replyhint:/, async (ctx) => {
-      await ctx.answerCallbackQuery({
-        text: "Send your answer as a normal Telegram message. It will answer the pending Codex question.",
-        show_alert: true
-      });
-    });
-
     this.bot.callbackQuery(/^kill:/, async (ctx) => {
       const [, sessionId, confirm] = String(ctx.callbackQuery.data).split(":");
       if (sessionId && confirm === "confirm") {
@@ -460,7 +633,7 @@ export class TelegramGateway {
       }
       await ctx.answerCallbackQuery({ text: "Resuming thread..." });
       const session = await this.sessions.resumeThread(thread.id);
-      await ctx.reply(`Resumed app-server thread:\n${session.label}\n${session.id}`);
+      await ctx.reply(`Resumed Codex session:\n${session.label}\n${session.id}`);
     });
 
     this.bot.callbackQuery(/^model:/, async (ctx) => {
@@ -563,9 +736,45 @@ export class TelegramGateway {
       }
     });
 
+    this.bot.callbackQuery(/^proc:/, async (ctx) => {
+      const [, id, action] = String(ctx.callbackQuery.data).split(":");
+      const selection = id ? this.processSelections.get(id) : undefined;
+      if (!selection) {
+        await ctx.answerCallbackQuery({ text: "Process selection expired.", show_alert: true });
+        return;
+      }
+      if (action === "ask") {
+        const keyboard = new InlineKeyboard().text("Confirm stop", `proc:${id}:confirm`);
+        await ctx.answerCallbackQuery();
+        await ctx.reply(`Terminate this background process?\n${selection.command}`, { reply_markup: keyboard });
+        return;
+      }
+      const terminated = await this.sessions.terminateBackgroundTerminal(selection.processId, selection.sessionId);
+      this.processSelections.delete(id!);
+      await ctx.answerCallbackQuery({ text: terminated ? "Terminated." : "Process was already gone." });
+      await ctx.editMessageText(terminated ? "Background process terminated." : "Background process was already gone.");
+    });
+
     this.bot.on("message:text", async (ctx) => {
       const text = ctx.message.text;
       if (text.startsWith("/")) return;
+      const interaction = this.interactions.handleText(ctx.chat.id, ctx.from.id, text);
+      if (interaction) {
+        if (interaction.kind === "submit") {
+          try {
+            await this.sessions.respondAction(interaction.decision);
+            await this.clearActionKeyboards(interaction.decision.actionId);
+            await ctx.reply(interaction.text);
+          } catch (error) {
+            await ctx.reply(error instanceof Error ? error.message : "Could not submit answers.");
+          }
+        } else if (interaction.kind === "view") {
+          await ctx.reply(interaction.view.text, { reply_markup: interactionKeyboard(interaction.view) });
+        } else {
+          await ctx.reply(interaction.text);
+        }
+        return;
+      }
       await this.forwardUserText(ctx, text);
     });
   }
@@ -597,6 +806,9 @@ export class TelegramGateway {
   private panelText(session: StoredSession): string {
     const usage = this.store.getTokenUsage(session.id);
     const pending = this.store.countPendingActions(session.id);
+    const delivery = this.store.outboxCounts();
+    const goal = this.store.getGoal(session.id);
+    const limits = this.store.getRateLimits();
     return [
       "tele-codex panel",
       "",
@@ -604,6 +816,9 @@ export class TelegramGateway {
       `${session.adapter} | ${session.status}${session.paused ? " | paused" : ""}`,
       session.cwd,
       `pending: ${pending}`,
+      `delivery: ${delivery.pending} queued, ${delivery.failed} failed`,
+      goal ? `goal: ${goal.status}` : undefined,
+      limits ? `limits: ${limits.usedPercent.toFixed(1)}% used` : undefined,
       usage ? `usage: ${usage.total.totalTokens.toLocaleString("en-US")} tokens` : "usage: none yet"
     ]
       .filter(Boolean)
@@ -612,11 +827,15 @@ export class TelegramGateway {
 
   private async sendStartupPicker(): Promise<void> {
     const sessions = this.sessions.listSessions().filter((session) => session.status !== "stopped");
+    const lastActiveId = this.sessions.getLastActiveSessionId();
+    const orphaned = this.store.getRuntimeValue<number>("startup_orphaned_actions") ?? 0;
     for (const chatId of this.allowedDeliveryChats()) {
       try {
         if (sessions.length > 0) {
-          await this.bot.api.sendMessage(chatId, `Recoverable sessions:\n\n${formatSessions(sessions)}`, {
-            reply_markup: sessionsKeyboard(sessions)
+          const keyboard = sessionsKeyboard(sessions) as unknown as { inline_keyboard: unknown[][] };
+          this.store.enqueueOutbox(`startup-recovery:${this.runtimeId}`, chatId, {
+            text: `tele-codex restarted. Threads are not resumed automatically.\n${lastActiveId ? `Last active: ${lastActiveId}\n` : ""}${orphaned ? `${orphaned} previous pending request(s) were marked orphaned.\n` : ""}\nRecoverable sessions:\n\n${formatSessions(sessions)}`,
+            keyboard: keyboard.inline_keyboard
           });
         }
         const [text, options] = await this.workspacePickerMessage();
@@ -625,6 +844,8 @@ export class TelegramGateway {
         this.logger.warn({ error, chatId }, "failed to send startup picker");
       }
     }
+    void this.drainOutbox();
+    if (orphaned) this.store.setRuntimeValue("startup_orphaned_actions", 0);
   }
 
   private async workspacePickerMessage(): Promise<[string, { reply_markup: InlineKeyboard }]> {
@@ -648,10 +869,14 @@ export class TelegramGateway {
   private async showThreadPicker(ctx: Context): Promise<void> {
     const threads = await this.sessions.listRemoteThreads(12);
     if (threads.length === 0) {
-      await ctx.reply("No previous app-server threads found.");
+      await ctx.reply("No previous Codex sessions found.");
       return;
     }
 
+    await this.sendThreadPicker(ctx, threads);
+  }
+
+  private async sendThreadPicker(ctx: Context, threads: CodexThreadSummary[]): Promise<void> {
     const keyboard = new InlineKeyboard();
     this.threadSelections.clear();
     threads.forEach((thread, index) => {
@@ -661,6 +886,11 @@ export class TelegramGateway {
     });
 
     await ctx.reply(formatThreads(threads), { reply_markup: keyboard });
+  }
+
+  private async resumeTarget(target: string): Promise<StoredSession | SessionRef> {
+    const local = this.store.getSession(target);
+    return local ? this.sessions.resumeSession(local.id) : this.sessions.resumeThread(target);
   }
 
   private async showModelPicker(ctx: Context): Promise<void> {
@@ -772,12 +1002,17 @@ export class TelegramGateway {
       return;
     }
     await this.sessions.respondAction({ actionId, decision });
+    await this.clearActionKeyboards(actionId);
     await ctx.reply("Sent to Codex.");
   }
 
   private async forwardCodexEvents(): Promise<void> {
     for await (const event of this.sessions.events()) {
-      await this.handleCodexEvent(event);
+      try {
+        await this.handleCodexEvent(event);
+      } catch (error) {
+        this.logger.error({ error, eventType: event.type, sessionId: event.sessionId }, "failed to ingest Codex event");
+      }
     }
   }
 
@@ -790,19 +1025,32 @@ export class TelegramGateway {
       return;
     }
 
+    if (event.type === "actionResolved") {
+      await this.clearActionKeyboards(event.actionId);
+      return;
+    }
+
     if (event.type === "approvalRequested" || event.type === "questionAsked") {
-      const keyboard = this.actionKeyboard(event.action);
       for (const chatId of this.allowedDeliveryChats()) {
-        const sent = await this.bot.api.sendMessage(chatId, formatAction(event.action), {
-          parse_mode: "MarkdownV2",
-          reply_markup: keyboard
-        });
-        this.store.setTelegramMessage(event.action.id, chatId, sent.message_id);
+        const view = this.interactions.actionView(event.action, chatId);
+        const keyboard = interactionKeyboard(view) as unknown as { inline_keyboard: unknown[][] };
+        this.store.enqueueOutbox(
+          `action:${event.action.id}`,
+          chatId,
+          {
+            text: `${formatAction(event.action)}\n\n${escapeMd(view.text)}`,
+            parseMode: "MarkdownV2",
+            keyboard: keyboard.inline_keyboard
+          },
+          event.action.id
+        );
       }
+      void this.drainOutbox();
       return;
     }
 
     if (event.type === "taskCompleted" || event.type === "error" || event.type === "blocked") {
+      if (event.type === "taskCompleted") await this.flushAgentMessage(event.sessionId);
       const text =
         event.type === "taskCompleted"
           ? `Codex task ${event.status}: ${event.summary}`
@@ -810,9 +1058,87 @@ export class TelegramGateway {
             ? `Codex error: ${event.message}`
             : `Codex blocked: ${event.reason}`;
       for (const chatId of this.allowedDeliveryChats()) {
-        await this.bot.api.sendMessage(chatId, truncateMiddle(text));
+        const discriminator = event.type === "taskCompleted" ? event.turnId ?? event.status : createId(event.type);
+        this.store.enqueueOutbox(
+          `${event.type}:${event.sessionId}:${discriminator}`,
+          chatId,
+          { text: truncateMiddle(text) }
+        );
       }
+      void this.drainOutbox();
+      return;
     }
+
+    if (event.type === "goalChanged") {
+      if (!["blocked", "usageLimited", "budgetLimited", "complete"].includes(event.goal.status)) return;
+      for (const chatId of this.allowedDeliveryChats()) {
+        this.store.enqueueOutbox(`goal:${event.sessionId}:${event.goal.status}:${event.goal.updatedAt}`, chatId, {
+          text: formatGoal(event.goal)
+        });
+      }
+      void this.drainOutbox();
+      return;
+    }
+
+    if (event.type === "rateLimitsChanged" && (event.recovered || event.limits.usedPercent >= this.config.rateLimitWarnPercent)) {
+      const bucket = event.limits.usedPercent >= 100 ? 100 : event.limits.usedPercent >= 95 ? 95 : this.config.rateLimitWarnPercent;
+      for (const chatId of this.allowedDeliveryChats()) {
+        this.store.enqueueOutbox(`limits:${event.recovered ? "recovered" : bucket}:${event.limits.resetsAt ?? "unknown"}`, chatId, {
+          text: `${event.recovered ? "Codex rate limits recovered" : "Codex rate-limit warning"}\n\n${formatLimits(event.limits)}`
+        });
+      }
+      void this.drainOutbox();
+      return;
+    }
+
+    if (event.type === "warning") {
+      for (const chatId of this.allowedDeliveryChats()) {
+        this.store.enqueueOutbox(`warning:${event.sessionId}:${createId("event")}`, chatId, {
+          text: `Codex warning: ${event.message}`
+        });
+      }
+      void this.drainOutbox();
+    }
+  }
+
+  private async drainOutbox(): Promise<void> {
+    if (this.drainingOutbox) return;
+    this.drainingOutbox = true;
+    try {
+      for (const message of this.store.dueOutbox()) {
+        try {
+          if (message.actionId) {
+            const action = this.store.getPendingAction(message.actionId);
+            if (!action || action.status !== "pending" || action.expiresAt <= Date.now()) {
+              this.store.markOutboxSent(message.id);
+              continue;
+            }
+          }
+          const options: Record<string, unknown> = {};
+          if (message.payload.parseMode) options.parse_mode = message.payload.parseMode;
+          if (message.payload.keyboard) options.reply_markup = { inline_keyboard: message.payload.keyboard };
+          const sent = await this.bot.api.sendMessage(message.chatId, message.payload.text, options as never);
+          this.store.markOutboxSent(message.id);
+          if (message.actionId) this.store.setTelegramMessage(message.actionId, message.chatId, sent.message_id);
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : String(error);
+          this.store.retryOutbox(message.id, message.attempts + 1, detail);
+          this.logger.warn({ error, outboxId: message.id, attempts: message.attempts + 1 }, "Telegram delivery failed");
+        }
+      }
+    } finally {
+      this.drainingOutbox = false;
+    }
+  }
+
+  private async clearActionKeyboards(actionId: string): Promise<void> {
+    await Promise.all(this.store.listTelegramMessages(actionId).map(async ({ chatId, messageId }) => {
+      try {
+        await this.bot.api.editMessageReplyMarkup(chatId, messageId, { reply_markup: { inline_keyboard: [] } });
+      } catch (error) {
+        this.logger.debug({ error, actionId, chatId, messageId }, "could not clear resolved action keyboard");
+      }
+    }));
   }
 
   private bufferAgentMessage(sessionId: string, text: string, session?: StoredSession): void {
@@ -847,31 +1173,22 @@ export class TelegramGateway {
     if (!info.isDirectory()) throw new Error(`Not a directory: ${path}`);
   }
 
-  private actionKeyboard(action: { id: string; nonce: string; kind: string; payload?: unknown }): InlineKeyboard {
-    if (action.kind === "question") {
-      const keyboard = new InlineKeyboard();
-      const questions = requestUserInputQuestions(action.payload);
-      if (questions.length === 1) {
-        questions[0]!.options.slice(0, 8).forEach((choice) => {
-          const selectionId = Math.random().toString(36).slice(2, 10);
-          this.answerSelections.set(selectionId, { actionId: action.id, nonce: action.nonce, text: choice.label });
-          keyboard.text(choice.label.slice(0, 48), `answer:${selectionId}`).row();
-        });
-      }
-      keyboard.text("Reply in chat", `replyhint:${action.id}`);
-      return keyboard;
-    }
-    return new InlineKeyboard()
-      .text("Approve", `act:${action.id}:${action.nonce}:accept`)
-      .text("Approve for session", `act:${action.id}:${action.nonce}:acceptForSession`)
-      .row()
-      .text("Deny", `act:${action.id}:${action.nonce}:decline`);
-  }
-
   private allowedDeliveryChats(): number[] {
     if (this.config.allowedChatIds.size > 0) return [...this.config.allowedChatIds];
     return [...this.config.allowedUserIds];
   }
+}
+
+function interactionKeyboard(view: InteractionView): InlineKeyboard {
+  const keyboard = new InlineKeyboard();
+  for (const row of view.rows) {
+    for (const button of row) {
+      if (button.url) keyboard.url(button.label, button.url);
+      else if (button.callbackData) keyboard.text(button.label, button.callbackData);
+    }
+    keyboard.row();
+  }
+  return keyboard;
 }
 
 function sessionsKeyboard(sessions: StoredSession[]): InlineKeyboard {
@@ -912,21 +1229,6 @@ function panelKeyboard(session?: StoredSession): InlineKeyboard {
   return keyboard;
 }
 
-function formatThreads(threads: CodexThreadSummary[]): string {
-  return [
-    "Previous app-server threads",
-    "",
-    ...threads.map((thread, index) => {
-      const title = thread.name || thread.preview || thread.id;
-      const updated = thread.updatedAt ? new Date(thread.updatedAt * 1000).toISOString() : "unknown";
-      const cwd = thread.cwd ? `\n${thread.cwd}` : "";
-      return `${index + 1}. ${title.slice(0, 120)}\n${thread.id}\nupdated: ${updated}${cwd}`;
-    }),
-    "",
-    "Use /resume <threadId> to resume one directly."
-  ].join("\n\n");
-}
-
 function formatModels(models: CodexModelSummary[]): string {
   return [
     "Available models",
@@ -937,6 +1239,43 @@ function formatModels(models: CodexModelSummary[]): string {
     }),
     "",
     "Use /model <id> to change the active app-server session."
+  ].join("\n");
+}
+
+function formatLimits(limits: RateLimitSummary | undefined): string {
+  if (!limits) return "No Codex account limit information is available.";
+  return [
+    "Codex account limits",
+    "",
+    `used: ${limits.usedPercent.toFixed(1)}%`,
+    limits.planType ? `plan: ${limits.planType}` : undefined,
+    limits.windowDurationMins ? `window: ${limits.windowDurationMins} minutes` : undefined,
+    limits.resetsAt ? `resets: ${new Date(limits.resetsAt * 1000).toISOString()}` : undefined,
+    `updated: ${new Date(limits.updatedAt).toISOString()}`
+  ].filter(Boolean).join("\n");
+}
+
+function formatProgress(progress: SessionProgress): string {
+  return [
+    "Active turn plan",
+    progress.explanation ? `\n${progress.explanation}` : undefined,
+    "",
+    ...progress.plan.map((step) => `${step.status === "completed" ? "OK" : step.status === "inProgress" ? ">" : "-"} ${step.step}`),
+    "",
+    `updated: ${new Date(progress.updatedAt).toISOString()}`
+  ].filter((value) => value !== undefined).join("\n");
+}
+
+function formatGoal(goal: ThreadGoalSummary): string {
+  return [
+    "Codex goal",
+    "",
+    goal.objective,
+    "",
+    `status: ${goal.status}`,
+    `tokens: ${goal.tokensUsed}${goal.tokenBudget ? ` / ${goal.tokenBudget}` : ""}`,
+    `time: ${goal.timeUsedSeconds}s`,
+    `updated: ${new Date(goal.updatedAt).toISOString()}`
   ].join("\n");
 }
 

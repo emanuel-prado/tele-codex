@@ -42,13 +42,28 @@ export function formatRequestUserInput(payload: unknown): string {
   return questions.map(formatQuestion).join("\n\n");
 }
 
-export function buildRequestUserInputResponse(action: PendingAction, answer: string): unknown {
+export function buildRequestUserInputResponse(
+  action: PendingAction,
+  answer: string | Record<string, { answers: string[] }>
+): unknown {
+  const questions = requestUserInputQuestions(action.payload);
+  if (typeof answer !== "string") {
+    if (Object.keys(answer).length === 0) return { answers: {} };
+    const expected = new Set(questions.map((question) => question.id));
+    const provided = Object.keys(answer);
+    if (provided.length !== expected.size || provided.some((id) => !expected.has(id))) {
+      throw new Error("Question response does not match the pending Codex questions.");
+    }
+    for (const value of Object.values(answer)) {
+      if (value.answers.length === 0 || value.answers.some((item) => !item.trim())) {
+        throw new Error("Every Codex question requires a non-empty answer.");
+      }
+    }
+    return { answers: answer };
+  }
   const trimmed = answer.trim();
   if (!trimmed) throw new Error("Question responses require text.");
-  const questions = requestUserInputQuestions(action.payload);
-  if (questions.length !== 1) {
-    throw new Error("Telegram currently supports one Codex question at a time. Answer this request from Codex directly.");
-  }
+  if (questions.length !== 1) throw new Error("This Codex request requires answers for every question.");
   return {
     answers: {
       [questions[0]!.id]: {
@@ -58,13 +73,20 @@ export function buildRequestUserInputResponse(action: PendingAction, answer: str
   };
 }
 
-export function buildMcpElicitationResponse(decision: string): unknown {
+export function buildMcpElicitationResponse(decision: string, content: unknown = null): unknown {
   const action = decision === "decline" || decision === "cancel" ? decision : "accept";
   return {
     action,
-    content: null,
+    content: action === "accept" ? content : null,
     _meta: null
   };
+}
+
+export function buildPermissionsResponse(action: PendingAction, decision: string, scope: "turn" | "session" = "turn"): unknown {
+  const params = actionParams(action.payload);
+  const denied = decision === "decline" || decision === "cancel";
+  const permissions = denied ? {} : asRecord(params.permissions);
+  return { permissions, scope: denied ? "turn" : scope, strictAutoReview: false };
 }
 
 export function parseTokenUsage(payload: unknown, updatedAt = Date.now()): SessionTokenUsage | undefined {

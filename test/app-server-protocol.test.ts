@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   buildMcpElicitationResponse,
+  buildPermissionsResponse,
   buildRequestUserInputResponse,
   formatRequestUserInput,
   parseTokenUsage,
@@ -55,13 +56,23 @@ describe("app-server protocol helpers", () => {
     expect(formatRequestUserInput(payload)).toContain("custom answer");
   });
 
-  it("rejects multi-question responses for the Telegram MVP", () => {
+  it("maps every answer in a multi-question response", () => {
     const action = questionAction([
       { id: "one", question: "First?", isOther: false, isSecret: false, options: null },
       { id: "two", question: "Second?", isOther: false, isSecret: false, options: null }
     ]);
 
-    expect(() => buildRequestUserInputResponse(action, "answer")).toThrow(/one Codex question at a time/);
+    expect(
+      buildRequestUserInputResponse(action, {
+        one: { answers: ["first"] },
+        two: { answers: ["second"] }
+      })
+    ).toEqual({
+      answers: {
+        one: { answers: ["first"] },
+        two: { answers: ["second"] }
+      }
+    });
   });
 
   it("parses option labels for Telegram buttons", () => {
@@ -85,6 +96,28 @@ describe("app-server protocol helpers", () => {
       action: "decline",
       content: null,
       _meta: null
+    });
+  });
+
+  it("includes validated MCP form content only for accepted responses", () => {
+    expect(buildMcpElicitationResponse("accept", { project: "tele-codex" })).toEqual({
+      action: "accept",
+      content: { project: "tele-codex" },
+      _meta: null
+    });
+    expect(buildMcpElicitationResponse("cancel", { ignored: true })).toEqual({ action: "cancel", content: null, _meta: null });
+  });
+
+  it("denies permission requests with an empty turn-scoped grant", () => {
+    const action: PendingAction = {
+      ...questionAction([]),
+      kind: "permissionsApproval",
+      payload: { method: "item/permissions/requestApproval", params: { permissions: { network: { enabled: true } } } }
+    };
+    expect(buildPermissionsResponse(action, "decline", "session")).toEqual({
+      permissions: {},
+      scope: "turn",
+      strictAutoReview: false
     });
   });
 

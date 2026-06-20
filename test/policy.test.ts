@@ -11,6 +11,8 @@ const baseConfig: AppConfig = {
   defaultAdapter: "appserver",
   logLevel: "silent",
   approvalTimeoutMs: 1000,
+  rpcTimeoutMs: 30000,
+  rateLimitWarnPercent: 80,
   allowSessionGrants: false,
   codexCommand: "codex",
   ptySubmitKey: "C-j",

@@ -129,7 +129,6 @@ export class PtyAdapter implements CodexAdapter {
     } else {
       await this.sendUserText(action.sessionId, decision.decision === "decline" ? "n" : "y");
     }
-    this.store.resolvePendingAction(action.id, "resolved");
   }
 
   async interrupt(sessionId: string): Promise<void> {

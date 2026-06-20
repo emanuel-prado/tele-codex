@@ -13,6 +13,8 @@ describe("loadConfig", () => {
     expect(config.allowedUserIds.has(2)).toBe(true);
     expect(config.defaultAdapter).toBe("appserver");
     expect(config.allowSessionGrants).toBe(true);
+    expect(config.rpcTimeoutMs).toBe(30_000);
+    expect(config.rateLimitWarnPercent).toBe(80);
     expect(config.ptySubmitKey).toBe("enter");
     expect(config.ptyPasteSettleMs).toBe(250);
     expect(config.workspaceRoot.endsWith("/Workspace")).toBe(true);
