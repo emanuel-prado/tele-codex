@@ -11,6 +11,7 @@ const baseConfig: AppConfig = {
   logLevel: "silent",
   approvalTimeoutMs: 1000,
   rpcTimeoutMs: 30000,
+  appServerMaxReconnectAttempts: 3,
   rateLimitWarnPercent: 80,
   allowSessionGrants: false,
   codexCommand: "codex",

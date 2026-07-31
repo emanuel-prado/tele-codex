@@ -118,6 +118,25 @@ describe("SessionManager thread lifecycle", () => {
   });
 });
 
+describe("SessionManager event forwarding", () => {
+  it("exposes adapter event-loop death to the runtime supervisor", async () => {
+    const store = new Store(":memory:");
+    const appserver: AppServerRuntime = {
+      ...unusedAdapterMethods(),
+      async *events() {
+        throw new Error("adapter stream crashed");
+      }
+    };
+    const manager = new SessionManager(appserver, store, silentLogger());
+    const subsystem = manager.eventSubsystem();
+
+    subsystem.start();
+    await expect(subsystem.wait()).rejects.toThrow("adapter stream crashed");
+    await subsystem.stop();
+    store.close();
+  });
+});
+
 function fakeAppServer(
   store: Store,
   threads: CodexThreadSummary[],

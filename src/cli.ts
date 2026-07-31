@@ -10,6 +10,8 @@ import { SessionManager } from "./runtime/session-manager.js";
 import { loadDotEnv } from "./runtime/dotenv.js";
 import { formatDoctorReport, runDoctor } from "./runtime/doctor.js";
 import { ServiceManager } from "./runtime/service-manager.js";
+import { RuntimeHealth } from "./runtime/health.js";
+import { RuntimeSupervisor, type SupervisedSubsystem } from "./runtime/supervisor.js";
 
 async function main(): Promise<void> {
   const envFile = optionValue("--env-file") ?? process.env.TELE_CODEX_ENV_FILE ?? ".env";
@@ -27,22 +29,54 @@ async function main(): Promise<void> {
   }
   const logger = createLogger(config.logLevel);
   const store = new Store(config.dbPath);
-  const appserver = new AppServerAdapter(config, store, logger);
-  const sessions = new SessionManager(appserver, store, logger);
-  const legacyTmux = new LegacyTmuxBridge(config, store, logger);
-  const policy = new PolicyEngine(config);
-  const telegram = new TelegramGateway(config, sessions, legacyTmux, store, policy, logger);
+  try {
+    const health = new RuntimeHealth(store);
+    const supervisor = new RuntimeSupervisor(health, logger);
+    const appserver = new AppServerAdapter(config, store, logger, health);
+    const sessions = new SessionManager(appserver, store, logger);
+    const legacyTmux = new LegacyTmuxBridge(config, store, logger);
+    const policy = new PolicyEngine(config);
+    const telegram = new TelegramGateway(config, sessions, legacyTmux, store, policy, logger, health);
 
-  const shutdown = async () => {
-    logger.info("shutting down");
-    await telegram.stop();
-    await sessions.close();
+    const storeSubsystem = cleanupSubsystem("sqlite-store", () => store.close());
+    const appServerSubsystem: SupervisedSubsystem = {
+      name: "app-server-transport",
+      start: () => appserver.startTransport(),
+      wait: () => appserver.waitForFailure(),
+      stop: () => sessions.close()
+    };
+    const [telegramPolling, telegramEvents, outboxWorker, actionSweeper] = telegram.runtimeSubsystems();
+    if (!telegramPolling || !telegramEvents || !outboxWorker || !actionSweeper) {
+      throw new Error("Telegram runtime subsystem registry is incomplete.");
+    }
+    const subsystems = [
+      storeSubsystem,
+      appServerSubsystem,
+      telegramEvents,
+      outboxWorker,
+      actionSweeper,
+      sessions.eventSubsystem(),
+      telegramPolling
+    ];
+    const shutdown = () => {
+      logger.info("shutting down");
+      void supervisor.stop().catch((error) => logger.error({ error }, "runtime shutdown failed"));
+    };
+    process.once("SIGINT", shutdown);
+    process.once("SIGTERM", shutdown);
+
+    try {
+      await supervisor.start(subsystems);
+      await supervisor.wait();
+    } finally {
+      process.removeListener("SIGINT", shutdown);
+      process.removeListener("SIGTERM", shutdown);
+      await supervisor.stop();
+    }
+  } catch (error) {
     store.close();
-  };
-  process.once("SIGINT", () => void shutdown().finally(() => process.exit(0)));
-  process.once("SIGTERM", () => void shutdown().finally(() => process.exit(0)));
-
-  await telegram.start();
+    throw error;
+  }
 }
 
 async function runServiceCommand(envFile: string): Promise<void> {
@@ -62,7 +96,30 @@ async function runServiceCommand(envFile: string): Promise<void> {
     console.log(formatServiceStatus(await manager.status()));
     return;
   }
-  throw new Error("Usage: tele-codex service install|status|uninstall [--env-file PATH]");
+  if (action === "update") {
+    console.log(formatServiceStatus(await manager.update()));
+    return;
+  }
+  throw new Error("Usage: tele-codex service install|status|update|uninstall [--env-file PATH]");
+}
+
+function cleanupSubsystem(name: string, cleanup: () => void | Promise<void>): SupervisedSubsystem {
+  let resolve!: () => void;
+  const stopped = new Promise<void>((done) => {
+    resolve = done;
+  });
+  let stopPromise: Promise<void> | undefined;
+  return {
+    name,
+    start() {},
+    wait: () => stopped,
+    stop() {
+      if (!stopPromise) {
+        stopPromise = Promise.resolve().then(cleanup).finally(resolve);
+      }
+      return stopPromise;
+    }
+  };
 }
 
 function formatServiceStatus(status: Awaited<ReturnType<ServiceManager["status"]>>): string {

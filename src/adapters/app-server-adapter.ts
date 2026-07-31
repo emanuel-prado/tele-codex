@@ -17,6 +17,7 @@ import { AsyncQueue } from "../utils/async-queue.js";
 import { createId, createNonce, nowMs } from "../utils/ids.js";
 import { Store } from "../store/store.js";
 import type { StoredSession } from "../store/store.js";
+import { noopRuntimeHealth, type RuntimeHealthReporter } from "../runtime/health.js";
 import {
   buildMcpElicitationResponse,
   buildPermissionsResponse,
@@ -38,11 +39,19 @@ export class AppServerAdapter implements AppServerRuntime {
   private reconnectAttempt = 0;
   private stopping = false;
   private connectionGeneration: number | undefined;
+  private runtimeSettled = false;
+  private resolveRuntime!: () => void;
+  private rejectRuntime!: (error: Error) => void;
+  private readonly runtimePromise = new Promise<void>((resolve, reject) => {
+    this.resolveRuntime = resolve;
+    this.rejectRuntime = reject;
+  });
 
   constructor(
     private readonly config: AppConfig,
     private readonly store: Store,
-    private readonly logger: Logger
+    private readonly logger: Logger,
+    private readonly health: RuntimeHealthReporter = noopRuntimeHealth
   ) {
     this.store.clearSessionAttachments();
     const startupOpenActions = this.store.listOpenActions();
@@ -53,7 +62,12 @@ export class AppServerAdapter implements AppServerRuntime {
       this.logger.warn({ orphaned }, "orphaned pending actions from a previous app-server connection");
     }
     this.rpc = new JsonRpcClient(logger, config.rpcTimeoutMs);
-    this.rpc.on("message", (message: JsonRpcMessage, generation: number) => void this.handleMessage(message, generation));
+    this.rpc.on("activity", (generation: number) => {
+      if (generation === this.connectionGeneration) this.health.appServer({ lastMessageAt: Date.now() });
+    });
+    this.rpc.on("message", (message: JsonRpcMessage, generation: number) => {
+      void this.handleMessage(message, generation).catch((error) => this.failRuntime(error));
+    });
     this.rpc.on("stderr", (chunk: string, generation: number) => {
       if (generation !== this.connectionGeneration) return;
       for (const session of this.store.listSessions()) {
@@ -362,12 +376,39 @@ export class AppServerAdapter implements AppServerRuntime {
     return this.queue;
   }
 
+  async startTransport(): Promise<void> {
+    this.stopping = false;
+    this.health.appServer({
+      state: "connecting",
+      transport: this.config.appServerUrl ? "websocket" : "stdio",
+      reconnectAttempt: 0,
+      detail: "Establishing app-server transport."
+    });
+    try {
+      await this.ensureConnected();
+    } catch (error) {
+      this.health.appServer({ state: "failed", detail: error instanceof Error ? error.message : String(error) });
+      throw error;
+    }
+  }
+
+  waitForFailure(): Promise<void> {
+    return this.runtimePromise;
+  }
+
   close(): void {
+    if (this.stopping) return;
     this.stopping = true;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = undefined;
     this.connected = false;
     this.rpc.close();
+    this.queue.close();
+    this.health.appServer({ state: "stopped", pid: undefined, detail: "App-server transport stopped." });
+    if (!this.runtimeSettled) {
+      this.runtimeSettled = true;
+      this.resolveRuntime();
+    }
   }
 
   private async ensureConnected(): Promise<void> {
@@ -397,6 +438,15 @@ export class AppServerAdapter implements AppServerRuntime {
     this.reconnectAttempt = 0;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = undefined;
+    const transport = this.rpc.transportInfo();
+    this.health.appServer({
+      state: "connected",
+      transport: transport.kind,
+      pid: transport.pid,
+      connectionGeneration: generation,
+      reconnectAttempt: 0,
+      detail: "App-server transport connected."
+    });
   }
 
   private handleDisconnect(generation: number): void {
@@ -407,6 +457,7 @@ export class AppServerAdapter implements AppServerRuntime {
     }
     if (!this.connected && this.reconnectTimer) return;
     this.connected = false;
+    this.health.appServer({ state: "reconnecting", pid: undefined, detail: "App-server transport disconnected." });
     this.activeTurns.clear();
     const openActions = this.store.listOpenActions(generation);
     const orphaned = this.store.orphanOpenActions(generation);
@@ -436,8 +487,18 @@ export class AppServerAdapter implements AppServerRuntime {
   }
 
   private scheduleReconnect(): void {
-    if (this.reconnectTimer) return;
-    const delay = Math.min(30_000, 1_000 * 2 ** this.reconnectAttempt++);
+    if (this.reconnectTimer || this.stopping || this.runtimeSettled) return;
+    if (this.reconnectAttempt >= this.config.appServerMaxReconnectAttempts) {
+      this.failRuntime(new Error(`App-server reconnect exhausted after ${this.reconnectAttempt} attempts.`));
+      return;
+    }
+    const attempt = ++this.reconnectAttempt;
+    const delay = Math.min(30_000, 1_000 * 2 ** (attempt - 1));
+    this.health.appServer({
+      state: "reconnecting",
+      reconnectAttempt: attempt,
+      detail: `Reconnect attempt ${attempt}/${this.config.appServerMaxReconnectAttempts} in ${delay}ms.`
+    });
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = undefined;
       void this.ensureConnected()
@@ -454,10 +515,18 @@ export class AppServerAdapter implements AppServerRuntime {
           this.recoveringSessionIds.clear();
         })
         .catch((error) => {
-          this.logger.warn({ error, delay }, "app-server reconnect failed");
+          this.logger.warn({ error, delay, attempt }, "app-server reconnect failed");
           this.scheduleReconnect();
         });
     }, delay);
+  }
+
+  private failRuntime(error: unknown): void {
+    if (this.stopping || this.runtimeSettled) return;
+    const failure = error instanceof Error ? error : new Error(String(error));
+    this.runtimeSettled = true;
+    this.health.appServer({ state: "failed", pid: undefined, detail: failure.message });
+    this.rejectRuntime(failure);
   }
 
   private async handleMessage(message: JsonRpcMessage, generation: number): Promise<void> {

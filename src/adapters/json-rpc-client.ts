@@ -125,11 +125,18 @@ export class JsonRpcClient extends EventEmitter {
   }
 
   close(): void {
+    this.rejectPending(new Error("JSON-RPC client closed."));
     this.socket?.close();
     this.child?.kill();
     this.socket = undefined;
     this.child = undefined;
     this.activeGeneration = undefined;
+  }
+
+  transportInfo(): { kind?: "stdio" | "websocket"; pid?: number } {
+    if (this.child) return this.child.pid === undefined ? { kind: "stdio" } : { kind: "stdio", pid: this.child.pid };
+    if (this.socket) return { kind: "websocket" };
+    return {};
   }
 
   private send(message: JsonRpcMessage, expectedGeneration?: number): void {
@@ -183,6 +190,7 @@ export class JsonRpcClient extends EventEmitter {
       this.logger.warn({ raw, error }, "invalid JSON-RPC message");
       return;
     }
+    this.emit("activity", generation);
 
     if (message.id !== undefined && (message.result !== undefined || message.error !== undefined) && !message.method) {
       const pending = this.pending.get(message.id);

@@ -13,6 +13,7 @@ describe("loadConfig", () => {
     expect(config.allowedUserIds.has(2)).toBe(true);
     expect(config.allowSessionGrants).toBe(true);
     expect(config.rpcTimeoutMs).toBe(30_000);
+    expect(config.appServerMaxReconnectAttempts).toBe(8);
     expect(config.rateLimitWarnPercent).toBe(80);
     expect(config.tmuxSubmitKey).toBe("enter");
     expect(config.tmuxPasteSettleMs).toBe(250);

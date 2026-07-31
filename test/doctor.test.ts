@@ -46,6 +46,7 @@ function config(workspaceRoot: string, dbPath: string): AppConfig {
     logLevel: "info",
     approvalTimeoutMs: 900000,
     rpcTimeoutMs: 30000,
+    appServerMaxReconnectAttempts: 3,
     rateLimitWarnPercent: 80,
     allowSessionGrants: true,
     codexCommand: "codex",

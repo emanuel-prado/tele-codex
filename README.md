@@ -81,6 +81,7 @@ node dist/cli.js doctor
 | `TELE_CODEX_TMUX_PASTE_SETTLE_MS` | `250` | Delay between tmux paste and submit key. |
 | `TELE_CODEX_ALLOW_SESSION_GRANTS` | `true` | Enables “approve for session.” |
 | `TELE_CODEX_RPC_TIMEOUT_MS` | `30000` | Maximum wait for an app-server JSON-RPC response. |
+| `TELE_CODEX_APP_SERVER_MAX_RECONNECT_ATTEMPTS` | `8` | Failed reconnect attempts before the supervised runtime exits for systemd restart. |
 | `TELE_CODEX_RATE_LIMIT_WARN_PERCENT` | `80` | First account-limit warning threshold. |
 
 Manual project paths passed to `/new` must stay inside `TELE_CODEX_WORKSPACE_ROOT`.
@@ -121,7 +122,7 @@ Session utilities:
 - `/log [n]` shows recent logs.
 - `/usage` shows the latest token usage reported by app-server.
 - `/doctor` runs local setup health checks.
-- `/health` shows app-server, pending interaction, and delivery-outbox health.
+- `/health` shows overall lifecycle health, every critical worker, app-server transport/PID/generation/reconnect state, Telegram activity, delivery results, and the last fatal correlation ID.
 - `/pending` lists unresolved questions and approvals across sessions.
 - `/search <term>` searches previous Codex sessions.
 - `/limits` shows current account limits.
@@ -194,9 +195,10 @@ Build first, then install the user service from the compiled CLI:
 npm run build
 node dist/cli.js service install --env-file "$PWD/.env"
 node dist/cli.js service status
+node dist/cli.js service update
 ```
 
-The installer writes `~/.config/systemd/user/tele-codex.service`, enables it immediately, restarts it after failures, and keeps Codex child processes in the same systemd control group. If lingering is disabled, follow the reported `loginctl enable-linger` instruction so the user manager survives logout and starts at boot.
+The installer writes `~/.config/systemd/user/tele-codex.service`, enables it immediately, restarts it after failures, and keeps Codex child processes in the same systemd control group. `service update` builds first, restarts only after a successful build, and verifies that the restarted unit remains active with a stable PID. If lingering is disabled, follow the reported `loginctl enable-linger` instruction so the user manager survives logout and starts at boot.
 
 Useful operations:
 
@@ -205,4 +207,4 @@ journalctl --user -u tele-codex.service -f
 node dist/cli.js service uninstall
 ```
 
-The unattended guarantee applies to structured app-server sessions. High-signal notifications are persisted and delivered at least once while the host, Telegram, and Codex are reachable. Threads are deliberately not resumed automatically after a process or host restart; Telegram sends a durable recovery card requiring explicit selection. Secret question answers are refused because Telegram bot chats are not end-to-end encrypted.
+The unattended guarantee applies to structured app-server sessions. App-server connectivity, Telegram polling, event forwarding, outbox delivery, and interaction expiry are supervised. Unexpected loop exit records a correlation ID, runs exactly-once cleanup, and exits nonzero so systemd can restart the process. High-signal notifications are persisted and delivered at least once while the host, Telegram, and Codex are reachable. Threads are deliberately not resumed automatically after a process or host restart; Telegram sends a durable recovery card requiring explicit selection. Secret question answers are refused because Telegram bot chats are not end-to-end encrypted.

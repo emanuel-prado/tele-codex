@@ -12,19 +12,19 @@ import type {
 } from "../types/control.js";
 import type { AttachSession, CodexEvent, LogEntry, SessionRef, StartSession, UserDecision } from "../types/events.js";
 import { AsyncQueue } from "../utils/async-queue.js";
+import type { SupervisedSubsystem } from "./supervisor.js";
 import { Store, type StoredSession } from "../store/store.js";
 
 export class SessionManager {
   private readonly queue = new AsyncQueue<CodexEvent>();
+  private forwardPromise?: Promise<void>;
   private activeSessionId?: string;
 
   constructor(
     private readonly appserver: AppServerRuntime,
     private readonly store: Store,
     private readonly logger: Logger
-  ) {
-    void this.forwardEvents();
-  }
+  ) {}
 
   async newSession(opts: StartSession = {}): Promise<SessionRef> {
     const session = await this.appserver.start(opts);
@@ -304,6 +304,17 @@ export class SessionManager {
     return this.queue;
   }
 
+  eventSubsystem(): SupervisedSubsystem {
+    return {
+      name: "adapter-event-forwarder",
+      start: () => {
+        this.forwardPromise = this.forwardEvents();
+      },
+      wait: () => this.forwardPromise ?? Promise.reject(new Error("Adapter event forwarder was not started.")),
+      stop: () => this.queue.close()
+    };
+  }
+
   getLastActiveSessionId(): string | undefined {
     return this.store.getRuntimeValue<string>("last_active_session_id");
   }
@@ -340,12 +351,10 @@ export class SessionManager {
   }
 
   private async forwardEvents(): Promise<void> {
-    try {
-      for await (const event of this.appserver.events()) {
-        this.queue.push(event);
-      }
-    } catch (error) {
-      this.logger.error({ error }, "app-server event stream failed");
+    for await (const event of this.appserver.events()) {
+      this.queue.push(event);
     }
+    this.queue.close();
   }
+
 }
