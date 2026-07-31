@@ -29,7 +29,7 @@ export class AppServerAdapter implements CodexAdapter {
   readonly kind = "appserver" as const;
   private readonly rpc: JsonRpcClient;
   private readonly queue = new AsyncQueue<CodexEvent>();
-  private readonly sessionsByThread = new Map<string, string>();
+  private readonly sessionsByThread = new Map<string, { sessionId: string; generation: number }>();
   private readonly activeTurns = new Map<string, string>();
   private readonly sessionModels = new Map<string, string>();
   private connected = false;
@@ -37,25 +37,30 @@ export class AppServerAdapter implements CodexAdapter {
   private reconnectTimer: NodeJS.Timeout | undefined;
   private reconnectAttempt = 0;
   private stopping = false;
+  private connectionGeneration: number | undefined;
 
   constructor(
     private readonly config: AppConfig,
     private readonly store: Store,
     private readonly logger: Logger
   ) {
+    this.store.clearSessionAttachments();
+    const startupOpenActions = this.store.listOpenActions();
     const orphaned = this.store.orphanOpenActions();
     if (orphaned > 0) {
       this.store.setRuntimeValue("startup_orphaned_actions", orphaned);
+      this.store.setRuntimeValue("startup_orphaned_action_ids", startupOpenActions.map((action) => action.id));
       this.logger.warn({ orphaned }, "orphaned pending actions from a previous app-server connection");
     }
     this.rpc = new JsonRpcClient(logger, config.rpcTimeoutMs);
-    this.rpc.on("message", (message: JsonRpcMessage) => void this.handleMessage(message));
-    this.rpc.on("stderr", (chunk: string) => {
+    this.rpc.on("message", (message: JsonRpcMessage, generation: number) => void this.handleMessage(message, generation));
+    this.rpc.on("stderr", (chunk: string, generation: number) => {
+      if (generation !== this.connectionGeneration) return;
       for (const session of this.store.listSessions().filter((item) => item.adapter === "appserver")) {
         this.store.appendLog({ sessionId: session.id, type: "appserver.stderr", severity: "debug", text: chunk });
       }
     });
-    this.rpc.on("close", () => this.handleDisconnect());
+    this.rpc.on("close", (_details: unknown, generation: number) => this.handleDisconnect(generation));
   }
 
   async start(opts: StartSession): Promise<SessionRef> {
@@ -72,14 +77,16 @@ export class AppServerAdapter implements CodexAdapter {
 
     const threadId = extractThreadId(result);
     const model = stringField(result, "model");
+    const generation = this.requireConnectionGeneration();
     const session: SessionRef = {
       id: createId("session"),
       adapter: "appserver",
       label: opts.label ?? `Codex ${threadId.slice(0, 8)}`,
-      codexThreadId: threadId
+      codexThreadId: threadId,
+      connectionGeneration: generation
     };
     session.cwd = opts.cwd ?? process.cwd();
-    this.sessionsByThread.set(threadId, session.id);
+    this.sessionsByThread.set(threadId, { sessionId: session.id, generation });
     if (model) this.sessionModels.set(session.id, model);
     this.store.upsertSession(session, "idle");
     this.queue.push({ type: "statusChanged", sessionId: session.id, status: "idle", detail: "App-server thread started." });
@@ -99,14 +106,16 @@ export class AppServerAdapter implements CodexAdapter {
       excludeTurns: true
     });
     const model = stringField(result, "model") ?? opts.model;
+    const generation = this.requireConnectionGeneration();
     const session: SessionRef = {
       id: createId("session"),
       adapter: "appserver",
       label: opts.label ?? labelForThread(asRecord((asRecord(result).thread)), opts.codexThreadId),
-      codexThreadId: opts.codexThreadId
+      codexThreadId: opts.codexThreadId,
+      connectionGeneration: generation
     };
     if (opts.cwd) session.cwd = opts.cwd;
-    this.sessionsByThread.set(opts.codexThreadId, session.id);
+    this.sessionsByThread.set(opts.codexThreadId, { sessionId: session.id, generation });
     if (model) this.sessionModels.set(session.id, model);
     this.store.upsertSession(session, "attached");
     return session;
@@ -116,7 +125,9 @@ export class AppServerAdapter implements CodexAdapter {
     if (!session.codexThreadId) throw new Error("Stored app-server session has no Codex thread id.");
     await this.ensureConnected();
     const result = await this.rpc.request("thread/resume", { threadId: session.codexThreadId, excludeTurns: true });
-    this.sessionsByThread.set(session.codexThreadId, session.id);
+    const generation = this.requireConnectionGeneration();
+    this.sessionsByThread.set(session.codexThreadId, { sessionId: session.id, generation });
+    this.store.upsertSession({ ...session, connectionGeneration: generation }, "idle");
     const model = stringField(result, "model");
     if (model) this.sessionModels.set(session.id, model);
     this.store.setSessionStatus(session.id, "idle");
@@ -132,15 +143,17 @@ export class AppServerAdapter implements CodexAdapter {
     });
     const thread = asRecord(asRecord(result).thread);
     const model = stringField(result, "model") ?? options.model;
+    const generation = this.requireConnectionGeneration();
     const session: SessionRef = {
       id: createId("session"),
       adapter: "appserver",
       label: labelForThread(thread, threadId),
-      codexThreadId: threadId
+      codexThreadId: threadId,
+      connectionGeneration: generation
     };
     const cwd = stringField(result, "cwd") ?? stringField(thread, "cwd");
     if (cwd) session.cwd = cwd;
-    this.sessionsByThread.set(threadId, session.id);
+    this.sessionsByThread.set(threadId, { sessionId: session.id, generation });
     if (model) this.sessionModels.set(session.id, model);
     this.store.upsertSession(session, "idle");
     if (options.mode) await this.setCollaborationMode(session.id, options.mode);
@@ -171,17 +184,24 @@ export class AppServerAdapter implements CodexAdapter {
 
   async respondAction(decision: UserDecision): Promise<void> {
     const action = this.store.getPendingAction(decision.actionId);
-    if (!action?.requestId) throw new Error("Pending app-server action not found.");
+    if (!action || action.requestId == null || action.connectionGeneration == null) {
+      throw new Error("Pending app-server action not found.");
+    }
+    if (!this.connected || action.connectionGeneration !== this.connectionGeneration) {
+      this.store.resolvePendingAction(action.id, "orphaned");
+      throw new Error("This approval belongs to a disconnected app-server connection. Resume the thread and retry the original command.");
+    }
+    const generation = action.connectionGeneration;
 
     if (action.kind === "question") {
-      this.rpc.respond(action.requestId, buildRequestUserInputResponse(action, decision.answers ?? decision.text ?? ""));
+      this.rpc.respond(action.requestId, buildRequestUserInputResponse(action, decision.answers ?? decision.text ?? ""), generation);
     } else if (action.kind === "mcpElicitation") {
-      this.rpc.respond(action.requestId, buildMcpElicitationResponse(decision.decision, decision.content));
+      this.rpc.respond(action.requestId, buildMcpElicitationResponse(decision.decision, decision.content), generation);
     } else if (action.kind === "permissionsApproval") {
-      this.rpc.respond(action.requestId, buildPermissionsResponse(action, decision.decision, decision.permissionScope));
+      this.rpc.respond(action.requestId, buildPermissionsResponse(action, decision.decision, decision.permissionScope), generation);
     } else {
       const responseDecision = decision.protocolDecision ?? (decision.decision === "acceptForSession" ? "acceptForSession" : decision.decision);
-      this.rpc.respond(action.requestId, { decision: responseDecision });
+      this.rpc.respond(action.requestId, { decision: responseDecision }, generation);
     }
 
     if (decision.decision === "acceptForSession") {
@@ -355,35 +375,55 @@ export class AppServerAdapter implements CodexAdapter {
   }
 
   private async connect(): Promise<void> {
+    const generation = (this.store.getRuntimeValue<number>("appserver_connection_generation") ?? 0) + 1;
+    this.store.setRuntimeValue("appserver_connection_generation", generation);
     if (this.config.appServerUrl) {
-      await this.rpc.connectWebSocket(this.config.appServerUrl, process.env.TELE_CODEX_APP_SERVER_TOKEN);
+      await this.rpc.connectWebSocket(this.config.appServerUrl, process.env.TELE_CODEX_APP_SERVER_TOKEN, generation);
     } else {
-      await this.rpc.connectStdio(this.config.codexCommand);
+      await this.rpc.connectStdio(this.config.codexCommand, generation);
     }
+    this.connectionGeneration = generation;
     await this.rpc.request("initialize", {
       clientInfo: { name: "tele-codex", title: "Telegram Companion for Codex", version: "0.1.0" },
       capabilities: { experimentalApi: true, requestAttestation: false }
     });
-    this.rpc.notify("initialized");
+    this.rpc.notify("initialized", undefined, generation);
     this.connected = true;
     this.reconnectAttempt = 0;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = undefined;
   }
 
-  private handleDisconnect(): void {
+  private handleDisconnect(generation: number): void {
     if (this.stopping) return;
+    if (generation !== this.connectionGeneration) {
+      this.logger.debug({ generation, currentGeneration: this.connectionGeneration }, "ignored stale app-server disconnect");
+      return;
+    }
     if (!this.connected && this.reconnectTimer) return;
     this.connected = false;
     this.activeTurns.clear();
-    const orphaned = this.store.orphanOpenActions();
-    const sessions = this.store.listSessions().filter((item) => item.adapter === "appserver" && item.status !== "stopped");
+    const openActions = this.store.listOpenActions(generation);
+    const orphaned = this.store.orphanOpenActions(generation);
+    const detachedSessionIds = new Set(this.store.clearSessionAttachments(generation));
+    for (const [threadId, attachment] of this.sessionsByThread) {
+      if (attachment.generation === generation) this.sessionsByThread.delete(threadId);
+    }
+    for (const action of openActions) {
+      this.queue.push({
+        type: "actionOrphaned",
+        sessionId: action.sessionId,
+        actionId: action.id,
+        message: "App-server disconnected before Codex confirmed this request. Resume the thread and retry the original command."
+      });
+    }
+    const sessions = this.store.listSessions().filter((item) => detachedSessionIds.has(item.id));
     for (const session of sessions) {
       this.store.setSessionStatus(session.id, "error");
       this.queue.push({
         type: "error",
         sessionId: session.id,
-        message: `App-server disconnected${orphaned ? `; ${orphaned} pending request(s) were orphaned` : ""}. Reconnection will restore controls, but resuming the thread requires your confirmation.`,
+        message: `App-server disconnected${orphaned ? `; ${orphaned} pending request(s) were orphaned` : ""}. Resume the thread, then retry the original command.`,
         willRetry: true
       });
     }
@@ -412,26 +452,31 @@ export class AppServerAdapter implements CodexAdapter {
     }, delay);
   }
 
-  private async handleMessage(message: JsonRpcMessage): Promise<void> {
-    if (!message.method) return;
-    if (message.id !== undefined) {
-      await this.handleServerRequest(message);
+  private async handleMessage(message: JsonRpcMessage, generation: number): Promise<void> {
+    if (generation !== this.connectionGeneration) {
+      this.logger.debug({ generation, currentGeneration: this.connectionGeneration }, "ignored stale app-server message");
       return;
     }
-    this.handleNotification(message);
+    if (!message.method) return;
+    if (message.id !== undefined) {
+      await this.handleServerRequest(message, generation);
+      return;
+    }
+    this.handleNotification(message, generation);
   }
 
-  private async handleServerRequest(message: JsonRpcMessage): Promise<void> {
+  private async handleServerRequest(message: JsonRpcMessage, generation: number): Promise<void> {
     const params = asRecord(message.params);
     const threadId = typeof params.threadId === "string" ? params.threadId : undefined;
-    const sessionId = threadId ? this.sessionsByThread.get(threadId) : undefined;
+    const attachment = threadId ? this.sessionsByThread.get(threadId) : undefined;
+    const sessionId = attachment?.generation === generation ? attachment.sessionId : undefined;
     if (!sessionId) {
-      this.rpc.fail(message.id as string | number, -32001, "No Telegram session is attached to this Codex thread.");
+      this.rpc.fail(message.id as string | number, -32001, "No Telegram session is attached to this Codex thread.", generation);
       return;
     }
 
     if (!isSupportedInteractiveRequest(message.method)) {
-      this.rpc.fail(message.id as string | number, -32601, `Unsupported app-server request: ${message.method}`);
+      this.rpc.fail(message.id as string | number, -32601, `Unsupported app-server request: ${message.method}`, generation);
       this.queue.push({
         type: "error",
         sessionId,
@@ -445,7 +490,8 @@ export class AppServerAdapter implements CodexAdapter {
       message.id as string | number,
       message.method ?? "unknown",
       params,
-      this.config.approvalTimeoutMs
+      this.config.approvalTimeoutMs,
+      generation
     );
     this.store.putPendingAction(action);
     this.queue.push({
@@ -455,10 +501,20 @@ export class AppServerAdapter implements CodexAdapter {
     });
   }
 
-  private handleNotification(message: JsonRpcMessage): void {
+  private handleNotification(message: JsonRpcMessage, generation: number): void {
     const params = asRecord(message.params);
     const threadId = typeof params.threadId === "string" ? params.threadId : undefined;
-    const sessionId = threadId ? this.sessionsByThread.get(threadId) : undefined;
+    const attachment = threadId ? this.sessionsByThread.get(threadId) : undefined;
+    const sessionId = attachment?.generation === generation ? attachment.sessionId : undefined;
+    if (message.method === "serverRequest/resolved") {
+      const requestId = params.requestId;
+      if (typeof requestId === "string" || typeof requestId === "number") {
+        const actionId = this.store.resolvePendingActionByRequestId(requestId, generation);
+        const action = actionId ? this.store.getPendingAction(actionId) : undefined;
+        if (actionId && action) this.queue.push({ type: "actionResolved", sessionId: action.sessionId, actionId });
+      }
+      return;
+    }
     if (message.method === "account/rateLimits/updated") {
       const limits = parseRateLimits(asRecord(params.rateLimits));
       if (limits) {
@@ -611,15 +667,6 @@ export class AppServerAdapter implements CodexAdapter {
       return;
     }
 
-    if (message.method === "serverRequest/resolved") {
-      const requestId = params.requestId;
-      if (typeof requestId === "string" || typeof requestId === "number") {
-        const actionId = this.store.resolvePendingActionByRequestId(requestId);
-        if (actionId) this.queue.push({ type: "actionResolved", sessionId, actionId });
-      }
-      return;
-    }
-
     if (message.method === "error") {
       const event: CodexEvent = {
         type: "error",
@@ -637,6 +684,13 @@ export class AppServerAdapter implements CodexAdapter {
     if (!session?.codexThreadId) throw new Error(`Unknown app-server session: ${sessionId}`);
     return session;
   }
+
+  private requireConnectionGeneration(): number {
+    if (!this.connected || this.connectionGeneration === undefined) {
+      throw new Error("App-server is not connected.");
+    }
+    return this.connectionGeneration;
+  }
 }
 
 function extractThreadId(result: { thread?: { id: string } } | { id?: string }): string {
@@ -650,7 +704,8 @@ function makeActionFromServerRequest(
   requestId: string | number,
   method: string,
   params: Record<string, unknown>,
-  timeoutMs: number
+  timeoutMs: number,
+  connectionGeneration: number
 ): PendingAction {
   const command = typeof params.command === "string" ? params.command : undefined;
   const reason = typeof params.reason === "string" ? params.reason : undefined;
@@ -676,6 +731,7 @@ function makeActionFromServerRequest(
     kind,
     sessionId,
     requestId,
+    connectionGeneration,
     title,
     body: body || JSON.stringify(params),
     payload: { method, params },

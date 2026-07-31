@@ -38,16 +38,19 @@ export class PendingInteractionManager {
   ) {}
 
   actionView(action: StoredPendingAction | PendingAction, chatId: number): InteractionView {
+    const retryPrefix = "status" in action && action.status === "failed"
+      ? `Previous submission failed${action.failureReason ? `: ${action.failureReason}` : ""}. You can retry this control.\n\n`
+      : "";
     if (action.kind === "question") {
       const questions = requestUserInputQuestions(action.payload);
       if (questions.some((question) => question.isSecret)) {
         return {
-          text: "This request contains a secret question. Telegram bot chats are not end-to-end encrypted, so tele-codex will not collect or submit it. Resolve it from a secure local client.",
+          text: `${retryPrefix}This request contains a secret question. Telegram bot chats are not end-to-end encrypted, so tele-codex will not collect or submit it. Resolve it from a secure local client.`,
           rows: []
         };
       }
       return {
-        text: `${questions.length} question${questions.length === 1 ? "" : "s"}. Answers are collected step by step and submitted together.`,
+        text: `${retryPrefix}${questions.length} question${questions.length === 1 ? "" : "s"}. Answers are collected step by step and submitted together.`,
         rows: [[this.callbackButton("Answer", action, chatId, "start")]]
       };
     }
@@ -56,7 +59,7 @@ export class PendingInteractionManager {
       const params = actionParams(action);
       if (params.mode === "url" && typeof params.url === "string") {
         return {
-          text: "Open the URL, complete the external flow, then confirm or cancel.",
+          text: `${retryPrefix}Open the URL, complete the external flow, then confirm or cancel.`,
           rows: [
             [{ label: "Open URL", url: params.url }],
             [
@@ -67,7 +70,7 @@ export class PendingInteractionManager {
         };
       }
       return {
-        text: "MCP form request. Values are validated and submitted together.",
+        text: `${retryPrefix}MCP form request. Values are validated and submitted together.`,
         rows: [
           [this.callbackButton("Fill form", action, chatId, "start")],
           [this.callbackButton("Decline", action, chatId, "decision", { value: "decline" })]
@@ -77,7 +80,7 @@ export class PendingInteractionManager {
 
     const decisions = approvalDecisions(action, this.allowSessionGrants);
     return {
-      text: "Choose a decision. Each action can be submitted only once.",
+      text: `${retryPrefix}Choose a decision. Duplicate submissions are blocked while Codex processes the response.`,
       rows: decisions.map((item) => [this.callbackButton(item.label, action, chatId, "decision", { value: item.value })])
     };
   }
@@ -86,7 +89,7 @@ export class PendingInteractionManager {
     const callback = this.store.consumeCallbackToken(token, chatId);
     if (!callback) return { kind: "notice", text: "This control expired or was already used." };
     const action = this.store.getPendingAction(callback.actionId);
-    if (!action || action.status !== "pending" || action.expiresAt <= Date.now()) {
+    if (!action || !isRetryableStatus(action.status) || action.expiresAt <= Date.now()) {
       return { kind: "notice", text: "This request is no longer pending." };
     }
     const payload = asRecord(callback.payload) as TokenPayload;
@@ -96,13 +99,15 @@ export class PendingInteractionManager {
       if (action.kind === "permissionsApproval") {
         const decision = value === "decline" ? "decline" : "accept";
         const permissionScope = value === "session" ? "session" : "turn";
-        return { kind: "submit", decision: { actionId: action.id, decision, permissionScope }, text: "Decision sent to Codex." };
+        this.store.releaseCallbackToken(token, chatId);
+        return { kind: "submit", decision: { actionId: action.id, decision, permissionScope }, text: "Decision submitted; waiting for Codex confirmation." };
       }
       const decision = typeof value === "string" ? value : "decline";
       const userDecision: UserDecision = { actionId: action.id, decision: normalizeDecision(decision) };
       if (value && typeof value === "object") userDecision.protocolDecision = value;
       if (action.kind === "mcpElicitation" && decision === "accept") userDecision.content = null;
-      return { kind: "submit", decision: userDecision, text: "Decision sent to Codex." };
+      this.store.releaseCallbackToken(token, chatId);
+      return { kind: "submit", decision: userDecision, text: "Decision submitted; waiting for Codex confirmation." };
     }
 
     if (callback.operation === "start") {
@@ -146,10 +151,13 @@ export class PendingInteractionManager {
       this.store.putInteractionDraft(draft);
       if (draft.questionIndex < interactionQuestions(action).length) return this.renderDraft(action, draft);
       const decision: UserDecision = { actionId: action.id, decision: "accept", content: mcpContent(action, draft.answers) };
-      return { kind: "submit", decision, text: "Answers submitted to Codex." };
+      this.store.releaseCallbackToken(token, chatId);
+      return { kind: "submit", decision, text: "Answers submitted; waiting for Codex confirmation." };
     }
     if (callback.operation === "answer" && typeof payload.value === "string") {
-      return this.recordAnswer(action, draft, payload.value);
+      const result = this.recordAnswer(action, draft, payload.value);
+      if (result.kind === "submit") this.store.releaseCallbackToken(token, chatId);
+      return result;
     }
     return { kind: "notice", text: "Unsupported interaction control." };
   }
@@ -158,7 +166,7 @@ export class PendingInteractionManager {
     const draft = this.store.getAwaitingInteractionDraft(chatId, userId);
     if (!draft) return undefined;
     const action = this.store.getPendingAction(draft.actionId);
-    if (!action || action.status !== "pending") {
+    if (!action || !isRetryableStatus(action.status)) {
       this.store.deleteInteractionDraft(draft.actionId);
       return { kind: "notice", text: "That request is no longer pending." };
     }
@@ -231,6 +239,10 @@ export class PendingInteractionManager {
     this.store.putCallbackToken({ token, actionId: action.id, chatId, operation, payload, expiresAt: action.expiresAt });
     return { label, callbackData: `cb:${token}` };
   }
+}
+
+function isRetryableStatus(status: StoredPendingAction["status"]): boolean {
+  return status === "pending" || status === "failed";
 }
 
 function interactionQuestions(action: StoredPendingAction): WizardQuestion[] {

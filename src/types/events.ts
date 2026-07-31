@@ -32,6 +32,7 @@ export interface SessionRef {
   label: string;
   cwd?: string;
   codexThreadId?: string;
+  connectionGeneration?: number;
   tmuxTarget?: string;
   attachStatus?: "ready" | "probing" | "needs-confirmation" | "paste-only" | "stale" | "unknown";
   submitStrategy?: string;
@@ -61,6 +62,7 @@ export interface PendingAction {
   kind: ActionKind;
   sessionId: string;
   requestId?: string | number;
+  connectionGeneration?: number;
   threadId?: string;
   turnId?: string;
   itemId?: string;
@@ -130,6 +132,12 @@ export type CodexEvent =
       type: "actionResolved";
       sessionId: string;
       actionId: string;
+    }
+  | {
+      type: "actionOrphaned";
+      sessionId: string;
+      actionId: string;
+      message: string;
     }
   | {
       type: "warning";

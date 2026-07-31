@@ -514,6 +514,7 @@ export class TelegramGateway {
         }
         if (result.kind === "submit") {
           await this.sessions.respondAction(result.decision);
+          this.store.consumeCallbackToken(token, chatId);
           await this.clearActionKeyboards(result.decision.actionId);
           await ctx.answerCallbackQuery({ text: result.text });
           await ctx.editMessageText(result.text);
@@ -829,6 +830,11 @@ export class TelegramGateway {
     const sessions = this.sessions.listSessions().filter((session) => session.status !== "stopped");
     const lastActiveId = this.sessions.getLastActiveSessionId();
     const orphaned = this.store.getRuntimeValue<number>("startup_orphaned_actions") ?? 0;
+    const orphanedActionIds = this.store.getRuntimeValue<string[]>("startup_orphaned_action_ids") ?? [];
+    await Promise.all(orphanedActionIds.map((actionId) => this.finalizeActionMessages(
+      actionId,
+      "This request was invalidated when tele-codex restarted. Resume the thread and retry the original command."
+    )));
     for (const chatId of this.allowedDeliveryChats()) {
       try {
         if (sessions.length > 0) {
@@ -846,6 +852,7 @@ export class TelegramGateway {
     }
     void this.drainOutbox();
     if (orphaned) this.store.setRuntimeValue("startup_orphaned_actions", 0);
+    if (orphanedActionIds.length > 0) this.store.setRuntimeValue("startup_orphaned_action_ids", []);
   }
 
   private async workspacePickerMessage(): Promise<[string, { reply_markup: InlineKeyboard }]> {
@@ -1003,7 +1010,7 @@ export class TelegramGateway {
     }
     await this.sessions.respondAction({ actionId, decision });
     await this.clearActionKeyboards(actionId);
-    await ctx.reply("Sent to Codex.");
+    await ctx.reply("Decision submitted; waiting for Codex confirmation.");
   }
 
   private async forwardCodexEvents(): Promise<void> {
@@ -1026,7 +1033,12 @@ export class TelegramGateway {
     }
 
     if (event.type === "actionResolved") {
-      await this.clearActionKeyboards(event.actionId);
+      await this.finalizeActionMessages(event.actionId, "Codex confirmed the response.");
+      return;
+    }
+
+    if (event.type === "actionOrphaned") {
+      await this.finalizeActionMessages(event.actionId, event.message);
       return;
     }
 
@@ -1137,6 +1149,21 @@ export class TelegramGateway {
         await this.bot.api.editMessageReplyMarkup(chatId, messageId, { reply_markup: { inline_keyboard: [] } });
       } catch (error) {
         this.logger.debug({ error, actionId, chatId, messageId }, "could not clear resolved action keyboard");
+      }
+    }));
+  }
+
+  private async finalizeActionMessages(actionId: string, text: string): Promise<void> {
+    await Promise.all(this.store.listTelegramMessages(actionId).map(async ({ chatId, messageId }) => {
+      try {
+        await this.bot.api.editMessageText(chatId, messageId, text, { reply_markup: { inline_keyboard: [] } });
+      } catch (error) {
+        this.logger.debug({ error, actionId, chatId, messageId }, "could not invalidate action message");
+        try {
+          await this.bot.api.editMessageReplyMarkup(chatId, messageId, { reply_markup: { inline_keyboard: [] } });
+        } catch (markupError) {
+          this.logger.debug({ error: markupError, actionId, chatId, messageId }, "could not clear action keyboard");
+        }
       }
     }));
   }
