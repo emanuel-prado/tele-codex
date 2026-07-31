@@ -247,6 +247,15 @@ export class SessionManager {
     await this.adapters[session.adapter].sendUserText(session.id, text);
   }
 
+  async sendToSession(sessionId: string, text: string): Promise<void> {
+    const session = this.store.getSession(sessionId);
+    if (!session) throw new Error("The selected Codex thread no longer exists.");
+    if (!this.canReceiveInput(session)) {
+      throw new Error("The selected Codex thread is detached or cannot receive input. Resume it and choose it again.");
+    }
+    await this.adapters[session.adapter].sendUserText(session.id, text);
+  }
+
   async respondAction(decision: UserDecision): Promise<void> {
     const action = this.store.claimPendingAction(decision.actionId);
     if (!action) throw new Error("Action is no longer pending or has expired.");

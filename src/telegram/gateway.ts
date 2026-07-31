@@ -35,6 +35,7 @@ import { formatDoctorReport, runDoctor } from "../runtime/doctor.js";
 import { parseResumeCommand } from "./resume-command.js";
 import { PendingInteractionManager, type InteractionView } from "./pending-interaction.js";
 import { createId } from "../utils/ids.js";
+import { TelegramRouting } from "./routing.js";
 
 export class TelegramGateway {
   private readonly bot: Bot;
@@ -46,6 +47,7 @@ export class TelegramGateway {
   private readonly modelSelections = new Map<string, CodexModelSummary>();
   private readonly processSelections = new Map<string, { sessionId: string; processId: string; command: string }>();
   private readonly interactions: PendingInteractionManager;
+  private readonly routing: TelegramRouting;
   private outboxTimer: NodeJS.Timeout | undefined;
   private actionSweepTimer: NodeJS.Timeout | undefined;
   private drainingOutbox = false;
@@ -59,6 +61,7 @@ export class TelegramGateway {
   ) {
     this.bot = new Bot(config.botToken);
     this.interactions = new PendingInteractionManager(store, config.allowSessionGrants);
+    this.routing = new TelegramRouting(store, sessions);
     this.bot.use(async (ctx, next) => {
       if (!this.policy.authorizeTelegramUser(ctx.from?.id, ctx.chat?.id)) {
         this.logger.warn({ userId: ctx.from?.id, chatId: ctx.chat?.id }, "rejected unauthorized Telegram update");
@@ -100,7 +103,8 @@ export class TelegramGateway {
       { command: "archive", description: "Archive active app-server thread" },
       { command: "detach", description: "Detach active app-server thread" },
       { command: "forget", description: "Forget local thread metadata" },
-      { command: "send", description: "Forward slash-prefixed text to Codex" },
+      { command: "send", description: "Send one message to a selected thread" },
+      { command: "use", description: "Opt into sticky routing for this chat" },
       { command: "attach", description: "Attach app-server thread or tmux fallback" },
       { command: "tmux", description: "Attach tmux fallback session" },
       { command: "testinput", description: "Test tmux fallback input" },
@@ -161,7 +165,9 @@ export class TelegramGateway {
           "/archive - archive the active app-server thread",
           "/detach - remove the active live attachment without deleting its thread",
           "/forget <sessionId> - remove local tele-codex metadata after confirmation",
-          "/send <text> - forward slash-prefixed text to Codex",
+          "/send - choose a thread for your next message",
+          "/send <thread-alias-or-id> <message> - send directly to one thread",
+          "/use <thread-alias-or-id> - opt into sticky routing; /use off disables it",
           "/attach appserver <threadId> - attach Codex thread",
           "/attach tmux <target> - attach a specific tmux pane",
           "/tmux - list tmux panes to attach as a fallback",
@@ -181,7 +187,7 @@ export class TelegramGateway {
           "/transcript - export full active transcript",
           "/pause and /unpause - toggle forwarding",
           "/kill - interrupt active session",
-          "Plain text is forwarded to the active Codex session."
+          "Plain text needs /send, a reply to agent output, or an explicit /use route."
         ].join("\n")
       );
     });
@@ -313,12 +319,33 @@ export class TelegramGateway {
     });
 
     this.bot.command("send", async (ctx) => {
-      const text = String(ctx.match ?? "");
-      if (!text.trim()) {
-        await ctx.reply("Usage: /send <text>");
+      const input = String(ctx.match ?? "").trim();
+      if (!input) {
+        await this.showSendPicker(ctx);
         return;
       }
-      await this.forwardUserText(ctx, text.trimStart());
+      const direct = input.match(/^(\S+)\s+([\s\S]+)$/);
+      if (!direct) {
+        await ctx.reply("Usage: /send <thread-alias-or-id> <message>, or run /send to choose a thread.");
+        return;
+      }
+      const routed = await this.routing.sendDirect(ctx.chat.id, ctx.from!.id, direct[1]!, direct[2]!);
+      await ctx.reply(`Sent to ${routed.session.label}.`);
+    });
+
+    this.bot.command("use", async (ctx) => {
+      const target = String(ctx.match ?? "").trim();
+      if (!target) {
+        await ctx.reply("Usage: /use <thread-alias-or-id>, or /use off to disable sticky routing.");
+        return;
+      }
+      if (["off", "none", "clear"].includes(target.toLowerCase())) {
+        this.routing.clearSticky(ctx.chat.id, ctx.from!.id);
+        await ctx.reply("Sticky routing disabled. Plain text now requires /send or a reply to agent output.");
+        return;
+      }
+      const session = await this.routing.setSticky(ctx.chat.id, ctx.from!.id, target);
+      await ctx.reply(`Sticky routing enabled for this chat and user:\n${session.label}\n${session.id}`);
     });
 
     this.bot.command("attach", async (ctx) => {
@@ -553,6 +580,19 @@ export class TelegramGateway {
       }
     });
 
+    this.bot.callbackQuery(/^send:/, async (ctx) => {
+      const token = String(ctx.callbackQuery.data).slice(5);
+      const chatId = ctx.chat?.id;
+      if (!chatId) return;
+      try {
+        const session = await this.routing.selectPicker(token, chatId, ctx.from.id);
+        await ctx.answerCallbackQuery({ text: "Thread selected." });
+        await ctx.reply(`Your next message will be sent once to:\n${session.label}\n${session.cwd ?? session.id}\n\nThis compose selection expires in 5 minutes.`);
+      } catch (error) {
+        await ctx.answerCallbackQuery({ text: error instanceof Error ? error.message : "Could not select thread.", show_alert: true });
+      }
+    });
+
     this.bot.callbackQuery(/^panel:/, async (ctx) => {
       const [, action] = String(ctx.callbackQuery.data).split(":");
       try {
@@ -692,9 +732,9 @@ export class TelegramGateway {
       }
       try {
         if (action === "use") {
-          const session = this.sessions.setActiveSession(sessionId);
-          await ctx.answerCallbackQuery({ text: "Active session updated." });
-          await ctx.reply(`Active session:\n${session.label}\n${session.id}`);
+          const session = await this.routing.setSticky(ctx.chat!.id, ctx.from.id, sessionId);
+          await ctx.answerCallbackQuery({ text: "Sticky route updated." });
+          await ctx.reply(`Sticky route for this chat and user:\n${session.label}\n${session.id}`);
           return;
         }
         if (action === "resume") {
@@ -829,7 +869,7 @@ export class TelegramGateway {
         }
         return;
       }
-      await this.forwardUserText(ctx, text);
+      await this.forwardUserText(ctx, text, ctx.message.reply_to_message?.message_id);
     });
   }
 
@@ -936,6 +976,35 @@ export class TelegramGateway {
     await this.sendThreadPicker(ctx, threads);
   }
 
+  private async showSendPicker(ctx: Context): Promise<void> {
+    const remote = await this.sessions.listRemoteThreads(12);
+    const local = this.store.listSessions(true).filter((session) => session.adapter === "appserver");
+    const threads = [...remote];
+    for (const session of local) {
+      if (!session.codexThreadId || threads.some((thread) => thread.id === session.codexThreadId)) continue;
+      const thread: CodexThreadSummary = {
+        id: session.codexThreadId,
+        name: session.label,
+        status: session.status,
+        updatedAt: Math.floor(session.updatedAt / 1000)
+      };
+      if (session.cwd) thread.cwd = session.cwd;
+      threads.push(thread);
+    }
+    if (threads.length === 0) {
+      await ctx.reply("No recent or recoverable Codex threads found. Use /new to start one.");
+      return;
+    }
+
+    const keyboard = new InlineKeyboard();
+    threads.slice(0, 12).forEach((thread, index) => {
+      const attached = this.store.getSessionByCodexThreadId(thread.id);
+      const token = this.routing.pickerToken(ctx.chat!.id, ctx.from!.id, thread, attached);
+      keyboard.text(`${index + 1}. Send to thread`.slice(0, 60), `send:${token}`).row();
+    });
+    await ctx.reply(formatSendPicker(threads.slice(0, 12), this.store), { reply_markup: keyboard });
+  }
+
   private async sendThreadPicker(ctx: Context, threads: CodexThreadSummary[]): Promise<void> {
     const keyboard = new InlineKeyboard();
     this.threadSelections.clear();
@@ -1032,9 +1101,12 @@ export class TelegramGateway {
     }
   }
 
-  private async forwardUserText(ctx: Context, text: string): Promise<void> {
+  private async forwardUserText(ctx: Context, text: string, replyToMessageId?: number): Promise<void> {
     try {
-      await this.sessions.sendToActive(text);
+      const routed = await this.routing.routeText(ctx.chat!.id, ctx.from!.id, text, replyToMessageId);
+      if (!routed) {
+        await ctx.reply("Choose a destination first: run /send, reply to a tele-codex agent message, or opt into sticky routing with /use <thread>.");
+      }
     } catch (error) {
       await ctx.reply(error instanceof Error ? error.message : "Could not forward message to Codex.");
     }
@@ -1079,9 +1151,9 @@ export class TelegramGateway {
   private async handleCodexEvent(event: CodexEvent): Promise<void> {
     if (event.type === "agentMessage") {
       this.store.appendTranscript(event.sessionId, event.text, { turnId: event.turnId, itemId: event.itemId });
-      const active = this.sessions.getActiveSession();
-      if (active?.id !== event.sessionId) return;
-      this.bufferAgentMessage(event.sessionId, event.text, active);
+      const session = this.store.getSession(event.sessionId);
+      if (!session || this.store.listSessionChats(event.sessionId).length === 0) return;
+      this.bufferAgentMessage(event.sessionId, event.text, session);
       return;
     }
 
@@ -1096,7 +1168,7 @@ export class TelegramGateway {
     }
 
     if (event.type === "approvalRequested" || event.type === "questionAsked") {
-      for (const chatId of this.allowedDeliveryChats()) {
+      for (const chatId of this.deliveryChatsForSession(event.sessionId)) {
         const view = this.interactions.actionView(event.action, chatId);
         const keyboard = interactionKeyboard(view) as unknown as { inline_keyboard: unknown[][] };
         this.store.enqueueOutbox(
@@ -1122,7 +1194,7 @@ export class TelegramGateway {
           : event.type === "error"
             ? `Codex error: ${event.message}`
             : `Codex blocked: ${event.reason}`;
-      for (const chatId of this.allowedDeliveryChats()) {
+      for (const chatId of this.deliveryChatsForSession(event.sessionId)) {
         const discriminator = event.type === "taskCompleted" ? event.turnId ?? event.status : createId(event.type);
         this.store.enqueueOutbox(
           `${event.type}:${event.sessionId}:${discriminator}`,
@@ -1136,7 +1208,7 @@ export class TelegramGateway {
 
     if (event.type === "goalChanged") {
       if (!["blocked", "usageLimited", "budgetLimited", "complete"].includes(event.goal.status)) return;
-      for (const chatId of this.allowedDeliveryChats()) {
+      for (const chatId of this.deliveryChatsForSession(event.sessionId)) {
         this.store.enqueueOutbox(`goal:${event.sessionId}:${event.goal.status}:${event.goal.updatedAt}`, chatId, {
           text: formatGoal(event.goal)
         });
@@ -1147,7 +1219,7 @@ export class TelegramGateway {
 
     if (event.type === "rateLimitsChanged" && (event.recovered || event.limits.usedPercent >= this.config.rateLimitWarnPercent)) {
       const bucket = event.limits.usedPercent >= 100 ? 100 : event.limits.usedPercent >= 95 ? 95 : this.config.rateLimitWarnPercent;
-      for (const chatId of this.allowedDeliveryChats()) {
+      for (const chatId of this.deliveryChatsForSession(event.sessionId)) {
         this.store.enqueueOutbox(`limits:${event.recovered ? "recovered" : bucket}:${event.limits.resetsAt ?? "unknown"}`, chatId, {
           text: `${event.recovered ? "Codex rate limits recovered" : "Codex rate-limit warning"}\n\n${formatLimits(event.limits)}`
         });
@@ -1157,7 +1229,7 @@ export class TelegramGateway {
     }
 
     if (event.type === "warning") {
-      for (const chatId of this.allowedDeliveryChats()) {
+      for (const chatId of this.deliveryChatsForSession(event.sessionId)) {
         this.store.enqueueOutbox(`warning:${event.sessionId}:${createId("event")}`, chatId, {
           text: `Codex warning: ${event.message}`
         });
@@ -1243,8 +1315,9 @@ export class TelegramGateway {
 
     const session = this.store.getSession(sessionId);
     const text = formatAgentMessage(session, buffered.text);
-    for (const chatId of this.allowedDeliveryChats()) {
-      await this.bot.api.sendMessage(chatId, text);
+    for (const chatId of this.store.listSessionChats(sessionId)) {
+      const sent = await this.bot.api.sendMessage(chatId, text);
+      this.store.setMessageThread(chatId, sent.message_id, sessionId);
     }
   }
 
@@ -1256,6 +1329,11 @@ export class TelegramGateway {
   private allowedDeliveryChats(): number[] {
     if (this.config.allowedChatIds.size > 0) return [...this.config.allowedChatIds];
     return [...this.config.allowedUserIds];
+  }
+
+  private deliveryChatsForSession(sessionId: string): number[] {
+    const routed = this.store.listSessionChats(sessionId);
+    return routed.length > 0 ? routed : this.allowedDeliveryChats();
   }
 }
 
@@ -1269,6 +1347,27 @@ function interactionKeyboard(view: InteractionView): InlineKeyboard {
     keyboard.row();
   }
   return keyboard;
+}
+
+function formatSendPicker(threads: CodexThreadSummary[], store: Store): string {
+  return [
+    "Choose a Codex thread for one message",
+    "",
+    ...threads.map((thread, index) => {
+      const local = store.getSessionByCodexThreadId(thread.id);
+      const label = thread.name || thread.preview || local?.label || thread.id;
+      const updatedSeconds = thread.updatedAt ?? (local ? Math.floor(local.updatedAt / 1000) : undefined);
+      return [
+        `${index + 1}. ${label.slice(0, 100)}`,
+        thread.cwd || local?.cwd,
+        `attachment: ${local?.status ?? "recoverable"}`,
+        `turn: ${local?.activeTurnId ? "active" : "idle"}`,
+        `updated: ${updatedSeconds ? new Date(updatedSeconds * 1000).toISOString() : "unknown"}`
+      ].filter(Boolean).join("\n");
+    }),
+    "",
+    "The selection applies only to your next message and expires in 5 minutes."
+  ].join("\n\n");
 }
 
 function sessionsKeyboard(sessions: StoredSession[]): InlineKeyboard {
