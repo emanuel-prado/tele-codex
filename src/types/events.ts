@@ -10,6 +10,8 @@ export type SessionStatus =
   | "paused"
   | "blocked"
   | "error"
+  | "detached"
+  | "archived"
   | "stopped";
 
 export type ApprovalDecision =

@@ -26,7 +26,7 @@ describe("AppServerAdapter connection generations", () => {
 
     const adapter = new AppServerAdapter(config(), store, logger());
 
-    expect(store.getSession("session_1")).toMatchObject({ status: "error" });
+    expect(store.getSession("session_1")).toMatchObject({ status: "detached" });
     expect(store.getSession("session_1")?.connectionGeneration).toBeUndefined();
     expect(store.getPendingAction("action_1")?.status).toBe("orphaned");
     expect(store.getRuntimeValue("startup_orphaned_action_ids")).toEqual(["action_1"]);
@@ -86,7 +86,7 @@ describe("AppServerAdapter connection generations", () => {
 
     expect(store.getPendingAction("action_1")?.status).toBe("orphaned");
     expect(store.getPendingAction("older_action")?.status).toBe("pending");
-    expect(store.getSession("session_1")).toMatchObject({ status: "error" });
+    expect(store.getSession("session_1")).toMatchObject({ status: "detached" });
     expect(store.getSession("session_1")?.connectionGeneration).toBeUndefined();
     expect(internals.sessionsByThread.has("thread_1")).toBe(false);
     adapter.close();

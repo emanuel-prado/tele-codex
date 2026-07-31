@@ -2,7 +2,7 @@
 
 ## Architecture
 
-`TelegramGateway` handles Bot API polling and command UX. `PendingInteractionManager` owns questions, approvals, permission grants, and MCP forms: opaque callbacks, persisted drafts, validation, and single-submit transitions. `SessionManager` owns active-session routing. `AppServerAdapter` speaks Codex app-server JSON-RPC and maintains the reconnecting transport. Each app-server transport has a persisted, monotonically increasing connection generation; live thread attachments and server-initiated requests are bound to that generation. `PtyAdapter` remains a fallback. `Store` persists sessions, interactions, delivery state, operational snapshots, logs, and transcripts in SQLite.
+`TelegramGateway` handles Bot API polling and command UX. `PendingInteractionManager` owns questions, approvals, permission grants, and MCP forms: opaque callbacks, persisted drafts, validation, and single-submit transitions. `SessionManager` owns active-session routing. `AppServerAdapter` speaks Codex app-server JSON-RPC and maintains the reconnecting transport. Durable Codex threads, live app-server attachments, and active turns are separate records; a thread keeps one stable local ID across detach and resume. Each transport has a persisted, monotonically increasing connection generation, and live attachments plus server-initiated requests are bound to that generation. `PtyAdapter` remains a fallback. `Store` persists threads, legacy sessions, interactions, delivery state, operational snapshots, logs, and transcripts in SQLite.
 
 The adapter seam is intentionally deeper than raw chat forwarding. Core chat/session operations are common to both adapters, while app-server-only controls are exposed as optional adapter capabilities: thread listing/resume, model listing/selection, collaboration mode changes, compaction, and archive. Telegram command handlers call `SessionManager`, not protocol method names directly.
 
@@ -10,7 +10,10 @@ The adapter seam is intentionally deeper than raw chat forwarding. Core chat/ses
 
 SQLite tables:
 
-- `sessions`: local bridge sessions with adapter-specific identifiers and the generation of any live app-server attachment.
+- `codex_threads`: durable app-server thread identity and local metadata, unique by Codex thread ID.
+- `appserver_attachments`: current attachment status and connection generation for a durable thread.
+- `active_turns`: the currently running Codex turn, separate from durable thread and attachment state.
+- `sessions`: legacy PTY/tmux and diagnostic records; app-server rows are migrated into the normalized tables.
 - `pending_actions`: approval/question requests, their owning app-server generation, and their `pending`, `submitting`, confirmed, orphaned, or retryable-failure state.
 - `event_log`: normalized event log for `/log`.
 - `transcript_chunks`: full Codex output chunks for `/transcript`.
@@ -20,7 +23,9 @@ SQLite tables:
 - `session_runtime` and `global_runtime`: plans, diffs, goals, limits, and recovery metadata.
 - `action_messages`: Telegram messages associated with pending requests so keyboards can be invalidated.
 
-The bridge can restart and retain session metadata. App-server sessions can be manually resumed from stored thread IDs through Telegram session controls, and `/resume` can query previous app-server threads directly. tmux sessions can be reattached by target pane through the fallback flow.
+The bridge can restart and retain thread metadata. Legacy app-server rows are grouped by Codex thread ID; the newest row becomes canonical and transcripts, logs, pending actions, grants, usage, progress, goals, diffs, and the last-active pointer are reparented transactionally. Persisted attachments and turns are not treated as live after restart. App-server threads can be manually resumed through Telegram session controls, and `/resume` can query Codex history directly. tmux sessions can be reattached by target pane through the fallback flow.
+
+`/kill` interrupts only the active turn. `/detach` removes the live attachment, `/archive` archives the durable Codex thread, and `/forget` removes local tele-codex metadata without deleting Codex history. Detached, archived, errored, stopped, and paused records cannot become implicit send targets. `/sessions` shows current or recoverable records; `/sessions all` includes archived and legacy diagnostic rows.
 
 ## Notification Strategy
 

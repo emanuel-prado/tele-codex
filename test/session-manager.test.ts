@@ -96,6 +96,53 @@ describe("SessionManager approval acknowledgement", () => {
   });
 });
 
+describe("SessionManager thread lifecycle", () => {
+  it("interrupts without deleting the thread, then detaches, resumes, archives, and forgets explicitly", async () => {
+    const store = new Store(":memory:");
+    const calls: Array<{ operation: string; value?: unknown }> = [];
+    const appserver = fakeAppServer(store, [], calls);
+    const manager = new SessionManager({ appserver, pty: fakePty() }, store, "appserver", silentLogger());
+    const session = store.upsertSession({ id: "session_1", adapter: "appserver", label: "one", codexThreadId: "thread_1" }, "idle");
+    manager.setActiveSession(session.id);
+
+    await manager.kill();
+    expect(store.getSession(session.id)?.status).toBe("idle");
+    expect(calls.at(-1)).toEqual({ operation: "interrupt", value: session.id });
+
+    await manager.detach();
+    expect(store.getSession(session.id)?.status).toBe("detached");
+    expect(manager.getActiveSession()).toBeUndefined();
+    await expect(manager.sendToActive("unsafe")).rejects.toThrow(/no active/i);
+
+    await manager.resumeSession(session.id);
+    expect(store.getSession(session.id)?.status).toBe("idle");
+    await manager.archive(session.id);
+    expect(store.listSessions()).toEqual([]);
+    expect(store.listSessions(true)[0]?.status).toBe("archived");
+
+    store.appendTranscript(session.id, "remove me");
+    await manager.forget(session.id);
+    expect(store.getSession(session.id)).toBeUndefined();
+    expect(store.getTranscript(session.id)).toBe("");
+    store.close();
+  });
+
+  it("rejects invalid sticky send targets", () => {
+    const store = new Store(":memory:");
+    const manager = new SessionManager(
+      { appserver: fakeAppServer(store, [], []), pty: fakePty() },
+      store,
+      "appserver",
+      silentLogger()
+    );
+    const session = store.upsertSession({ id: "session_1", adapter: "appserver", label: "one", codexThreadId: "thread_1" }, "idle");
+    store.setPaused(session.id, true);
+
+    expect(() => manager.setActiveSession(session.id)).toThrow(/cannot receive input/i);
+    store.close();
+  });
+});
+
 function fakeAppServer(
   store: Store,
   threads: CodexThreadSummary[],
@@ -115,13 +162,25 @@ function fakeAppServer(
         label: threadId,
         codexThreadId: threadId
       };
-      store.upsertSession(session, "idle");
-      return session;
+      return store.upsertSession(session, "idle");
+    },
+    async resume(session) {
+      calls.push({ operation: "resume-session", value: session.id });
+      return store.upsertSession(session, "idle");
+    },
+    async detach(sessionId) {
+      calls.push({ operation: "detach", value: sessionId });
+    },
+    async archiveThread(sessionId) {
+      calls.push({ operation: "archive", value: sessionId });
     },
     async listModels() {
       return [];
     },
-    ...unusedAdapterMethods()
+    ...unusedAdapterMethods(),
+    async interrupt(sessionId) {
+      calls.push({ operation: "interrupt", value: sessionId });
+    }
   };
 }
 
@@ -139,7 +198,10 @@ function unusedAdapterMethods(): Omit<CodexAdapter, "kind"> {
     },
     async sendUserText() {},
     async respondAction() {},
-    async interrupt() {},
+    async interrupt(sessionId) {
+      // Individual fakes may observe this through their shared calls array.
+      void sessionId;
+    },
     async kill() {},
     async getRecentLog() {
       return [];
