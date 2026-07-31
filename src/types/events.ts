@@ -1,7 +1,5 @@
 import type { RateLimitSummary, ThreadGoalSummary } from "./control.js";
 
-export type AdapterKind = "appserver" | "pty";
-
 export type SessionStatus =
   | "starting"
   | "attached"
@@ -30,30 +28,22 @@ export type ActionKind =
 
 export interface SessionRef {
   id: string;
-  adapter: AdapterKind;
+  adapter: "appserver";
   label: string;
   cwd?: string;
-  codexThreadId?: string;
+  codexThreadId: string;
   connectionGeneration?: number;
-  tmuxTarget?: string;
-  attachStatus?: "ready" | "probing" | "needs-confirmation" | "paste-only" | "stale" | "unknown";
-  submitStrategy?: string;
-  lastProbe?: string;
-  lastProbeAt?: number;
 }
 
 export interface StartSession {
   cwd?: string;
   prompt?: string;
   label?: string;
-  adapter?: AdapterKind;
   model?: string;
 }
 
 export interface AttachSession {
-  adapter: AdapterKind;
-  codexThreadId?: string;
-  tmuxTarget?: string;
+  codexThreadId: string;
   label?: string;
   cwd?: string;
   model?: string;

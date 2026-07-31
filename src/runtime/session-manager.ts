@@ -1,5 +1,5 @@
 import type { Logger } from "pino";
-import type { CodexAdapter } from "../types/adapter.js";
+import type { AppServerRuntime } from "../types/adapter.js";
 import type {
   BackgroundTerminalSummary,
   CodexModelSummary,
@@ -10,67 +10,32 @@ import type {
   SessionProgress,
   ThreadGoalSummary
 } from "../types/control.js";
-import type { AdapterKind, AttachSession, CodexEvent, LogEntry, SessionRef, StartSession, UserDecision } from "../types/events.js";
+import type { AttachSession, CodexEvent, LogEntry, SessionRef, StartSession, UserDecision } from "../types/events.js";
 import { AsyncQueue } from "../utils/async-queue.js";
 import { Store, type StoredSession } from "../store/store.js";
-import { PtyAdapter, type ProbeResult, type TmuxPane } from "../adapters/pty-adapter.js";
 
 export class SessionManager {
-  private readonly adapters: Record<AdapterKind, CodexAdapter>;
   private readonly queue = new AsyncQueue<CodexEvent>();
   private activeSessionId?: string;
 
   constructor(
-    adapters: Record<AdapterKind, CodexAdapter>,
+    private readonly appserver: AppServerRuntime,
     private readonly store: Store,
-    private readonly defaultAdapter: AdapterKind,
     private readonly logger: Logger
   ) {
-    this.adapters = adapters;
-    for (const adapter of Object.values(adapters)) {
-      void this.forwardEvents(adapter);
-    }
+    void this.forwardEvents();
   }
 
   async newSession(opts: StartSession = {}): Promise<SessionRef> {
-    const adapterKind = opts.adapter ?? this.defaultAdapter;
-    const session = await this.adapters[adapterKind].start(opts);
+    const session = await this.appserver.start(opts);
     this.setActiveId(session.id);
     return session;
   }
 
   async attach(opts: AttachSession): Promise<SessionRef> {
-    const session = await this.adapters[opts.adapter].attach(opts);
+    const session = await this.appserver.attach(opts);
     this.setActiveId(session.id);
     return session;
-  }
-
-  async listTmuxPanes(): Promise<TmuxPane[]> {
-    return this.ptyAdapter().listTmuxPanes();
-  }
-
-  async probeTmuxSession(sessionId?: string, strategy?: string): Promise<ProbeResult> {
-    const session = this.resolveSession(sessionId);
-    if (session.adapter !== "pty") throw new Error("Active session is not a PTY/tmux session.");
-    return this.ptyAdapter().probeSession(session.id, strategy);
-  }
-
-  async tryNextTmuxStrategy(sessionId?: string): Promise<ProbeResult> {
-    const session = this.resolveSession(sessionId);
-    if (session.adapter !== "pty") throw new Error("Active session is not a PTY/tmux session.");
-    return this.ptyAdapter().tryNextStrategy(session.id);
-  }
-
-  markTmuxManualSubmit(sessionId?: string): void {
-    const session = this.resolveSession(sessionId);
-    if (session.adapter !== "pty") throw new Error("Active session is not a PTY/tmux session.");
-    this.ptyAdapter().markManualSubmit(session.id);
-  }
-
-  markTmuxReady(sessionId?: string): void {
-    const session = this.resolveSession(sessionId);
-    if (session.adapter !== "pty") throw new Error("Active session is not a PTY/tmux session.");
-    this.ptyAdapter().markReady(session.id);
   }
 
   listSessions(includeAll = false): StoredSession[] {
@@ -99,20 +64,14 @@ export class SessionManager {
     const session = this.store.getSession(sessionId);
     if (!session) throw new Error(`Unknown session: ${sessionId}`);
     if (session.status === "archived") throw new Error("Archived threads cannot be resumed from local metadata. Use /resume to restore it from Codex history if available.");
-    const adapter = this.adapters[session.adapter];
-    if (adapter.resume) {
-      await adapter.resume(session);
-    } else if (session.status === "stopped") {
-      throw new Error("Stopped session cannot be resumed.");
-    }
+    await this.appserver.resume(session);
     this.store.setPaused(session.id, false);
     this.setActiveId(session.id);
     return this.store.getSession(session.id) ?? session;
   }
 
   async resumeThread(threadId: string, options: SessionControlOptions = {}): Promise<SessionRef> {
-    const adapter = this.appServerAdapter();
-    const session = await adapter.resumeThread(threadId, options);
+    const session = await this.appserver.resumeThread(threadId, options);
     this.store.setPaused(session.id, false);
     this.setActiveId(session.id);
     return session;
@@ -125,19 +84,15 @@ export class SessionManager {
   }
 
   async listRemoteThreads(limit = 10): Promise<CodexThreadSummary[]> {
-    return this.appServerAdapter().listThreads(limit);
+    return this.appserver.listThreads(limit);
   }
 
   async searchRemoteThreads(term: string, limit = 10): Promise<CodexThreadSummary[]> {
-    const adapter = this.appServerAdapter();
-    if (!adapter.searchThreads) throw new Error("Configured app-server adapter does not support thread search.");
-    return adapter.searchThreads(term, limit);
+    return this.appserver.searchThreads(term, limit);
   }
 
   async rateLimits(): Promise<RateLimitSummary | undefined> {
-    const adapter = this.appServerAdapter();
-    if (!adapter.readRateLimits) throw new Error("Configured app-server adapter does not support account limits.");
-    return adapter.readRateLimits();
+    return this.appserver.readRateLimits();
   }
 
   progress(sessionId?: string): SessionProgress | undefined {
@@ -150,91 +105,73 @@ export class SessionManager {
 
   async goal(sessionId?: string): Promise<ThreadGoalSummary | undefined> {
     const session = this.resolveSession(sessionId);
-    const adapter = this.requireAppServerSession(session);
-    if (!adapter.getGoal) throw new Error("Configured app-server adapter does not support goals.");
-    return adapter.getGoal(session.id);
+    return this.appserver.getGoal(session.id);
   }
 
   async startGoal(objective: string, sessionId?: string): Promise<ThreadGoalSummary> {
     const session = this.resolveSession(sessionId);
     if (session.activeTurnId) throw new Error("Wait for or interrupt the active turn before starting a new goal.");
-    const adapter = this.requireAppServerSession(session);
-    if (!adapter.setGoal) throw new Error("Configured app-server adapter does not support goals.");
-    const goal = await adapter.setGoal(session.id, objective, "active");
-    await adapter.sendUserText(session.id, objective);
+    const goal = await this.appserver.setGoal(session.id, objective, "active");
+    await this.appserver.sendUserText(session.id, objective);
     return goal;
   }
 
   async setGoalStatus(status: "active" | "paused", sessionId?: string): Promise<ThreadGoalSummary> {
     const session = this.resolveSession(sessionId);
-    const adapter = this.requireAppServerSession(session);
-    if (!adapter.setGoal) throw new Error("Configured app-server adapter does not support goals.");
-    return adapter.setGoal(session.id, undefined, status);
+    return this.appserver.setGoal(session.id, undefined, status);
   }
 
   async clearGoal(sessionId?: string): Promise<boolean> {
     const session = this.resolveSession(sessionId);
-    const adapter = this.requireAppServerSession(session);
-    if (!adapter.clearGoal) throw new Error("Configured app-server adapter does not support goals.");
-    return adapter.clearGoal(session.id);
+    return this.appserver.clearGoal(session.id);
   }
 
   async backgroundTerminals(sessionId?: string): Promise<BackgroundTerminalSummary[]> {
     const session = this.resolveSession(sessionId);
-    const adapter = this.requireAppServerSession(session);
-    if (!adapter.listBackgroundTerminals) throw new Error("Configured app-server adapter does not support background terminals.");
-    return adapter.listBackgroundTerminals(session.id);
+    return this.appserver.listBackgroundTerminals(session.id);
   }
 
   async terminateBackgroundTerminal(processId: string, sessionId?: string): Promise<boolean> {
     const session = this.resolveSession(sessionId);
-    const adapter = this.requireAppServerSession(session);
-    if (!adapter.terminateBackgroundTerminal) throw new Error("Configured app-server adapter does not support background terminals.");
-    return adapter.terminateBackgroundTerminal(session.id, processId);
+    return this.appserver.terminateBackgroundTerminal(session.id, processId);
   }
 
   async listModels(limit = 20): Promise<CodexModelSummary[]> {
-    return this.appServerAdapter().listModels(limit);
+    return this.appserver.listModels(limit);
   }
 
   async setModel(model: string, sessionId?: string): Promise<void> {
     const session = this.resolveSession(sessionId);
-    await this.requireAppServerSession(session).updateSettings(session.id, { model });
+    await this.appserver.updateSettings(session.id, { model });
   }
 
   async setMode(mode: CollaborationModeKind, sessionId?: string): Promise<void> {
     const session = this.resolveSession(sessionId);
-    await this.requireAppServerSession(session).setCollaborationMode(session.id, mode);
+    await this.appserver.setCollaborationMode(session.id, mode);
   }
 
   async compact(sessionId?: string): Promise<void> {
     const session = this.resolveSession(sessionId);
-    await this.requireAppServerSession(session).compactThread(session.id);
+    await this.appserver.compactThread(session.id);
   }
 
   async archive(sessionId?: string): Promise<void> {
     const session = this.resolveSession(sessionId);
-    if (session.adapter !== "appserver" || !this.adapters.appserver.archiveThread) {
-      throw new Error("Archive is only available for app-server threads.");
-    }
-    await this.adapters.appserver.archiveThread(session.id);
+    await this.appserver.archiveThread(session.id);
     this.store.markThreadArchived(session.id);
     this.clearActiveId(session.id);
   }
 
   async detach(sessionId?: string): Promise<void> {
     const session = this.resolveSession(sessionId);
-    if (session.adapter !== "appserver") throw new Error("Detach is only available for app-server threads.");
-    const adapter = this.adapters.appserver;
-    if (adapter.detach) await adapter.detach(session.id);
+    await this.appserver.detach(session.id);
     this.store.markThreadDetached(session.id);
     this.clearActiveId(session.id);
   }
 
   async forget(sessionId?: string): Promise<void> {
     const session = this.resolveSession(sessionId);
-    if (session.adapter !== "appserver") throw new Error("Forget is only available for app-server threads.");
-    if (session.codexThreadId && this.adapters.appserver.detach) await this.adapters.appserver.detach(session.id);
+    if (session.codexThreadId) await this.appserver.detach(session.id);
     this.store.forgetThread(session.id);
     this.clearActiveId(session.id);
   }
@@ -244,7 +181,7 @@ export class SessionManager {
     if (!session) {
       throw new Error("No active Codex session. Use /new to start one or /sessions to resume an existing session.");
     }
-    await this.adapters[session.adapter].sendUserText(session.id, text);
+    await this.appserver.sendUserText(session.id, text);
   }
 
   async sendToSession(sessionId: string, text: string): Promise<void> {
@@ -253,7 +190,7 @@ export class SessionManager {
     if (!this.canReceiveInput(session)) {
       throw new Error("The selected Codex thread is detached or cannot receive input. Resume it and choose it again.");
     }
-    await this.adapters[session.adapter].sendUserText(session.id, text);
+    await this.appserver.sendUserText(session.id, text);
   }
 
   async respondAction(decision: UserDecision): Promise<void> {
@@ -265,11 +202,7 @@ export class SessionManager {
       throw new Error("Session for pending action not found.");
     }
     try {
-      await this.adapters[session.adapter].respondAction(decision);
-      if (session.adapter !== "appserver") {
-        this.store.resolvePendingAction(action.id, "resolved");
-        this.store.deleteInteractionDraft(action.id);
-      }
+      await this.appserver.respondAction(decision);
     } catch (error) {
       if (this.store.getPendingAction(action.id)?.status === "submitting") {
         this.store.failPendingAction(action.id, error instanceof Error ? error.message : "Action submission failed.");
@@ -317,9 +250,8 @@ export class SessionManager {
       const decision: UserDecision = { actionId: action.id, decision: action.kind === "mcpElicitation" ? "cancel" : "decline" };
       if (action.kind === "question") decision.answers = {};
       try {
-        await this.adapters[session.adapter].respondAction(decision);
+        await this.appserver.respondAction(decision);
         this.store.deleteInteractionDraft(action.id);
-        if (session.adapter !== "appserver") this.store.resolvePendingAction(action.id, "expired");
         expired += 1;
       } catch (error) {
         this.store.resolvePendingAction(action.id, "orphaned");
@@ -350,17 +282,17 @@ export class SessionManager {
 
   async interrupt(sessionId?: string): Promise<void> {
     const session = this.resolveSession(sessionId);
-    await this.adapters[session.adapter].interrupt(session.id);
+    await this.appserver.interrupt(session.id);
   }
 
   async kill(sessionId?: string): Promise<void> {
     const session = this.resolveSession(sessionId);
-    await this.adapters[session.adapter].interrupt(session.id);
+    await this.appserver.interrupt(session.id);
   }
 
   async logs(sessionId?: string, limit = 30): Promise<LogEntry[]> {
     const session = this.resolveSession(sessionId);
-    return this.adapters[session.adapter].getRecentLog(session.id, limit);
+    return this.appserver.getRecentLog(session.id, limit);
   }
 
   transcript(sessionId?: string): string {
@@ -377,7 +309,7 @@ export class SessionManager {
   }
 
   async close(): Promise<void> {
-    await Promise.all(Object.values(this.adapters).map((adapter) => adapter.close?.()));
+    await this.appserver.close();
   }
 
   private resolveSession(sessionId?: string): StoredSession {
@@ -407,43 +339,13 @@ export class SessionManager {
     return session.status === "attached" || session.status === "idle" || session.status === "active" || session.status === "blocked";
   }
 
-  private ptyAdapter(): PtyAdapter {
-    const adapter = this.adapters.pty;
-    if (!(adapter instanceof PtyAdapter)) {
-      throw new Error("Configured PTY adapter does not support tmux operations.");
-    }
-    return adapter;
-  }
-
-  private appServerAdapter(): Required<Pick<CodexAdapter, "resumeThread" | "listThreads" | "listModels">> & CodexAdapter {
-    const adapter = this.adapters.appserver;
-    if (!adapter.resumeThread || !adapter.listThreads || !adapter.listModels) {
-      throw new Error("Configured app-server adapter does not support Codex control commands.");
-    }
-    return adapter as Required<Pick<CodexAdapter, "resumeThread" | "listThreads" | "listModels">> & CodexAdapter;
-  }
-
-  private requireAppServerSession(
-    session: StoredSession
-  ): Required<Pick<CodexAdapter, "updateSettings" | "setCollaborationMode" | "compactThread" | "archiveThread">> & CodexAdapter {
-    if (session.adapter !== "appserver") {
-      throw new Error("This command requires an app-server session. Use /new or /resume to start an app-server session.");
-    }
-    const adapter = this.adapters.appserver;
-    if (!adapter.updateSettings || !adapter.setCollaborationMode || !adapter.compactThread || !adapter.archiveThread) {
-      throw new Error("Configured app-server adapter does not support Codex control commands.");
-    }
-    return adapter as Required<Pick<CodexAdapter, "updateSettings" | "setCollaborationMode" | "compactThread" | "archiveThread">> &
-      CodexAdapter;
-  }
-
-  private async forwardEvents(adapter: CodexAdapter): Promise<void> {
+  private async forwardEvents(): Promise<void> {
     try {
-      for await (const event of adapter.events()) {
+      for await (const event of this.appserver.events()) {
         this.queue.push(event);
       }
     } catch (error) {
-      this.logger.error({ error, adapter: adapter.kind }, "adapter event stream failed");
+      this.logger.error({ error }, "app-server event stream failed");
     }
   }
 }

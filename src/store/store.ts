@@ -1,6 +1,7 @@
 import Database from "better-sqlite3";
 import type { RateLimitSummary, SessionProgress, SessionTokenUsage, ThreadGoalSummary } from "../types/control.js";
-import type { AdapterKind, LogEntry, PendingAction, SessionRef, SessionStatus } from "../types/events.js";
+import type { LogEntry, PendingAction, SessionRef, SessionStatus } from "../types/events.js";
+import type { LegacyTmuxAttachment, LegacyTmuxInputStatus, LegacyTmuxStatus } from "../types/legacy-tmux.js";
 
 export type PendingActionStatus = "pending" | "submitting" | "resolved" | "expired" | "cancelled" | "orphaned" | "failed";
 
@@ -94,66 +95,8 @@ export class Store {
   }
 
   upsertSession(session: SessionRef, status: SessionStatus): StoredSession {
-    if (session.adapter === "appserver" && session.codexThreadId) {
-      return this.upsertCodexThread(session, status);
-    }
-    const now = Date.now();
-    this.db
-      .prepare(
-        `insert into sessions (id, adapter, label, cwd, codex_thread_id, connection_generation, tmux_target, status, paused, created_at, updated_at)
-         values (@id, @adapter, @label, @cwd, @codexThreadId, @connectionGeneration, @tmuxTarget, @status, 0, @now, @now)
-         on conflict(id) do update set
-           label=excluded.label,
-           cwd=excluded.cwd,
-           codex_thread_id=excluded.codex_thread_id,
-           connection_generation=excluded.connection_generation,
-           tmux_target=excluded.tmux_target,
-           status=excluded.status,
-           updated_at=excluded.updated_at`
-      )
-      .run({
-        id: session.id,
-        adapter: session.adapter,
-        label: session.label,
-        cwd: session.cwd ?? null,
-        codexThreadId: session.codexThreadId ?? null,
-        connectionGeneration: session.connectionGeneration ?? null,
-        tmuxTarget: session.tmuxTarget ?? null,
-        status,
-        now
-      });
-    return this.getSession(session.id)!;
-  }
-
-  updateAttachState(
-    sessionId: string,
-    state: {
-      attachStatus?: NonNullable<SessionRef["attachStatus"]>;
-      submitStrategy?: string | null;
-      lastProbe?: string | null;
-      lastProbeAt?: number | null;
-    }
-  ): void {
-    const session = this.getSession(sessionId);
-    if (!session) return;
-    this.db
-      .prepare(
-        `update sessions
-         set attach_status = ?,
-             submit_strategy = ?,
-             last_probe = ?,
-             last_probe_at = ?,
-             updated_at = ?
-         where id = ?`
-      )
-      .run(
-        state.attachStatus ?? session.attachStatus ?? "unknown",
-        state.submitStrategy === undefined ? (session.submitStrategy ?? null) : state.submitStrategy,
-        state.lastProbe === undefined ? (session.lastProbe ?? null) : state.lastProbe,
-        state.lastProbeAt === undefined ? (session.lastProbeAt ?? null) : state.lastProbeAt,
-        Date.now(),
-        sessionId
-      );
+    if (!session.codexThreadId) throw new Error("App-server threads require a Codex thread id.");
+    return this.upsertCodexThread(session, status);
   }
 
   setSessionStatus(sessionId: string, status: SessionStatus): void {
@@ -167,28 +110,17 @@ export class Store {
       }
       return;
     }
-    this.db
-      .prepare("update sessions set status = ?, updated_at = ? where id = ?")
-      .run(status, Date.now(), sessionId);
   }
 
   clearSessionAttachments(connectionGeneration?: number): string[] {
     const normalized = connectionGeneration === undefined
       ? this.db.prepare("select thread_id as id from appserver_attachments where connection_generation is not null").all() as Array<{ id: string }>
       : this.db.prepare("select thread_id as id from appserver_attachments where connection_generation = ?").all(connectionGeneration) as Array<{ id: string }>;
-    const legacy = connectionGeneration === undefined
-      ? this.db.prepare("select id from sessions where adapter = 'appserver' and connection_generation is not null").all() as Array<{ id: string }>
-      : this.db.prepare("select id from sessions where adapter = 'appserver' and connection_generation = ?").all(connectionGeneration) as Array<{ id: string }>;
     const transaction = this.db.transaction(() => {
       for (const row of normalized) this.markThreadDetached(row.id);
-      if (connectionGeneration === undefined) {
-        this.db.prepare("update sessions set connection_generation = null, active_turn_id = null, status = 'error', updated_at = ? where adapter = 'appserver' and connection_generation is not null").run(Date.now());
-      } else {
-        this.db.prepare("update sessions set connection_generation = null, active_turn_id = null, status = 'error', updated_at = ? where adapter = 'appserver' and connection_generation = ?").run(Date.now(), connectionGeneration);
-      }
     });
     transaction();
-    return [...normalized, ...legacy].map((row) => row.id);
+    return normalized.map((row) => row.id);
   }
 
   setPaused(sessionId: string, paused: boolean): void {
@@ -196,9 +128,6 @@ export class Store {
       this.db.prepare("update codex_threads set paused = ?, updated_at = ? where id = ?").run(paused ? 1 : 0, Date.now(), sessionId);
       return;
     }
-    this.db
-      .prepare("update sessions set paused = ?, status = ?, updated_at = ? where id = ?")
-      .run(paused ? 1 : 0, paused ? "paused" : "idle", Date.now(), sessionId);
   }
 
   setActiveTurn(sessionId: string, turnId: string | null): void {
@@ -215,16 +144,12 @@ export class Store {
       }
       return;
     }
-    this.db
-      .prepare("update sessions set active_turn_id = ?, updated_at = ? where id = ?")
-      .run(turnId, Date.now(), sessionId);
   }
 
   getSession(sessionId: string): StoredSession | undefined {
     const thread = this.getCodexThreadRow(sessionId);
     if (thread) return mapCodexThread(thread);
-    const row = this.db.prepare("select * from sessions where id = ?").get(sessionId) as Row | undefined;
-    return row ? mapSession(row) : undefined;
+    return undefined;
   }
 
   getSessionByCodexThreadId(codexThreadId: string): StoredSession | undefined {
@@ -236,13 +161,74 @@ export class Store {
     const threadRows = this.db.prepare(
       `${CODEX_THREAD_SELECT}${includeAll ? "" : " where t.lifecycle_status = 'available'"}`
     ).all() as Row[];
-    const legacyRows = this.db.prepare(
-      includeAll
-        ? "select * from sessions order by updated_at desc"
-        : "select * from sessions where adapter != 'appserver' and status != 'stopped' order by updated_at desc"
-    ).all() as Row[];
-    return [...threadRows.map(mapCodexThread), ...legacyRows.map(mapSession)]
-      .sort((left, right) => right.updatedAt - left.updatedAt);
+    return threadRows.map(mapCodexThread).sort((left, right) => right.updatedAt - left.updatedAt);
+  }
+
+  upsertLegacyTmuxAttachment(input: {
+    id: string;
+    target: string;
+    label: string;
+    cwd?: string;
+    chatId: number;
+    status?: LegacyTmuxStatus;
+    inputStatus?: LegacyTmuxInputStatus;
+    submitStrategy: string;
+  }): LegacyTmuxAttachment {
+    const now = Date.now();
+    this.db.prepare(
+      `insert into legacy_tmux_attachments
+        (id, target, label, cwd, chat_id, status, input_status, submit_strategy, created_at, updated_at)
+       values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       on conflict(id) do update set
+         target=excluded.target, label=excluded.label, cwd=excluded.cwd, chat_id=excluded.chat_id,
+         status=excluded.status, input_status=excluded.input_status,
+         submit_strategy=excluded.submit_strategy, updated_at=excluded.updated_at`
+    ).run(
+      input.id,
+      input.target,
+      input.label,
+      input.cwd ?? null,
+      input.chatId,
+      input.status ?? "attached",
+      input.inputStatus ?? "unknown",
+      input.submitStrategy,
+      now,
+      now
+    );
+    return this.getLegacyTmuxAttachment(input.id)!;
+  }
+
+  getLegacyTmuxAttachment(id: string): LegacyTmuxAttachment | undefined {
+    const row = this.db.prepare("select * from legacy_tmux_attachments where id = ?").get(id) as Row | undefined;
+    return row ? mapLegacyTmuxAttachment(row) : undefined;
+  }
+
+  listLegacyTmuxAttachments(chatId?: number): LegacyTmuxAttachment[] {
+    const rows = chatId === undefined
+      ? this.db.prepare("select * from legacy_tmux_attachments order by updated_at desc").all() as Row[]
+      : this.db.prepare("select * from legacy_tmux_attachments where chat_id = ? order by updated_at desc").all(chatId) as Row[];
+    return rows.map(mapLegacyTmuxAttachment);
+  }
+
+  updateLegacyTmuxAttachment(
+    id: string,
+    state: Partial<Pick<LegacyTmuxAttachment, "status" | "inputStatus" | "submitStrategy" | "lastProbe" | "lastProbeAt">>
+  ): void {
+    const attachment = this.getLegacyTmuxAttachment(id);
+    if (!attachment) return;
+    this.db.prepare(
+      `update legacy_tmux_attachments set
+        status = ?, input_status = ?, submit_strategy = ?, last_probe = ?, last_probe_at = ?, updated_at = ?
+       where id = ?`
+    ).run(
+      state.status ?? attachment.status,
+      state.inputStatus ?? attachment.inputStatus,
+      state.submitStrategy ?? attachment.submitStrategy,
+      state.lastProbe === undefined ? attachment.lastProbe ?? null : state.lastProbe,
+      state.lastProbeAt === undefined ? attachment.lastProbeAt ?? null : state.lastProbeAt,
+      Date.now(),
+      id
+    );
   }
 
   markThreadDetached(sessionId: string): void {
@@ -263,8 +249,7 @@ export class Store {
 
   forgetThread(sessionId: string): boolean {
     const normalized = Boolean(this.getCodexThreadRow(sessionId));
-    const legacy = this.db.prepare("select id from sessions where id = ?").get(sessionId) as { id: string } | undefined;
-    if (!normalized && !legacy) return false;
+    if (!normalized) return false;
     const transaction = this.db.transaction(() => {
       const actionIds = (this.db.prepare("select id from pending_actions where session_id = ?").all(sessionId) as Array<{ id: string }>).map((row) => row.id);
       for (const actionId of actionIds) {
@@ -283,7 +268,6 @@ export class Store {
       this.db.prepare("delete from active_turns where thread_id = ?").run(sessionId);
       this.db.prepare("delete from appserver_attachments where thread_id = ?").run(sessionId);
       this.db.prepare("delete from codex_threads where id = ?").run(sessionId);
-      this.db.prepare("delete from sessions where id = ?").run(sessionId);
       if (this.getRuntimeValue<string>("last_active_session_id") === sessionId) {
         this.db.prepare("delete from global_runtime where key = 'last_active_session_id'").run();
       }
@@ -628,9 +612,7 @@ export class Store {
 
   getSessionResourceVersion(sessionId: string): number | undefined {
     const thread = this.db.prepare("select updated_at from codex_threads where id = ?").get(sessionId) as { updated_at: number } | undefined;
-    if (thread) return thread.updated_at;
-    const legacy = this.db.prepare("select updated_at from sessions where id = ?").get(sessionId) as { updated_at: number } | undefined;
-    return legacy?.updated_at;
+    return thread?.updated_at;
   }
 
   putInteractionDraft(draft: InteractionDraft): void {
@@ -817,6 +799,21 @@ export class Store {
         active_turn_id text,
         attach_status text,
         submit_strategy text,
+        last_probe text,
+        last_probe_at integer,
+        created_at integer not null,
+        updated_at integer not null
+      );
+
+      create table if not exists legacy_tmux_attachments (
+        id text primary key,
+        target text not null,
+        label text not null,
+        cwd text,
+        chat_id integer not null,
+        status text not null,
+        input_status text not null,
+        submit_strategy text not null,
         last_probe text,
         last_probe_at integer,
         created_at integer not null,
@@ -1019,11 +1016,13 @@ export class Store {
     this.addColumnIfMissing("callback_tokens", "user_id", "integer");
     this.addColumnIfMissing("sessions", "connection_generation", "integer");
     this.migrateLegacyAppServerSessions();
+    this.migrateLegacyTmuxSessions();
+    this.db.exec("drop table sessions");
     this.reconcilePersistedAppServerRuntime();
   }
 
   private upsertCodexThread(session: SessionRef, status: SessionStatus): StoredSession {
-    const existing = this.getSessionByCodexThreadId(session.codexThreadId!);
+    const existing = this.getSessionByCodexThreadId(session.codexThreadId);
     const id = existing?.id ?? session.id;
     const now = Date.now();
     this.db.prepare(
@@ -1110,6 +1109,37 @@ export class Store {
         if (lastActive && ids.includes(lastActive)) this.setRuntimeValue("last_active_session_id", canonicalId);
         this.db.prepare(`delete from sessions where id in (${marks})`).run(...ids);
       }
+    });
+    transaction();
+  }
+
+  private migrateLegacyTmuxSessions(): void {
+    const rows = this.db.prepare("select * from sessions where adapter = 'pty'").all() as Row[];
+    if (rows.length === 0) return;
+    const transaction = this.db.transaction(() => {
+      for (const row of rows) {
+        if (row.tmux_target) {
+          this.db.prepare(
+            `insert into legacy_tmux_attachments
+              (id, target, label, cwd, chat_id, status, input_status, submit_strategy, last_probe, last_probe_at, created_at, updated_at)
+             values (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)
+             on conflict(id) do nothing`
+          ).run(
+            String(row.id),
+            String(row.tmux_target),
+            String(row.label),
+            row.cwd ?? null,
+            row.status === "stopped" ? "stale" : "attached",
+            row.attach_status ?? "unknown",
+            row.submit_strategy ?? "enter",
+            row.last_probe ?? null,
+            row.last_probe_at ?? null,
+            Number(row.created_at),
+            Number(row.updated_at)
+          );
+        }
+      }
+      this.db.prepare("delete from sessions where adapter = 'pty'").run();
     });
     transaction();
   }
@@ -1215,26 +1245,22 @@ function isSessionStatus(value: string): value is SessionStatus {
     value === "archived" || value === "stopped";
 }
 
-function mapSession(row: Row): StoredSession {
-  const session: StoredSession = {
+function mapLegacyTmuxAttachment(row: Row): LegacyTmuxAttachment {
+  const attachment: LegacyTmuxAttachment = {
     id: String(row.id),
-    adapter: row.adapter as AdapterKind,
+    target: String(row.target),
     label: String(row.label),
-    status: row.status as SessionStatus,
-    paused: Number(row.paused) === 1,
+    chatId: Number(row.chat_id),
+    status: row.status as LegacyTmuxStatus,
+    inputStatus: row.input_status as LegacyTmuxInputStatus,
+    submitStrategy: String(row.submit_strategy),
     createdAt: Number(row.created_at),
     updatedAt: Number(row.updated_at)
   };
-  if (row.cwd) session.cwd = String(row.cwd);
-  if (row.codex_thread_id) session.codexThreadId = String(row.codex_thread_id);
-  if (row.connection_generation != null) session.connectionGeneration = Number(row.connection_generation);
-  if (row.tmux_target) session.tmuxTarget = String(row.tmux_target);
-  if (row.active_turn_id) session.activeTurnId = String(row.active_turn_id);
-  if (row.attach_status) session.attachStatus = row.attach_status as NonNullable<SessionRef["attachStatus"]>;
-  if (row.submit_strategy) session.submitStrategy = String(row.submit_strategy);
-  if (row.last_probe) session.lastProbe = String(row.last_probe);
-  if (row.last_probe_at) session.lastProbeAt = Number(row.last_probe_at);
-  return session;
+  if (row.cwd) attachment.cwd = String(row.cwd);
+  if (row.last_probe) attachment.lastProbe = String(row.last_probe);
+  if (row.last_probe_at) attachment.lastProbeAt = Number(row.last_probe_at);
+  return attachment;
 }
 
 function mapPendingAction(row: Row): StoredPendingAction {

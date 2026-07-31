@@ -10,18 +10,6 @@ export function parseSubmitSequence(value: string): SubmitStep[] {
     .flatMap(parseSubmitStep);
 }
 
-export function ptySubmitSequence(value: string): string {
-  return parseSubmitSequence(value)
-    .map((step) => {
-      if (step.type === "literal") return step.value;
-      if (step.key === "Enter" || step.key === "C-m") return "\r";
-      if (step.key === "C-j") return "\n";
-      if (step.key === "Escape") return "\x1b";
-      return "";
-    })
-    .join("");
-}
-
 function parseSubmitStep(raw: string): SubmitStep[] {
   const value = raw.toLowerCase();
 
