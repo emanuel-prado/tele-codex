@@ -83,6 +83,7 @@ const CODEX_THREAD_SELECT = `
 
 export class Store {
   private readonly db: Database.Database;
+  private closed = false;
 
   constructor(path: string) {
     this.db = new Database(path);
@@ -91,6 +92,8 @@ export class Store {
   }
 
   close(): void {
+    if (this.closed) return;
+    this.closed = true;
     this.db.close();
   }
 

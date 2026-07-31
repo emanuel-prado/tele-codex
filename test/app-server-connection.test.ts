@@ -1,8 +1,9 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { AppServerAdapter } from "../src/adapters/app-server-adapter.js";
 import type { AppConfig } from "../src/config.js";
 import { Store } from "../src/store/store.js";
 import type { PendingAction } from "../src/types/events.js";
+import { RuntimeHealth } from "../src/runtime/health.js";
 
 type AdapterInternals = {
   connected: boolean;
@@ -10,7 +11,13 @@ type AdapterInternals = {
   sessionsByThread: Map<string, { sessionId: string; generation: number }>;
   handleMessage(message: Record<string, unknown>, generation: number): Promise<void>;
   handleDisconnect(generation: number): void;
+  ensureConnected(): Promise<void>;
+  reconnectAttempt: number;
+  reconnectTimer?: NodeJS.Timeout;
+  waitForFailure(): Promise<void>;
 };
+
+afterEach(() => vi.useRealTimers());
 
 describe("AppServerAdapter connection generations", () => {
   it("invalidates persisted attachments and requests on restart", () => {
@@ -92,6 +99,51 @@ describe("AppServerAdapter connection generations", () => {
     adapter.close();
     store.close();
   });
+
+  it("fails the supervised transport after reconnect attempts are exhausted", async () => {
+    vi.useFakeTimers();
+    const store = new Store(":memory:");
+    const health = new RuntimeHealth();
+    const adapter = new AppServerAdapter({ ...config(), appServerMaxReconnectAttempts: 2 }, store, logger(), health);
+    const internals = adapter as unknown as AdapterInternals;
+    attach(internals, store, 2);
+    internals.ensureConnected = async () => { throw new Error("offline"); };
+
+    internals.handleDisconnect(2);
+    const failure = expect(internals.waitForFailure()).rejects.toThrow(/reconnect exhausted after 2 attempts/i);
+    await vi.advanceTimersByTimeAsync(3_000);
+
+    await failure;
+    expect(health.snapshot().appServer).toMatchObject({ state: "failed", reconnectAttempt: 2 });
+    adapter.close();
+    store.close();
+  });
+
+  it("recovers before the reconnect budget is exhausted", async () => {
+    vi.useFakeTimers();
+    const store = new Store(":memory:");
+    const health = new RuntimeHealth();
+    const adapter = new AppServerAdapter(config(), store, logger(), health);
+    const internals = adapter as unknown as AdapterInternals;
+    attach(internals, store, 2);
+    let attempts = 0;
+    internals.ensureConnected = async () => {
+      attempts += 1;
+      internals.connected = true;
+      internals.reconnectAttempt = 0;
+      health.appServer({ state: "connected", connectionGeneration: 3, reconnectAttempt: 0 });
+    };
+
+    internals.handleDisconnect(2);
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(attempts).toBe(1);
+    expect(health.snapshot().appServer).toMatchObject({ state: "connected", reconnectAttempt: 0 });
+    expect(internals.reconnectTimer).toBeUndefined();
+    adapter.close();
+    await expect(internals.waitForFailure()).resolves.toBeUndefined();
+    store.close();
+  });
 });
 
 function attach(internals: AdapterInternals, store: Store, generation: number): void {
@@ -140,6 +192,7 @@ function config(): AppConfig {
     logLevel: "silent",
     approvalTimeoutMs: 60_000,
     rpcTimeoutMs: 100,
+    appServerMaxReconnectAttempts: 3,
     rateLimitWarnPercent: 80,
     allowSessionGrants: true,
     codexCommand: "codex",

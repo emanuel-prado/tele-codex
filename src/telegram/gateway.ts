@@ -37,6 +37,10 @@ import { parseResumeCommand } from "./resume-command.js";
 import { PendingInteractionManager, type InteractionView } from "./pending-interaction.js";
 import { createId, createNonce } from "../utils/ids.js";
 import { TelegramRouting } from "./routing.js";
+import type { RuntimeHealth, RuntimeHealthReporter } from "../runtime/health.js";
+import { noopRuntimeHealth } from "../runtime/health.js";
+import type { SupervisedSubsystem } from "../runtime/supervisor.js";
+import { reportTelegramFailure, withPromptCallbackAck } from "./error-boundary.js";
 
 export class TelegramGateway {
   private readonly bot: Bot;
@@ -48,8 +52,14 @@ export class TelegramGateway {
   private readonly processSelections = new Map<string, { sessionId: string; processId: string; command: string }>();
   private readonly interactions: PendingInteractionManager;
   private readonly routing: TelegramRouting;
-  private outboxTimer: NodeJS.Timeout | undefined;
-  private actionSweepTimer: NodeJS.Timeout | undefined;
+  private pollingPromise?: Promise<void>;
+  private eventController?: AbortController;
+  private eventPromise?: Promise<void>;
+  private outboxController?: AbortController;
+  private outboxPromise?: Promise<void>;
+  private actionSweepController?: AbortController;
+  private actionSweepPromise?: Promise<void>;
+  private pollingStopPromise?: Promise<void>;
   private drainingOutbox = false;
 
   constructor(
@@ -58,7 +68,8 @@ export class TelegramGateway {
     private readonly legacyTmux: LegacyTmuxBridge,
     private readonly store: Store,
     private readonly policy: PolicyEngine,
-    private readonly logger: Logger
+    private readonly logger: Logger,
+    private readonly health: RuntimeHealthReporter = noopRuntimeHealth
   ) {
     this.bot = new Bot(config.botToken);
     this.interactions = new PendingInteractionManager(store, config.allowSessionGrants);
@@ -68,27 +79,17 @@ export class TelegramGateway {
         this.logger.warn({ userId: ctx.from?.id, chatId: ctx.chat?.id }, "rejected unauthorized Telegram update");
         return;
       }
+      this.health.telegramUpdate();
       await next();
     });
+    this.bot.use((ctx, next) => withPromptCallbackAck(ctx, next, this.logger));
     this.bot.catch(async (error) => {
-      this.logger.error({ error }, "Telegram bot middleware failed");
-      const detail = error.error instanceof Error ? error.error.message : "Telegram command failed.";
-      try {
-        await error.ctx.reply(`tele-codex error: ${detail}`);
-      } catch (replyError) {
-        this.logger.warn({ replyError }, "could not report Telegram command failure");
-      }
+      await reportTelegramFailure(error.ctx, error.error, this.health, this.logger);
     });
     this.registerHandlers();
   }
 
-  async start(): Promise<void> {
-    void this.forwardCodexEvents();
-    this.outboxTimer = setInterval(() => void this.drainOutbox(), 1_000);
-    this.actionSweepTimer = setInterval(() => {
-      void this.sessions.expirePendingActions().catch((error) => this.logger.error({ error }, "pending action sweep failed"));
-    }, 1_000);
-    void this.drainOutbox();
+  async startPolling(): Promise<void> {
     await this.bot.api.setMyCommands([
       { command: "status", description: "Show active Codex session" },
       { command: "panel", description: "Show session control panel" },
@@ -129,20 +130,119 @@ export class TelegramGateway {
       { command: "help", description: "Show help" }
     ]);
     await this.sendStartupPicker();
-    await this.bot.start({
-      allowed_updates: ["message", "callback_query"]
+    let ready!: () => void;
+    const started = new Promise<void>((resolve) => {
+      ready = resolve;
     });
+    this.pollingPromise = this.bot.start({
+      allowed_updates: ["message", "callback_query"],
+      onStart: () => ready()
+    });
+    await Promise.race([
+      started,
+      this.pollingPromise.then(() => {
+        throw new Error("Telegram polling exited during startup.");
+      })
+    ]);
+  }
+
+  runtimeSubsystems(): SupervisedSubsystem[] {
+    return [
+      {
+        name: "telegram-polling",
+        start: () => this.startPolling(),
+        wait: () => this.pollingPromise ?? Promise.reject(new Error("Telegram polling was not started.")),
+        stop: () => this.stopPolling()
+      },
+      {
+        name: "event-forwarder",
+        start: () => this.startEventForwarder(),
+        wait: () => this.eventPromise ?? Promise.reject(new Error("Event forwarder was not started.")),
+        stop: async () => {
+          this.eventController?.abort();
+          await this.eventPromise;
+        }
+      },
+      {
+        name: "outbox-worker",
+        start: () => this.startOutboxWorker(),
+        wait: () => this.outboxPromise ?? Promise.reject(new Error("Outbox worker was not started.")),
+        stop: async () => {
+          this.outboxController?.abort();
+          await this.outboxPromise;
+        }
+      },
+      {
+        name: "action-sweeper",
+        start: () => this.startActionSweeper(),
+        wait: () => this.actionSweepPromise ?? Promise.reject(new Error("Action sweeper was not started.")),
+        stop: async () => {
+          this.actionSweepController?.abort();
+          await this.actionSweepPromise;
+        }
+      }
+    ];
   }
 
   async stop(): Promise<void> {
-    if (this.outboxTimer) clearInterval(this.outboxTimer);
-    if (this.actionSweepTimer) clearInterval(this.actionSweepTimer);
-    this.outboxTimer = undefined;
-    this.actionSweepTimer = undefined;
-    for (const buffer of this.messageBuffers.values()) clearTimeout(buffer.timer);
-    for (const sessionId of [...this.messageBuffers.keys()]) await this.flushAgentMessage(sessionId);
-    await this.drainOutbox();
-    this.bot.stop();
+    this.actionSweepController?.abort();
+    this.outboxController?.abort();
+    this.eventController?.abort();
+    await this.stopPolling();
+  }
+
+  private startEventForwarder(): void {
+    this.eventController = new AbortController();
+    this.eventPromise = this.forwardCodexEvents(this.eventController.signal);
+  }
+
+  private startOutboxWorker(): void {
+    this.outboxController = new AbortController();
+    this.outboxPromise = this.runOutboxWorker(this.outboxController.signal);
+  }
+
+  private startActionSweeper(): void {
+    this.actionSweepController = new AbortController();
+    this.actionSweepPromise = this.runActionSweeper(this.actionSweepController.signal);
+  }
+
+  private stopPolling(): Promise<void> {
+    if (this.pollingStopPromise) return this.pollingStopPromise;
+    this.pollingStopPromise = (async () => {
+      for (const buffer of this.messageBuffers.values()) clearTimeout(buffer.timer);
+      for (const sessionId of [...this.messageBuffers.keys()]) {
+        try {
+          await this.flushAgentMessage(sessionId);
+        } catch (error) {
+          this.health.deliveryFailure(error);
+          this.logger.warn({ error, sessionId }, "could not flush buffered agent message during shutdown");
+        }
+      }
+      try {
+        await this.drainOutbox();
+      } catch (error) {
+        this.health.deliveryFailure(error);
+        this.logger.warn({ error }, "could not drain Telegram outbox during shutdown");
+      }
+      if (this.bot.isRunning()) this.bot.stop();
+    })();
+    return this.pollingStopPromise;
+  }
+
+  private async runOutboxWorker(signal: AbortSignal): Promise<void> {
+    while (!signal.aborted) {
+      await this.drainOutbox();
+      this.health.heartbeat("outbox-worker");
+      await waitForWorkerTick(signal, 1_000);
+    }
+  }
+
+  private async runActionSweeper(signal: AbortSignal): Promise<void> {
+    while (!signal.aborted) {
+      await this.sessions.expirePendingActions();
+      this.health.heartbeat("action-sweeper");
+      await waitForWorkerTick(signal, 1_000);
+    }
   }
 
   private registerHandlers(): void {
@@ -423,19 +523,19 @@ export class TelegramGateway {
     this.bot.command("health", async (ctx) => {
       const outbox = this.store.outboxCounts();
       const active = this.sessions.getActiveSession();
-      await ctx.reply([
-        "tele-codex health",
-        "",
-        `session: ${active ? `${active.status} (${active.label})` : "none active"}`,
-        `pending interactions: ${this.store.listPendingActions().length}`,
-        `delivery queue: ${outbox.pending} pending, ${outbox.failed} failed`,
-        outbox.failed ? "Use /retrydelivery after correcting Telegram connectivity." : "high-signal delivery: healthy"
-      ].join("\n"));
+      const snapshot = "snapshot" in this.health
+        ? (this.health as RuntimeHealth).snapshot()
+        : undefined;
+      await ctx.reply(formatRuntimeHealth(snapshot, {
+        session: active ? `${active.status} (${active.label})` : "none active",
+        pending: this.store.listPendingActions().length,
+        queued: outbox.pending,
+        failed: outbox.failed
+      }));
     });
 
     this.bot.command("retrydelivery", async (ctx) => {
       const count = this.store.retryFailedOutbox();
-      void this.drainOutbox();
       await ctx.reply(`Queued ${count} failed notification(s) for retry.`);
     });
 
@@ -951,11 +1051,12 @@ export class TelegramGateway {
         }
         const [text, options] = await this.workspacePickerMessage();
         await this.bot.api.sendMessage(chatId, text, options);
+        this.health.deliverySuccess();
       } catch (error) {
+        this.health.deliveryFailure(error);
         this.logger.warn({ error, chatId }, "failed to send startup picker");
       }
     }
-    void this.drainOutbox();
     if (orphaned) this.store.setRuntimeValue("startup_orphaned_actions", 0);
     if (orphanedActionIds.length > 0) this.store.setRuntimeValue("startup_orphaned_action_ids", []);
   }
@@ -1171,13 +1272,11 @@ export class TelegramGateway {
     await ctx.reply("Decision submitted; waiting for Codex confirmation.");
   }
 
-  private async forwardCodexEvents(): Promise<void> {
+  private async forwardCodexEvents(signal: AbortSignal): Promise<void> {
     for await (const event of this.sessions.events()) {
-      try {
-        await this.handleCodexEvent(event);
-      } catch (error) {
-        this.logger.error({ error, eventType: event.type, sessionId: event.sessionId }, "failed to ingest Codex event");
-      }
+      if (signal.aborted) return;
+      await this.handleCodexEvent(event);
+      this.health.heartbeat("event-forwarder", event.type);
     }
   }
 
@@ -1215,7 +1314,6 @@ export class TelegramGateway {
           event.action.id
         );
       }
-      void this.drainOutbox();
       return;
     }
 
@@ -1235,7 +1333,6 @@ export class TelegramGateway {
           { text: truncateMiddle(text) }
         );
       }
-      void this.drainOutbox();
       return;
     }
 
@@ -1246,7 +1343,6 @@ export class TelegramGateway {
           text: formatGoal(event.goal)
         });
       }
-      void this.drainOutbox();
       return;
     }
 
@@ -1257,7 +1353,6 @@ export class TelegramGateway {
           text: `${event.recovered ? "Codex rate limits recovered" : "Codex rate-limit warning"}\n\n${formatLimits(event.limits)}`
         });
       }
-      void this.drainOutbox();
       return;
     }
 
@@ -1267,7 +1362,6 @@ export class TelegramGateway {
           text: `Codex warning: ${event.message}`
         });
       }
-      void this.drainOutbox();
     }
   }
 
@@ -1289,10 +1383,12 @@ export class TelegramGateway {
           if (message.payload.keyboard) options.reply_markup = { inline_keyboard: message.payload.keyboard };
           const sent = await this.bot.api.sendMessage(message.chatId, message.payload.text, options as never);
           this.store.markOutboxSent(message.id);
+          this.health.deliverySuccess();
           if (message.actionId) this.store.setTelegramMessage(message.actionId, message.chatId, sent.message_id);
         } catch (error) {
           const detail = error instanceof Error ? error.message : String(error);
           this.store.retryOutbox(message.id, message.attempts + 1, detail);
+          this.health.deliveryFailure(error);
           this.logger.warn({ error, outboxId: message.id, attempts: message.attempts + 1 }, "Telegram delivery failed");
         }
       }
@@ -1333,11 +1429,17 @@ export class TelegramGateway {
     if (existing) {
       existing.text = appendAgentMessageChunk(existing.text, text, session);
       clearTimeout(existing.timer);
-      existing.timer = setTimeout(() => void this.flushAgentMessage(sessionId), 1200);
+      existing.timer = setTimeout(() => void this.flushAgentMessage(sessionId).catch((error) => {
+        this.health.deliveryFailure(error);
+        this.logger.warn({ error, sessionId }, "buffered Telegram delivery failed");
+      }), 1200);
       return;
     }
 
-    const timer = setTimeout(() => void this.flushAgentMessage(sessionId), 1200);
+    const timer = setTimeout(() => void this.flushAgentMessage(sessionId).catch((error) => {
+      this.health.deliveryFailure(error);
+      this.logger.warn({ error, sessionId }, "buffered Telegram delivery failed");
+    }), 1200);
     this.messageBuffers.set(sessionId, { text: appendAgentMessageChunk("", text, session), timer });
   }
 
@@ -1368,6 +1470,55 @@ export class TelegramGateway {
     const routed = this.store.listSessionChats(sessionId);
     return routed.length > 0 ? routed : this.allowedDeliveryChats();
   }
+}
+
+function formatRuntimeHealth(
+  snapshot: ReturnType<RuntimeHealth["snapshot"]> | undefined,
+  counts: { session: string; pending: number; queued: number; failed: number }
+): string {
+  if (!snapshot) {
+    return [
+      "tele-codex health: unavailable",
+      `session: ${counts.session}`,
+      `pending interactions: ${counts.pending}`,
+      `delivery queue: ${counts.queued} pending, ${counts.failed} failed`
+    ].join("\n");
+  }
+  const app = snapshot.appServer;
+  return [
+    `tele-codex health: ${snapshot.overall}`,
+    `lifecycle: ${snapshot.lifecycle}`,
+    `app-server: ${app.state}${app.transport ? ` (${app.transport}${app.pid ? ` pid ${app.pid}` : ""})` : ""}`,
+    `connection: generation ${app.connectionGeneration ?? "none"}, reconnect attempt ${app.reconnectAttempt}`,
+    `last app-server message: ${formatHealthTime(app.lastMessageAt)}`,
+    `last Telegram update: ${formatHealthTime(snapshot.lastTelegramUpdateAt)}`,
+    `last delivery success: ${formatHealthTime(snapshot.delivery.lastSuccessAt)}`,
+    `last delivery failure: ${formatHealthTime(snapshot.delivery.lastFailureAt)}${snapshot.delivery.lastFailure ? ` (${snapshot.delivery.lastFailure})` : ""}`,
+    ...snapshot.subsystems.map((item) => `${item.name}: ${item.state}, heartbeat ${formatHealthTime(item.lastHeartbeatAt)}${item.detail ? ` (${item.detail})` : ""}`),
+    `session: ${counts.session}`,
+    `pending interactions: ${counts.pending}`,
+    `delivery queue: ${counts.queued} pending, ${counts.failed} failed`,
+    snapshot.lastFatal
+      ? `last fatal: ${snapshot.lastFatal.subsystem} (${snapshot.lastFatal.correlationId}) at ${formatHealthTime(snapshot.lastFatal.at)}`
+      : "last fatal: none"
+  ].join("\n");
+}
+
+function formatHealthTime(value?: number): string {
+  return value ? new Date(value).toISOString() : "never";
+}
+
+function waitForWorkerTick(signal: AbortSignal, delayMs: number): Promise<void> {
+  if (signal.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(done, delayMs);
+    signal.addEventListener("abort", done, { once: true });
+    function done(): void {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", done);
+      resolve();
+    }
+  });
 }
 
 function interactionKeyboard(view: InteractionView): InlineKeyboard {

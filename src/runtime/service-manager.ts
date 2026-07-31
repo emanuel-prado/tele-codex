@@ -13,6 +13,8 @@ export interface ServiceManagerOptions {
   cliPath?: string;
   user?: string;
   runCommand?: (command: string, args: string[]) => Promise<{ stdout: string; stderr: string }>;
+  wait?: (ms: number) => Promise<void>;
+  updateHealthAttempts?: number;
 }
 
 export interface ServiceStatus {
@@ -30,6 +32,8 @@ export class ServiceManager {
   private readonly cliPath: string;
   private readonly user: string;
   private readonly runCommand: NonNullable<ServiceManagerOptions["runCommand"]>;
+  private readonly wait: NonNullable<ServiceManagerOptions["wait"]>;
+  private readonly updateHealthAttempts: number;
 
   constructor(options: ServiceManagerOptions = {}) {
     this.home = options.home ?? homedir();
@@ -38,6 +42,8 @@ export class ServiceManager {
     this.cliPath = resolve(options.cliPath ?? process.argv[1] ?? "dist/cli.js");
     this.user = options.user ?? process.env.USER ?? "";
     this.runCommand = options.runCommand ?? defaultRunCommand;
+    this.wait = options.wait ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+    this.updateHealthAttempts = options.updateHealthAttempts ?? 10;
   }
 
   unitPath(): string {
@@ -67,6 +73,31 @@ export class ServiceManager {
       if (error.code !== "ENOENT") throw error;
     });
     await this.runCommand("systemctl", ["--user", "daemon-reload"]);
+  }
+
+  async update(): Promise<ServiceStatus> {
+    await this.runCommand("npm", ["--prefix", this.cwd, "run", "build"]);
+    await this.runCommand("systemctl", ["--user", "restart", "tele-codex.service"]);
+    let stablePid: string | undefined;
+    let stableChecks = 0;
+    for (let attempt = 0; attempt < this.updateHealthAttempts; attempt += 1) {
+      const active = await commandOk(this.runCommand, "systemctl", ["--user", "is-active", "--quiet", "tele-codex.service"]);
+      const pid = active
+        ? (await this.runCommand("systemctl", ["--user", "show", "tele-codex.service", "--property", "MainPID", "--value"])
+            .then((result) => result.stdout.trim())
+            .catch(() => ""))
+        : "";
+      if (active && pid && pid !== "0") {
+        stableChecks = pid === stablePid ? stableChecks + 1 : 1;
+        stablePid = pid;
+        if (stableChecks >= 2) return this.status();
+      } else {
+        stablePid = undefined;
+        stableChecks = 0;
+      }
+      await this.wait(1_000);
+    }
+    throw new Error("Service update built successfully, but tele-codex did not remain active with a stable PID. Check: journalctl --user -u tele-codex.service");
   }
 
   async status(): Promise<ServiceStatus> {
