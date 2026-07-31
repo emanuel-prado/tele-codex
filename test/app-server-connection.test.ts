@@ -1,0 +1,155 @@
+import { describe, expect, it } from "vitest";
+import { AppServerAdapter } from "../src/adapters/app-server-adapter.js";
+import type { AppConfig } from "../src/config.js";
+import { Store } from "../src/store/store.js";
+import type { PendingAction } from "../src/types/events.js";
+
+type AdapterInternals = {
+  connected: boolean;
+  connectionGeneration?: number;
+  sessionsByThread: Map<string, { sessionId: string; generation: number }>;
+  handleMessage(message: Record<string, unknown>, generation: number): Promise<void>;
+  handleDisconnect(generation: number): void;
+};
+
+describe("AppServerAdapter connection generations", () => {
+  it("invalidates persisted attachments and requests on restart", () => {
+    const store = new Store(":memory:");
+    store.upsertSession({
+      id: "session_1",
+      adapter: "appserver",
+      label: "one",
+      codexThreadId: "thread_1",
+      connectionGeneration: 4
+    }, "idle");
+    store.putPendingAction(action(4));
+
+    const adapter = new AppServerAdapter(config(), store, logger());
+
+    expect(store.getSession("session_1")).toMatchObject({ status: "error" });
+    expect(store.getSession("session_1")?.connectionGeneration).toBeUndefined();
+    expect(store.getPendingAction("action_1")?.status).toBe("orphaned");
+    expect(store.getRuntimeValue("startup_orphaned_action_ids")).toEqual(["action_1"]);
+    adapter.close();
+    store.close();
+  });
+
+  it("ignores stale requests and resolves only an acknowledgement from the owning generation", async () => {
+    const store = new Store(":memory:");
+    const adapter = new AppServerAdapter(config(), store, logger());
+    const internals = adapter as unknown as AdapterInternals;
+    attach(internals, store, 2);
+
+    await internals.handleMessage(approvalRequest(7), 1);
+    expect(store.listPendingActions()).toEqual([]);
+
+    await internals.handleMessage(approvalRequest(7), 2);
+    const [action] = store.listPendingActions();
+    expect(action).toMatchObject({ requestId: 7, connectionGeneration: 2, status: "pending" });
+    store.claimPendingAction(action!.id);
+
+    await internals.handleMessage({ method: "serverRequest/resolved", params: { requestId: 7 } }, 1);
+    expect(store.getPendingAction(action!.id)?.status).toBe("submitting");
+    await internals.handleMessage({ method: "serverRequest/resolved", params: { requestId: 7 } }, 2);
+    expect(store.getPendingAction(action!.id)?.status).toBe("resolved");
+
+    adapter.close();
+    store.close();
+  });
+
+  it("does not let an old close event tear down a newer attachment", () => {
+    const store = new Store(":memory:");
+    const adapter = new AppServerAdapter(config(), store, logger());
+    const internals = adapter as unknown as AdapterInternals;
+    attach(internals, store, 2);
+    store.putPendingAction(action(2));
+
+    internals.handleDisconnect(1);
+
+    expect(store.getSession("session_1")).toMatchObject({ status: "idle", connectionGeneration: 2 });
+    expect(store.getPendingAction("action_1")?.status).toBe("pending");
+    expect(internals.sessionsByThread.get("thread_1")?.generation).toBe(2);
+    adapter.close();
+    store.close();
+  });
+
+  it("orphans and detaches only state owned by the lost generation", () => {
+    const store = new Store(":memory:");
+    const adapter = new AppServerAdapter(config(), store, logger());
+    const internals = adapter as unknown as AdapterInternals;
+    attach(internals, store, 2);
+    store.putPendingAction(action(2));
+    store.claimPendingAction("action_1");
+    store.putPendingAction({ ...action(1), id: "older_action", requestId: 8 });
+
+    internals.handleDisconnect(2);
+
+    expect(store.getPendingAction("action_1")?.status).toBe("orphaned");
+    expect(store.getPendingAction("older_action")?.status).toBe("pending");
+    expect(store.getSession("session_1")).toMatchObject({ status: "error" });
+    expect(store.getSession("session_1")?.connectionGeneration).toBeUndefined();
+    expect(internals.sessionsByThread.has("thread_1")).toBe(false);
+    adapter.close();
+    store.close();
+  });
+});
+
+function attach(internals: AdapterInternals, store: Store, generation: number): void {
+  internals.connected = true;
+  internals.connectionGeneration = generation;
+  internals.sessionsByThread.set("thread_1", { sessionId: "session_1", generation });
+  store.upsertSession({
+    id: "session_1",
+    adapter: "appserver",
+    label: "one",
+    codexThreadId: "thread_1",
+    connectionGeneration: generation
+  }, "idle");
+}
+
+function approvalRequest(id: number): Record<string, unknown> {
+  return {
+    id,
+    method: "item/commandExecution/requestApproval",
+    params: { threadId: "thread_1", command: "true" }
+  };
+}
+
+function action(connectionGeneration: number): PendingAction {
+  return {
+    id: "action_1",
+    kind: "commandApproval",
+    sessionId: "session_1",
+    requestId: 7,
+    connectionGeneration,
+    threadId: "thread_1",
+    title: "Approval",
+    body: "run",
+    payload: { method: "item/commandExecution/requestApproval", params: {} },
+    nonce: "nonce",
+    expiresAt: Date.now() + 60_000
+  };
+}
+
+function config(): AppConfig {
+  return {
+    botToken: "token",
+    allowedUserIds: new Set([1]),
+    allowedChatIds: new Set([1]),
+    dbPath: ":memory:",
+    defaultAdapter: "appserver",
+    logLevel: "silent",
+    approvalTimeoutMs: 60_000,
+    rpcTimeoutMs: 100,
+    rateLimitWarnPercent: 80,
+    allowSessionGrants: true,
+    codexCommand: "codex",
+    ptySubmitKey: "enter",
+    ptyPasteSettleMs: 0,
+    workspaceRoot: "/tmp"
+  };
+}
+
+function logger(): never {
+  return { debug() {}, warn() {}, error() {} } as never;
+}

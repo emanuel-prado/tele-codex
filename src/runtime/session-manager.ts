@@ -222,27 +222,48 @@ export class SessionManager {
     if (!action) throw new Error("Action is no longer pending or has expired.");
     const session = this.store.getSession(action.sessionId);
     if (!session) {
-      this.store.releasePendingAction(action.id);
+      this.store.failPendingAction(action.id, "Session for pending action not found.");
       throw new Error("Session for pending action not found.");
     }
     try {
       await this.adapters[session.adapter].respondAction(decision);
-      this.store.resolvePendingAction(action.id, "resolved");
-      this.store.deleteInteractionDraft(action.id);
+      if (session.adapter !== "appserver") {
+        this.store.resolvePendingAction(action.id, "resolved");
+        this.store.deleteInteractionDraft(action.id);
+      }
     } catch (error) {
-      this.store.releasePendingAction(action.id);
+      if (this.store.getPendingAction(action.id)?.status === "submitting") {
+        this.store.failPendingAction(action.id, error instanceof Error ? error.message : "Action submission failed.");
+      }
       throw error;
     }
   }
 
   async expirePendingActions(): Promise<number> {
     let expired = 0;
+    for (const action of this.store.listExpiredSubmissions()) {
+      this.store.resolvePendingAction(action.id, "orphaned");
+      this.store.deleteInteractionDraft(action.id);
+      this.queue.push({
+        type: "actionOrphaned",
+        sessionId: action.sessionId,
+        actionId: action.id,
+        message: "Codex did not confirm this response before it expired. Resume the thread and retry the original command."
+      });
+      expired += 1;
+    }
     for (const candidate of this.store.listExpiredActions()) {
       const action = this.store.claimExpiredAction(candidate.id);
       if (!action) continue;
       const session = this.store.getSession(action.sessionId);
       if (!session) {
         this.store.resolvePendingAction(action.id, "orphaned");
+        this.queue.push({
+          type: "actionOrphaned",
+          sessionId: action.sessionId,
+          actionId: action.id,
+          message: "The session for this request is unavailable. Resume the thread and retry the original command."
+        });
         continue;
       }
       const payload = action.payload && typeof action.payload === "object"
@@ -258,11 +279,18 @@ export class SessionManager {
       if (action.kind === "question") decision.answers = {};
       try {
         await this.adapters[session.adapter].respondAction(decision);
-        this.store.resolvePendingAction(action.id, "expired");
         this.store.deleteInteractionDraft(action.id);
+        if (session.adapter !== "appserver") this.store.resolvePendingAction(action.id, "expired");
         expired += 1;
       } catch (error) {
         this.store.resolvePendingAction(action.id, "orphaned");
+        this.store.deleteInteractionDraft(action.id);
+        this.queue.push({
+          type: "actionOrphaned",
+          sessionId: action.sessionId,
+          actionId: action.id,
+          message: "This request expired before it could be submitted. Resume the thread and retry the original command."
+        });
         this.logger.warn({ error, actionId: action.id }, "failed to expire pending action");
       }
     }

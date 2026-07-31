@@ -57,12 +57,57 @@ describe("PendingInteractionManager", () => {
     expect(view.text).toContain("not end-to-end encrypted");
     store.close();
   });
+
+  it("does not consume a decision control until submission succeeds", () => {
+    const store = new Store(":memory:");
+    const action = approvalAction();
+    store.putPendingAction(action);
+    const manager = new PendingInteractionManager(store, true);
+    const token = callback(manager.actionView(action, 10));
+
+    expect(manager.handleCallback(token, 10, 20).kind).toBe("submit");
+    store.claimPendingAction(action.id);
+    store.failPendingAction(action.id, "transport closed");
+    expect(manager.actionView(store.getPendingAction(action.id)!, 10).text).toContain("transport closed");
+    expect(manager.handleCallback(token, 10, 20).kind).toBe("submit");
+    store.close();
+  });
+
+  it("rejects a callback after its connection is orphaned", () => {
+    const store = new Store(":memory:");
+    const action = approvalAction();
+    store.putPendingAction(action);
+    const manager = new PendingInteractionManager(store, true);
+    const token = callback(manager.actionView(action, 10));
+    store.orphanOpenActions(action.connectionGeneration);
+
+    expect(manager.handleCallback(token, 10, 20)).toEqual({
+      kind: "notice",
+      text: "This request is no longer pending."
+    });
+    store.close();
+  });
 });
 
 function callback(view: { rows: Array<Array<{ callbackData?: string }>> } | undefined): string {
   const data = view?.rows.flat().find((button) => button.callbackData)?.callbackData;
   if (!data) throw new Error("missing callback");
   return data.slice(3);
+}
+
+function approvalAction(): PendingAction {
+  return {
+    id: "approval_1",
+    kind: "commandApproval",
+    sessionId: "session_1",
+    requestId: 2,
+    connectionGeneration: 1,
+    title: "Approval",
+    body: "run",
+    payload: { method: "item/commandExecution/requestApproval", params: {} },
+    nonce: "nonce",
+    expiresAt: Date.now() + 60_000
+  };
 }
 
 function questionAction(secret = false): PendingAction {

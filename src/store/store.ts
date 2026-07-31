@@ -2,12 +2,13 @@ import Database from "better-sqlite3";
 import type { RateLimitSummary, SessionProgress, SessionTokenUsage, ThreadGoalSummary } from "../types/control.js";
 import type { AdapterKind, LogEntry, PendingAction, SessionRef, SessionStatus } from "../types/events.js";
 
-export type PendingActionStatus = "pending" | "submitting" | "resolved" | "expired" | "cancelled" | "orphaned";
+export type PendingActionStatus = "pending" | "submitting" | "resolved" | "expired" | "cancelled" | "orphaned" | "failed";
 
 export interface StoredPendingAction extends PendingAction {
   status: PendingActionStatus;
   createdAt: number;
   resolvedAt?: number;
+  failureReason?: string;
 }
 
 export interface CallbackToken {
@@ -68,12 +69,13 @@ export class Store {
     const now = Date.now();
     this.db
       .prepare(
-        `insert into sessions (id, adapter, label, cwd, codex_thread_id, tmux_target, status, paused, created_at, updated_at)
-         values (@id, @adapter, @label, @cwd, @codexThreadId, @tmuxTarget, @status, 0, @now, @now)
+        `insert into sessions (id, adapter, label, cwd, codex_thread_id, connection_generation, tmux_target, status, paused, created_at, updated_at)
+         values (@id, @adapter, @label, @cwd, @codexThreadId, @connectionGeneration, @tmuxTarget, @status, 0, @now, @now)
          on conflict(id) do update set
            label=excluded.label,
            cwd=excluded.cwd,
            codex_thread_id=excluded.codex_thread_id,
+           connection_generation=excluded.connection_generation,
            tmux_target=excluded.tmux_target,
            status=excluded.status,
            updated_at=excluded.updated_at`
@@ -84,6 +86,7 @@ export class Store {
         label: session.label,
         cwd: session.cwd ?? null,
         codexThreadId: session.codexThreadId ?? null,
+        connectionGeneration: session.connectionGeneration ?? null,
         tmuxTarget: session.tmuxTarget ?? null,
         status,
         now
@@ -127,6 +130,22 @@ export class Store {
       .run(status, Date.now(), sessionId);
   }
 
+  clearSessionAttachments(connectionGeneration?: number): string[] {
+    const rows = connectionGeneration === undefined
+      ? this.db.prepare("select id from sessions where adapter = 'appserver' and connection_generation is not null").all() as Array<{ id: string }>
+      : this.db.prepare("select id from sessions where adapter = 'appserver' and connection_generation = ?").all(connectionGeneration) as Array<{ id: string }>;
+    if (connectionGeneration === undefined) {
+      this.db
+        .prepare("update sessions set connection_generation = null, active_turn_id = null, status = 'error', updated_at = ? where adapter = 'appserver' and connection_generation is not null")
+        .run(Date.now());
+    } else {
+      this.db
+        .prepare("update sessions set connection_generation = null, active_turn_id = null, status = 'error', updated_at = ? where adapter = 'appserver' and connection_generation = ?")
+        .run(Date.now(), connectionGeneration);
+    }
+    return rows.map((row) => row.id);
+  }
+
   setPaused(sessionId: string, paused: boolean): void {
     this.db
       .prepare("update sessions set paused = ?, status = ?, updated_at = ? where id = ?")
@@ -153,14 +172,17 @@ export class Store {
     this.db
       .prepare(
         `insert into pending_actions
-          (id, kind, session_id, request_id, request_id_type, thread_id, turn_id, item_id, title, body, payload_json, nonce, status, expires_at, created_at)
+          (id, kind, session_id, request_id, request_id_type, connection_generation, thread_id, turn_id, item_id, title, body, payload_json, nonce, status, expires_at, created_at, failure_reason)
          values
-          (@id, @kind, @sessionId, @requestId, @requestIdType, @threadId, @turnId, @itemId, @title, @body, @payloadJson, @nonce, 'pending', @expiresAt, @createdAt)
+          (@id, @kind, @sessionId, @requestId, @requestIdType, @connectionGeneration, @threadId, @turnId, @itemId, @title, @body, @payloadJson, @nonce, 'pending', @expiresAt, @createdAt, null)
          on conflict(id) do update set
           body=excluded.body,
           payload_json=excluded.payload_json,
           nonce=excluded.nonce,
           status='pending',
+          connection_generation=excluded.connection_generation,
+          failure_reason=null,
+          resolved_at=null,
           expires_at=excluded.expires_at`
       )
       .run({
@@ -169,6 +191,7 @@ export class Store {
         sessionId: action.sessionId,
         requestId: action.requestId == null ? null : String(action.requestId),
         requestIdType: action.requestId == null ? null : typeof action.requestId,
+        connectionGeneration: action.connectionGeneration ?? null,
         threadId: action.threadId ?? null,
         turnId: action.turnId ?? null,
         itemId: action.itemId ?? null,
@@ -189,51 +212,74 @@ export class Store {
   listPendingActions(sessionId?: string): StoredPendingAction[] {
     const rows = sessionId
       ? (this.db
-          .prepare("select * from pending_actions where status = 'pending' and expires_at > ? and session_id = ? order by created_at")
+          .prepare("select * from pending_actions where status in ('pending', 'failed') and expires_at > ? and session_id = ? order by created_at")
           .all(Date.now(), sessionId) as Row[])
       : (this.db
-          .prepare("select * from pending_actions where status = 'pending' and expires_at > ? order by created_at")
+          .prepare("select * from pending_actions where status in ('pending', 'failed') and expires_at > ? order by created_at")
           .all(Date.now()) as Row[]);
     return rows.map(mapPendingAction);
   }
 
   claimPendingAction(actionId: string): StoredPendingAction | undefined {
     const result = this.db
-      .prepare("update pending_actions set status = 'submitting' where id = ? and status = 'pending' and expires_at > ?")
+      .prepare("update pending_actions set status = 'submitting', failure_reason = null where id = ? and status in ('pending', 'failed') and expires_at > ?")
       .run(actionId, Date.now());
     return result.changes === 1 ? this.getPendingAction(actionId) : undefined;
   }
 
   listExpiredActions(): StoredPendingAction[] {
     const rows = this.db
-      .prepare("select * from pending_actions where status = 'pending' and expires_at <= ? order by created_at")
+      .prepare("select * from pending_actions where status in ('pending', 'failed') and expires_at <= ? order by created_at")
       .all(Date.now()) as Row[];
     return rows.map(mapPendingAction);
   }
 
   claimExpiredAction(actionId: string): StoredPendingAction | undefined {
     const result = this.db
-      .prepare("update pending_actions set status = 'submitting' where id = ? and status = 'pending' and expires_at <= ?")
+      .prepare("update pending_actions set status = 'submitting', failure_reason = null where id = ? and status in ('pending', 'failed') and expires_at <= ?")
       .run(actionId, Date.now());
     return result.changes === 1 ? this.getPendingAction(actionId) : undefined;
   }
 
-  releasePendingAction(actionId: string): void {
-    this.db.prepare("update pending_actions set status = 'pending' where id = ? and status = 'submitting'").run(actionId);
+  listExpiredSubmissions(): StoredPendingAction[] {
+    return (this.db
+      .prepare("select * from pending_actions where status = 'submitting' and expires_at <= ? order by created_at")
+      .all(Date.now()) as Row[]).map(mapPendingAction);
   }
 
-  orphanOpenActions(): number {
-    const result = this.db
-      .prepare("update pending_actions set status = 'orphaned', resolved_at = ? where status in ('pending', 'submitting')")
-      .run(Date.now());
+  failPendingAction(actionId: string, reason: string): void {
+    this.db
+      .prepare("update pending_actions set status = 'failed', failure_reason = ? where id = ? and status = 'submitting'")
+      .run(reason, actionId);
+  }
+
+  orphanOpenActions(connectionGeneration?: number): number {
+    const result = connectionGeneration === undefined
+      ? this.db
+          .prepare("update pending_actions set status = 'orphaned', resolved_at = ? where status in ('pending', 'submitting', 'failed')")
+          .run(Date.now())
+      : this.db
+          .prepare("update pending_actions set status = 'orphaned', resolved_at = ? where connection_generation = ? and status in ('pending', 'submitting', 'failed')")
+          .run(Date.now(), connectionGeneration);
     return result.changes;
+  }
+
+  listOpenActions(connectionGeneration?: number): StoredPendingAction[] {
+    const rows = connectionGeneration === undefined
+      ? this.db
+          .prepare("select * from pending_actions where status in ('pending', 'submitting', 'failed') order by created_at")
+          .all() as Row[]
+      : this.db
+          .prepare("select * from pending_actions where connection_generation = ? and status in ('pending', 'submitting', 'failed') order by created_at")
+          .all(connectionGeneration) as Row[];
+    return rows.map(mapPendingAction);
   }
 
   getNewestPendingQuestion(sessionId: string): PendingAction | undefined {
     const row = this.db
       .prepare(
         `select * from pending_actions
-         where session_id = ? and kind = 'question' and status = 'pending' and expires_at > ?
+         where session_id = ? and kind = 'question' and status in ('pending', 'failed') and expires_at > ?
          order by created_at desc
          limit 1`
       )
@@ -243,7 +289,7 @@ export class Store {
 
   countPendingActions(sessionId: string): number {
     const row = this.db
-      .prepare("select count(*) as count from pending_actions where session_id = ? and status = 'pending' and expires_at > ?")
+      .prepare("select count(*) as count from pending_actions where session_id = ? and status in ('pending', 'failed') and expires_at > ?")
       .get(sessionId, Date.now()) as { count: number };
     return Number(row.count);
   }
@@ -352,10 +398,10 @@ export class Store {
       .run(status, Date.now(), actionId);
   }
 
-  resolvePendingActionByRequestId(requestId: string | number, status: "resolved" | "expired" | "cancelled" = "resolved"): string | undefined {
+  resolvePendingActionByRequestId(requestId: string | number, connectionGeneration: number, status: "resolved" | "expired" | "cancelled" = "resolved"): string | undefined {
     const row = this.db
-      .prepare("select id from pending_actions where request_id = ? and status in ('pending', 'submitting', 'expired') order by created_at desc limit 1")
-      .get(String(requestId)) as { id: string } | undefined;
+      .prepare("select id from pending_actions where request_id = ? and connection_generation = ? and status in ('pending', 'submitting', 'failed', 'expired') order by created_at desc limit 1")
+      .get(String(requestId), connectionGeneration) as { id: string } | undefined;
     if (!row) return undefined;
     this.resolvePendingAction(row.id, status);
     this.deleteInteractionDraft(row.id);
@@ -379,6 +425,12 @@ export class Store {
       return mapCallbackToken(row);
     });
     return transaction();
+  }
+
+  releaseCallbackToken(token: string, chatId: number): void {
+    this.db
+      .prepare("update callback_tokens set consumed_at = null where token = ? and chat_id = ? and consumed_at is not null and expires_at > ?")
+      .run(token, chatId, Date.now());
   }
 
   putInteractionDraft(draft: InteractionDraft): void {
@@ -558,6 +610,7 @@ export class Store {
         label text not null,
         cwd text,
         codex_thread_id text,
+        connection_generation integer,
         tmux_target text,
         status text not null,
         paused integer not null default 0,
@@ -576,6 +629,7 @@ export class Store {
         session_id text not null,
         request_id text,
         request_id_type text,
+        connection_generation integer,
         thread_id text,
         turn_id text,
         item_id text,
@@ -588,7 +642,8 @@ export class Store {
         created_at integer not null,
         resolved_at integer,
         telegram_chat_id integer,
-        telegram_message_id integer
+        telegram_message_id integer,
+        failure_reason text
       );
 
       create table if not exists event_log (
@@ -698,6 +753,9 @@ export class Store {
     this.addColumnIfMissing("sessions", "last_probe", "text");
     this.addColumnIfMissing("sessions", "last_probe_at", "integer");
     this.addColumnIfMissing("pending_actions", "request_id_type", "text");
+    this.addColumnIfMissing("pending_actions", "connection_generation", "integer");
+    this.addColumnIfMissing("pending_actions", "failure_reason", "text");
+    this.addColumnIfMissing("sessions", "connection_generation", "integer");
   }
 
   private addColumnIfMissing(table: string, column: string, type: string): void {
@@ -727,6 +785,7 @@ function mapSession(row: Row): StoredSession {
   };
   if (row.cwd) session.cwd = String(row.cwd);
   if (row.codex_thread_id) session.codexThreadId = String(row.codex_thread_id);
+  if (row.connection_generation != null) session.connectionGeneration = Number(row.connection_generation);
   if (row.tmux_target) session.tmuxTarget = String(row.tmux_target);
   if (row.active_turn_id) session.activeTurnId = String(row.active_turn_id);
   if (row.attach_status) session.attachStatus = row.attach_status as NonNullable<SessionRef["attachStatus"]>;
@@ -750,10 +809,12 @@ function mapPendingAction(row: Row): StoredPendingAction {
     createdAt: Number(row.created_at)
   };
   if (row.request_id) action.requestId = row.request_id_type === "number" ? Number(row.request_id) : String(row.request_id);
+  if (row.connection_generation != null) action.connectionGeneration = Number(row.connection_generation);
   if (row.thread_id) action.threadId = String(row.thread_id);
   if (row.turn_id) action.turnId = String(row.turn_id);
   if (row.item_id) action.itemId = String(row.item_id);
   if (row.resolved_at) action.resolvedAt = Number(row.resolved_at);
+  if (row.failure_reason) action.failureReason = String(row.failure_reason);
   return action;
 }
 
