@@ -2,6 +2,7 @@ import { SessionManager } from "../runtime/session-manager.js";
 import { Store, type StoredSession } from "../store/store.js";
 import type { CodexThreadSummary } from "../types/control.js";
 import { createId, createNonce } from "../utils/ids.js";
+import { TelegramCallbackController } from "./callback-controller.js";
 
 const PICKER_TTL_MS = 10 * 60_000;
 const COMPOSE_TTL_MS = 5 * 60_000;
@@ -18,10 +19,15 @@ export interface RoutedText {
 }
 
 export class TelegramRouting {
+  private readonly callbacks: TelegramCallbackController;
+
   constructor(
     private readonly store: Store,
-    private readonly sessions: SessionManager
-  ) {}
+    private readonly sessions: SessionManager,
+    callbacks = new TelegramCallbackController(store)
+  ) {
+    this.callbacks = callbacks;
+  }
 
   pickerToken(chatId: number, userId: number, thread: CodexThreadSummary, local?: StoredSession): string {
     const token = createNonce(12);
@@ -43,37 +49,35 @@ export class TelegramRouting {
   }
 
   async selectPicker(token: string, chatId: number, userId: number): Promise<StoredSession> {
-    const callback = this.store.consumeCallbackToken(token, chatId, userId);
-    if (!callback || callback.operation !== "select-send-thread") {
-      throw new Error("This thread picker expired, was already used, or belongs to another chat.");
-    }
-    const payload = callback.payload as Partial<SendPickerPayload>;
-    if (typeof payload.threadId !== "string" || typeof payload.expectedVersion !== "number") {
-      throw new Error("This thread picker is invalid. Run /send again.");
-    }
-
-    let session = payload.sessionId ? this.store.getSession(payload.sessionId) : this.store.getSessionByCodexThreadId(payload.threadId);
-    if (session) {
-      if (this.resourceVersion(session.id) !== payload.expectedVersion) {
-        throw new Error("This thread changed after the picker opened. Run /send again.");
+    return this.callbacks.execute(token, { chatId, userId }, "select-send-thread", async (callback) => {
+      const payload = callback.payload as Partial<SendPickerPayload>;
+      if (typeof payload.threadId !== "string" || typeof payload.expectedVersion !== "number") {
+        throw new Error("This thread picker is invalid. Run /send again.");
       }
-      session = await this.ensureAttached(session);
-    } else {
-      const current = (await this.sessions.listRemoteThreads(25)).find((thread) => thread.id === payload.threadId);
-      if (!current || (current.updatedAt ?? 0) !== payload.expectedVersion) {
-        throw new Error("This thread is no longer available or changed after the picker opened.");
-      }
-      session = this.toStored(await this.sessions.resumeThread(payload.threadId));
-    }
 
-    this.store.putRoutingCompose({
-      chatId,
-      userId,
-      sessionId: session.id,
-      expectedVersion: this.resourceVersion(session.id),
-      expiresAt: Date.now() + COMPOSE_TTL_MS
+      let session = payload.sessionId ? this.store.getSession(payload.sessionId) : this.store.getSessionByCodexThreadId(payload.threadId);
+      if (session) {
+        if (this.resourceVersion(session.id) !== payload.expectedVersion) {
+          throw new Error("This thread changed after the picker opened. Run /send again.");
+        }
+        session = await this.ensureAttached(session);
+      } else {
+        const current = (await this.sessions.listRemoteThreads(25)).find((thread) => thread.id === payload.threadId);
+        if (!current || (current.updatedAt ?? 0) !== payload.expectedVersion) {
+          throw new Error("This thread is no longer available or changed after the picker opened.");
+        }
+        session = this.toStored(await this.sessions.resumeThread(payload.threadId));
+      }
+
+      this.store.putRoutingCompose({
+        chatId,
+        userId,
+        sessionId: session.id,
+        expectedVersion: this.resourceVersion(session.id),
+        expiresAt: Date.now() + COMPOSE_TTL_MS
+      });
+      return session;
     });
-    return session;
   }
 
   async sendDirect(chatId: number, userId: number, target: string, text: string): Promise<RoutedText> {

@@ -1,6 +1,6 @@
 import type { PendingAction, UserDecision } from "../types/events.js";
 import { requestUserInputQuestions, type UserInputQuestion } from "../adapters/app-server-protocol.js";
-import { Store, type InteractionDraft, type StoredPendingAction } from "../store/store.js";
+import { Store, type CallbackToken, type InteractionDraft, type StoredPendingAction } from "../store/store.js";
 import { createNonce } from "../utils/ids.js";
 
 export interface InteractionButton {
@@ -86,8 +86,21 @@ export class PendingInteractionManager {
   }
 
   handleCallback(token: string, chatId: number, userId: number): InteractionResult {
-    const callback = this.store.consumeCallbackToken(token, chatId);
+    const claimId = createNonce(12);
+    const callback = this.store.claimCallbackToken(token, chatId, userId, claimId);
     if (!callback) return { kind: "notice", text: "This control expired or was already used." };
+    try {
+      const result = this.handleClaimedCallback(callback, chatId, userId);
+      if (result.kind === "submit") this.store.releaseCallbackToken(token, claimId);
+      else this.store.commitCallbackToken(token, claimId);
+      return result;
+    } catch (error) {
+      this.store.releaseCallbackToken(token, claimId);
+      throw error;
+    }
+  }
+
+  private handleClaimedCallback(callback: CallbackToken, chatId: number, userId: number): InteractionResult {
     const action = this.store.getPendingAction(callback.actionId);
     if (!action || !isRetryableStatus(action.status) || action.expiresAt <= Date.now()) {
       return { kind: "notice", text: "This request is no longer pending." };
@@ -99,14 +112,12 @@ export class PendingInteractionManager {
       if (action.kind === "permissionsApproval") {
         const decision = value === "decline" ? "decline" : "accept";
         const permissionScope = value === "session" ? "session" : "turn";
-        this.store.releaseCallbackToken(token, chatId);
         return { kind: "submit", decision: { actionId: action.id, decision, permissionScope }, text: "Decision submitted; waiting for Codex confirmation." };
       }
       const decision = typeof value === "string" ? value : "decline";
       const userDecision: UserDecision = { actionId: action.id, decision: normalizeDecision(decision) };
       if (value && typeof value === "object") userDecision.protocolDecision = value;
       if (action.kind === "mcpElicitation" && decision === "accept") userDecision.content = null;
-      this.store.releaseCallbackToken(token, chatId);
       return { kind: "submit", decision: userDecision, text: "Decision submitted; waiting for Codex confirmation." };
     }
 
@@ -151,12 +162,10 @@ export class PendingInteractionManager {
       this.store.putInteractionDraft(draft);
       if (draft.questionIndex < interactionQuestions(action).length) return this.renderDraft(action, draft);
       const decision: UserDecision = { actionId: action.id, decision: "accept", content: mcpContent(action, draft.answers) };
-      this.store.releaseCallbackToken(token, chatId);
       return { kind: "submit", decision, text: "Answers submitted; waiting for Codex confirmation." };
     }
     if (callback.operation === "answer" && typeof payload.value === "string") {
       const result = this.recordAnswer(action, draft, payload.value);
-      if (result.kind === "submit") this.store.releaseCallbackToken(token, chatId);
       return result;
     }
     return { kind: "notice", text: "Unsupported interaction control." };
