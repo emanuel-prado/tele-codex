@@ -15,8 +15,17 @@ export interface CallbackToken {
   token: string;
   actionId: string;
   chatId: number;
+  userId?: number;
   operation: string;
   payload: unknown;
+  expiresAt: number;
+}
+
+export interface RoutingCompose {
+  chatId: number;
+  userId: number;
+  sessionId: string;
+  expectedVersion: number;
   expiresAt: number;
 }
 
@@ -266,6 +275,9 @@ export class Store {
       }
       this.db.prepare("delete from pending_actions where session_id = ?").run(sessionId);
       for (const table of ["event_log", "transcript_chunks", "session_grants", "token_usage", "session_runtime"]) {
+        this.db.prepare(`delete from ${table} where session_id = ?`).run(sessionId);
+      }
+      for (const table of ["routing_composes", "sticky_routes", "session_chats", "telegram_thread_messages"]) {
         this.db.prepare(`delete from ${table} where session_id = ?`).run(sessionId);
       }
       this.db.prepare("delete from active_turns where thread_id = ?").run(sessionId);
@@ -526,16 +538,16 @@ export class Store {
 
   putCallbackToken(token: CallbackToken): void {
     this.db.prepare(
-      `insert into callback_tokens (token, action_id, chat_id, operation, payload_json, expires_at, created_at)
-       values (?, ?, ?, ?, ?, ?, ?)`
-    ).run(token.token, token.actionId, token.chatId, token.operation, JSON.stringify(token.payload), token.expiresAt, Date.now());
+      `insert into callback_tokens (token, action_id, chat_id, user_id, operation, payload_json, expires_at, created_at)
+       values (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(token.token, token.actionId, token.chatId, token.userId ?? null, token.operation, JSON.stringify(token.payload), token.expiresAt, Date.now());
   }
 
-  consumeCallbackToken(token: string, chatId: number): CallbackToken | undefined {
+  consumeCallbackToken(token: string, chatId: number, userId?: number): CallbackToken | undefined {
     const transaction = this.db.transaction(() => {
       const row = this.db
-        .prepare("select * from callback_tokens where token = ? and chat_id = ? and consumed_at is null and expires_at > ?")
-        .get(token, chatId, Date.now()) as Row | undefined;
+        .prepare("select * from callback_tokens where token = ? and chat_id = ? and (user_id is null or user_id = ?) and consumed_at is null and expires_at > ?")
+        .get(token, chatId, userId ?? null, Date.now()) as Row | undefined;
       if (!row) return undefined;
       this.db.prepare("update callback_tokens set consumed_at = ? where token = ?").run(Date.now(), token);
       return mapCallbackToken(row);
@@ -547,6 +559,78 @@ export class Store {
     this.db
       .prepare("update callback_tokens set consumed_at = null where token = ? and chat_id = ? and consumed_at is not null and expires_at > ?")
       .run(token, chatId, Date.now());
+  }
+
+  putRoutingCompose(compose: RoutingCompose): void {
+    this.db.prepare(
+      `insert into routing_composes (chat_id, user_id, session_id, expected_version, expires_at, created_at)
+       values (?, ?, ?, ?, ?, ?)
+       on conflict(chat_id, user_id) do update set
+         session_id=excluded.session_id,
+         expected_version=excluded.expected_version,
+         expires_at=excluded.expires_at,
+         created_at=excluded.created_at`
+    ).run(compose.chatId, compose.userId, compose.sessionId, compose.expectedVersion, compose.expiresAt, Date.now());
+  }
+
+  consumeRoutingCompose(chatId: number, userId: number): RoutingCompose | undefined {
+    const transaction = this.db.transaction(() => {
+      const row = this.db.prepare(
+        "select * from routing_composes where chat_id = ? and user_id = ? and expires_at > ?"
+      ).get(chatId, userId, Date.now()) as Row | undefined;
+      this.db.prepare("delete from routing_composes where chat_id = ? and user_id = ?").run(chatId, userId);
+      return row ? mapRoutingCompose(row) : undefined;
+    });
+    return transaction();
+  }
+
+  setStickyRoute(chatId: number, userId: number, sessionId: string): void {
+    this.db.prepare(
+      `insert into sticky_routes (chat_id, user_id, session_id, updated_at) values (?, ?, ?, ?)
+       on conflict(chat_id, user_id) do update set session_id=excluded.session_id, updated_at=excluded.updated_at`
+    ).run(chatId, userId, sessionId, Date.now());
+  }
+
+  getStickyRoute(chatId: number, userId: number): string | undefined {
+    const row = this.db.prepare("select session_id from sticky_routes where chat_id = ? and user_id = ?")
+      .get(chatId, userId) as { session_id: string } | undefined;
+    return row?.session_id;
+  }
+
+  clearStickyRoute(chatId: number, userId: number): void {
+    this.db.prepare("delete from sticky_routes where chat_id = ? and user_id = ?").run(chatId, userId);
+  }
+
+  rememberSessionChat(sessionId: string, chatId: number): void {
+    this.db.prepare(
+      `insert into session_chats (session_id, chat_id, updated_at) values (?, ?, ?)
+       on conflict(session_id, chat_id) do update set updated_at=excluded.updated_at`
+    ).run(sessionId, chatId, Date.now());
+  }
+
+  listSessionChats(sessionId: string): number[] {
+    return (this.db.prepare("select chat_id from session_chats where session_id = ? order by updated_at desc")
+      .all(sessionId) as Array<{ chat_id: number }>).map((row) => row.chat_id);
+  }
+
+  setMessageThread(chatId: number, messageId: number, sessionId: string): void {
+    this.db.prepare(
+      `insert into telegram_thread_messages (chat_id, message_id, session_id, created_at) values (?, ?, ?, ?)
+       on conflict(chat_id, message_id) do update set session_id=excluded.session_id, created_at=excluded.created_at`
+    ).run(chatId, messageId, sessionId, Date.now());
+  }
+
+  getMessageThread(chatId: number, messageId: number): string | undefined {
+    const row = this.db.prepare("select session_id from telegram_thread_messages where chat_id = ? and message_id = ?")
+      .get(chatId, messageId) as { session_id: string } | undefined;
+    return row?.session_id;
+  }
+
+  getSessionResourceVersion(sessionId: string): number | undefined {
+    const thread = this.db.prepare("select updated_at from codex_threads where id = ?").get(sessionId) as { updated_at: number } | undefined;
+    if (thread) return thread.updated_at;
+    const legacy = this.db.prepare("select updated_at from sessions where id = ?").get(sessionId) as { updated_at: number } | undefined;
+    return legacy?.updated_at;
   }
 
   putInteractionDraft(draft: InteractionDraft): void {
@@ -837,11 +921,45 @@ export class Store {
         token text primary key,
         action_id text not null,
         chat_id integer not null,
+        user_id integer,
         operation text not null,
         payload_json text not null,
         expires_at integer not null,
         created_at integer not null,
         consumed_at integer
+      );
+
+      create table if not exists routing_composes (
+        chat_id integer not null,
+        user_id integer not null,
+        session_id text not null,
+        expected_version integer not null,
+        expires_at integer not null,
+        created_at integer not null,
+        primary key (chat_id, user_id)
+      );
+
+      create table if not exists sticky_routes (
+        chat_id integer not null,
+        user_id integer not null,
+        session_id text not null,
+        updated_at integer not null,
+        primary key (chat_id, user_id)
+      );
+
+      create table if not exists session_chats (
+        session_id text not null,
+        chat_id integer not null,
+        updated_at integer not null,
+        primary key (session_id, chat_id)
+      );
+
+      create table if not exists telegram_thread_messages (
+        chat_id integer not null,
+        message_id integer not null,
+        session_id text not null,
+        created_at integer not null,
+        primary key (chat_id, message_id)
       );
 
       create table if not exists interaction_drafts (
@@ -898,6 +1016,7 @@ export class Store {
     this.addColumnIfMissing("pending_actions", "request_id_type", "text");
     this.addColumnIfMissing("pending_actions", "connection_generation", "integer");
     this.addColumnIfMissing("pending_actions", "failure_reason", "text");
+    this.addColumnIfMissing("callback_tokens", "user_id", "integer");
     this.addColumnIfMissing("sessions", "connection_generation", "integer");
     this.migrateLegacyAppServerSessions();
     this.reconcilePersistedAppServerRuntime();
@@ -1142,12 +1261,24 @@ function mapPendingAction(row: Row): StoredPendingAction {
 }
 
 function mapCallbackToken(row: Row): CallbackToken {
-  return {
+  const token: CallbackToken = {
     token: String(row.token),
     actionId: String(row.action_id),
     chatId: Number(row.chat_id),
     operation: String(row.operation),
     payload: JSON.parse(String(row.payload_json)),
+    expiresAt: Number(row.expires_at)
+  };
+  if (row.user_id != null) token.userId = Number(row.user_id);
+  return token;
+}
+
+function mapRoutingCompose(row: Row): RoutingCompose {
+  return {
+    chatId: Number(row.chat_id),
+    userId: Number(row.user_id),
+    sessionId: String(row.session_id),
+    expectedVersion: Number(row.expected_version),
     expiresAt: Number(row.expires_at)
   };
 }

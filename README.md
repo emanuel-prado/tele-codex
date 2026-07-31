@@ -94,8 +94,11 @@ Core:
 - `/sessions` lists current and recoverable Codex threads with controls; `/sessions all` includes archived and legacy diagnostic records.
 - `/new` opens a workspace project picker.
 - `/new <project-or-path>` starts an app-server session in a workspace folder.
-- `/send <text>` forwards slash-prefixed text to Codex.
-- Plain text forwards to the active session.
+- `/send` opens a recent/recoverable thread picker; the next message is sent once to the selected thread.
+- `/send <thread-alias-or-id> <message>` sends directly to one thread.
+- Replying to a tele-codex agent message routes the reply to the thread that produced it.
+- `/use <thread-alias-or-id>` enables explicit sticky routing for that chat and user; `/use off` disables it.
+- Other plain text is not forwarded and explains how to choose a destination.
 
 App-server controls:
 
@@ -142,8 +145,9 @@ This is designed for a single trusted user controlling a local machine. Do not e
 
 - Unauthorized Telegram users are rejected before command handling.
 - If `TELE_CODEX_ALLOWED_CHAT_IDS` is set, both user ID and chat ID must match.
-- Approval callbacks contain short opaque tokens; action details and intended chat IDs remain in SQLite.
+- Approval and thread-picker callbacks contain short opaque tokens; action details, intended chat/user, target, expiry, and expected resource version remain in SQLite.
 - Expired, cross-chat, duplicate, and already-resolved interactions are rejected transactionally.
+- Agent output is delivered only to chats associated with its thread, and bot message-to-thread associations make reply routing explicit.
 - Session-level approval grants can be disabled with:
 
 ```bash
@@ -164,8 +168,8 @@ npm run test:appserver
 
 The project is intentionally small:
 
-- `src/telegram/` handles Telegram command and callback UX.
-- `src/runtime/` owns session routing and workspace resolution.
+- `src/telegram/` handles Telegram command/callback UX and explicit per-chat thread routing.
+- `src/runtime/` owns session lifecycle and workspace resolution.
 - `src/adapters/` contains the app-server and PTY/tmux adapters.
 - `src/store/` persists local bridge state.
 - `src/security/` enforces Telegram and approval policy.
