@@ -32,6 +32,7 @@ export class AppServerAdapter implements CodexAdapter {
   private readonly sessionsByThread = new Map<string, { sessionId: string; generation: number }>();
   private readonly activeTurns = new Map<string, string>();
   private readonly sessionModels = new Map<string, string>();
+  private readonly recoveringSessionIds = new Set<string>();
   private connected = false;
   private connectPromise: Promise<void> | undefined;
   private reconnectTimer: NodeJS.Timeout | undefined;
@@ -86,15 +87,15 @@ export class AppServerAdapter implements CodexAdapter {
       connectionGeneration: generation
     };
     session.cwd = opts.cwd ?? process.cwd();
-    this.sessionsByThread.set(threadId, { sessionId: session.id, generation });
     if (model) this.sessionModels.set(session.id, model);
-    this.store.upsertSession(session, "idle");
-    this.queue.push({ type: "statusChanged", sessionId: session.id, status: "idle", detail: "App-server thread started." });
+    const stored = this.store.upsertSession(session, "idle");
+    this.sessionsByThread.set(threadId, { sessionId: stored.id, generation });
+    this.queue.push({ type: "statusChanged", sessionId: stored.id, status: "idle", detail: "App-server thread started." });
 
     if (opts.prompt) {
-      await this.sendUserText(session.id, opts.prompt);
+      await this.sendUserText(stored.id, opts.prompt);
     }
-    return session;
+    return stored;
   }
 
   async attach(opts: AttachSession): Promise<SessionRef> {
@@ -107,18 +108,19 @@ export class AppServerAdapter implements CodexAdapter {
     });
     const model = stringField(result, "model") ?? opts.model;
     const generation = this.requireConnectionGeneration();
+    const existing = this.store.getSessionByCodexThreadId(opts.codexThreadId);
     const session: SessionRef = {
-      id: createId("session"),
+      id: existing?.id ?? createId("session"),
       adapter: "appserver",
       label: opts.label ?? labelForThread(asRecord((asRecord(result).thread)), opts.codexThreadId),
       codexThreadId: opts.codexThreadId,
       connectionGeneration: generation
     };
     if (opts.cwd) session.cwd = opts.cwd;
-    this.sessionsByThread.set(opts.codexThreadId, { sessionId: session.id, generation });
     if (model) this.sessionModels.set(session.id, model);
-    this.store.upsertSession(session, "attached");
-    return session;
+    const stored = this.store.upsertSession(session, "attached");
+    this.sessionsByThread.set(opts.codexThreadId, { sessionId: stored.id, generation });
+    return stored;
   }
 
   async resume(session: StoredSession): Promise<SessionRef> {
@@ -126,12 +128,11 @@ export class AppServerAdapter implements CodexAdapter {
     await this.ensureConnected();
     const result = await this.rpc.request("thread/resume", { threadId: session.codexThreadId, excludeTurns: true });
     const generation = this.requireConnectionGeneration();
-    this.sessionsByThread.set(session.codexThreadId, { sessionId: session.id, generation });
-    this.store.upsertSession({ ...session, connectionGeneration: generation }, "idle");
     const model = stringField(result, "model");
     if (model) this.sessionModels.set(session.id, model);
-    this.store.setSessionStatus(session.id, "idle");
-    return session;
+    const stored = this.store.upsertSession({ ...session, connectionGeneration: generation }, "idle");
+    this.sessionsByThread.set(session.codexThreadId, { sessionId: stored.id, generation });
+    return stored;
   }
 
   async resumeThread(threadId: string, options: SessionControlOptions = {}): Promise<SessionRef> {
@@ -144,8 +145,9 @@ export class AppServerAdapter implements CodexAdapter {
     const thread = asRecord(asRecord(result).thread);
     const model = stringField(result, "model") ?? options.model;
     const generation = this.requireConnectionGeneration();
+    const existing = this.store.getSessionByCodexThreadId(threadId);
     const session: SessionRef = {
-      id: createId("session"),
+      id: existing?.id ?? createId("session"),
       adapter: "appserver",
       label: labelForThread(thread, threadId),
       codexThreadId: threadId,
@@ -153,11 +155,11 @@ export class AppServerAdapter implements CodexAdapter {
     };
     const cwd = stringField(result, "cwd") ?? stringField(thread, "cwd");
     if (cwd) session.cwd = cwd;
-    this.sessionsByThread.set(threadId, { sessionId: session.id, generation });
     if (model) this.sessionModels.set(session.id, model);
-    this.store.upsertSession(session, "idle");
-    if (options.mode) await this.setCollaborationMode(session.id, options.mode);
-    return session;
+    const stored = this.store.upsertSession(session, "idle");
+    this.sessionsByThread.set(threadId, { sessionId: stored.id, generation });
+    if (options.mode) await this.setCollaborationMode(stored.id, options.mode);
+    return stored;
   }
 
   async sendUserText(sessionId: string, text: string): Promise<void> {
@@ -334,7 +336,16 @@ export class AppServerAdapter implements CodexAdapter {
   async archiveThread(sessionId: string): Promise<void> {
     const session = this.requireSession(sessionId);
     await this.rpc.request("thread/archive", { threadId: session.codexThreadId });
-    this.store.setSessionStatus(sessionId, "stopped");
+    this.sessionsByThread.delete(session.codexThreadId!);
+    this.activeTurns.delete(sessionId);
+    this.store.markThreadArchived(sessionId);
+  }
+
+  async detach(sessionId: string): Promise<void> {
+    const session = this.requireSession(sessionId);
+    this.sessionsByThread.delete(session.codexThreadId!);
+    this.activeTurns.delete(sessionId);
+    this.store.markThreadDetached(sessionId);
   }
 
   async interrupt(sessionId: string): Promise<void> {
@@ -346,7 +357,6 @@ export class AppServerAdapter implements CodexAdapter {
 
   async kill(sessionId: string): Promise<void> {
     await this.interrupt(sessionId);
-    this.store.setSessionStatus(sessionId, "stopped");
   }
 
   async getRecentLog(sessionId: string, limit: number): Promise<LogEntry[]> {
@@ -419,7 +429,7 @@ export class AppServerAdapter implements CodexAdapter {
     }
     const sessions = this.store.listSessions().filter((item) => detachedSessionIds.has(item.id));
     for (const session of sessions) {
-      this.store.setSessionStatus(session.id, "error");
+      this.recoveringSessionIds.add(session.id);
       this.queue.push({
         type: "error",
         sessionId: session.id,
@@ -437,13 +447,16 @@ export class AppServerAdapter implements CodexAdapter {
       this.reconnectTimer = undefined;
       void this.ensureConnected()
         .then(() => {
-          for (const session of this.store.listSessions().filter((item) => item.adapter === "appserver" && item.status !== "stopped")) {
+          for (const sessionId of this.recoveringSessionIds) {
+            const session = this.store.getSession(sessionId);
+            if (!session) continue;
             this.queue.push({
               type: "blocked",
               sessionId: session.id,
               reason: "App-server transport recovered. Use Resume in Telegram to reattach this thread."
             });
           }
+          this.recoveringSessionIds.clear();
         })
         .catch((error) => {
           this.logger.warn({ error, delay }, "app-server reconnect failed");
@@ -520,7 +533,7 @@ export class AppServerAdapter implements CodexAdapter {
       if (limits) {
         const previous = this.store.getRateLimits();
         this.store.setRateLimits(limits);
-        const active = this.store.listSessions().find((item) => item.adapter === "appserver" && item.status !== "stopped");
+        const active = this.firstAttachedSession();
         if (active) {
           const event: Extract<CodexEvent, { type: "rateLimitsChanged" }> = { type: "rateLimitsChanged", sessionId: active.id, limits };
           if (previous && previous.usedPercent >= this.config.rateLimitWarnPercent && limits.usedPercent < this.config.rateLimitWarnPercent) {
@@ -532,7 +545,7 @@ export class AppServerAdapter implements CodexAdapter {
       return;
     }
     if (message.method === "deprecationNotice" || message.method === "configWarning") {
-      const active = this.store.listSessions().find((item) => item.adapter === "appserver" && item.status !== "stopped");
+      const active = this.firstAttachedSession();
       if (active) {
         const summary = String(params.summary ?? params.message ?? "Codex configuration warning");
         const details = typeof params.details === "string" ? `\n${params.details}` : "";
@@ -690,6 +703,15 @@ export class AppServerAdapter implements CodexAdapter {
       throw new Error("App-server is not connected.");
     }
     return this.connectionGeneration;
+  }
+
+  private firstAttachedSession(): StoredSession | undefined {
+    for (const attachment of this.sessionsByThread.values()) {
+      if (attachment.generation !== this.connectionGeneration) continue;
+      const session = this.store.getSession(attachment.sessionId);
+      if (session) return session;
+    }
+    return undefined;
   }
 }
 

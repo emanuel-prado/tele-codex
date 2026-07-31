@@ -52,6 +52,25 @@ export interface StoredSession extends SessionRef {
 
 type Row = Record<string, unknown>;
 
+const CODEX_THREAD_SELECT = `
+  select
+    t.id,
+    t.codex_thread_id,
+    t.label,
+    t.cwd,
+    t.lifecycle_status,
+    t.paused,
+    t.created_at,
+    t.updated_at,
+    a.status as attachment_status,
+    a.connection_generation,
+    a.updated_at as attachment_updated_at,
+    v.codex_turn_id,
+    v.updated_at as turn_updated_at
+  from codex_threads t
+  left join appserver_attachments a on a.thread_id = t.id
+  left join active_turns v on v.thread_id = t.id`;
+
 export class Store {
   private readonly db: Database.Database;
 
@@ -65,7 +84,10 @@ export class Store {
     this.db.close();
   }
 
-  upsertSession(session: SessionRef, status: SessionStatus): void {
+  upsertSession(session: SessionRef, status: SessionStatus): StoredSession {
+    if (session.adapter === "appserver" && session.codexThreadId) {
+      return this.upsertCodexThread(session, status);
+    }
     const now = Date.now();
     this.db
       .prepare(
@@ -91,6 +113,7 @@ export class Store {
         status,
         now
       });
+    return this.getSession(session.id)!;
   }
 
   updateAttachState(
@@ -125,47 +148,136 @@ export class Store {
   }
 
   setSessionStatus(sessionId: string, status: SessionStatus): void {
+    if (this.getCodexThreadRow(sessionId)) {
+      if (status === "archived") {
+        this.markThreadArchived(sessionId);
+      } else if (status === "detached" || status === "stopped") {
+        this.markThreadDetached(sessionId);
+      } else {
+        this.upsertAttachment(sessionId, status);
+      }
+      return;
+    }
     this.db
       .prepare("update sessions set status = ?, updated_at = ? where id = ?")
       .run(status, Date.now(), sessionId);
   }
 
   clearSessionAttachments(connectionGeneration?: number): string[] {
-    const rows = connectionGeneration === undefined
+    const normalized = connectionGeneration === undefined
+      ? this.db.prepare("select thread_id as id from appserver_attachments where connection_generation is not null").all() as Array<{ id: string }>
+      : this.db.prepare("select thread_id as id from appserver_attachments where connection_generation = ?").all(connectionGeneration) as Array<{ id: string }>;
+    const legacy = connectionGeneration === undefined
       ? this.db.prepare("select id from sessions where adapter = 'appserver' and connection_generation is not null").all() as Array<{ id: string }>
       : this.db.prepare("select id from sessions where adapter = 'appserver' and connection_generation = ?").all(connectionGeneration) as Array<{ id: string }>;
-    if (connectionGeneration === undefined) {
-      this.db
-        .prepare("update sessions set connection_generation = null, active_turn_id = null, status = 'error', updated_at = ? where adapter = 'appserver' and connection_generation is not null")
-        .run(Date.now());
-    } else {
-      this.db
-        .prepare("update sessions set connection_generation = null, active_turn_id = null, status = 'error', updated_at = ? where adapter = 'appserver' and connection_generation = ?")
-        .run(Date.now(), connectionGeneration);
-    }
-    return rows.map((row) => row.id);
+    const transaction = this.db.transaction(() => {
+      for (const row of normalized) this.markThreadDetached(row.id);
+      if (connectionGeneration === undefined) {
+        this.db.prepare("update sessions set connection_generation = null, active_turn_id = null, status = 'error', updated_at = ? where adapter = 'appserver' and connection_generation is not null").run(Date.now());
+      } else {
+        this.db.prepare("update sessions set connection_generation = null, active_turn_id = null, status = 'error', updated_at = ? where adapter = 'appserver' and connection_generation = ?").run(Date.now(), connectionGeneration);
+      }
+    });
+    transaction();
+    return [...normalized, ...legacy].map((row) => row.id);
   }
 
   setPaused(sessionId: string, paused: boolean): void {
+    if (this.getCodexThreadRow(sessionId)) {
+      this.db.prepare("update codex_threads set paused = ?, updated_at = ? where id = ?").run(paused ? 1 : 0, Date.now(), sessionId);
+      return;
+    }
     this.db
       .prepare("update sessions set paused = ?, status = ?, updated_at = ? where id = ?")
       .run(paused ? 1 : 0, paused ? "paused" : "idle", Date.now(), sessionId);
   }
 
   setActiveTurn(sessionId: string, turnId: string | null): void {
+    if (this.getCodexThreadRow(sessionId)) {
+      if (turnId) {
+        this.db.prepare(
+          `insert into active_turns (thread_id, codex_turn_id, status, started_at, updated_at)
+           values (?, ?, 'active', ?, ?)
+           on conflict(thread_id) do update set codex_turn_id=excluded.codex_turn_id, status='active', updated_at=excluded.updated_at`
+        ).run(sessionId, turnId, Date.now(), Date.now());
+        this.upsertAttachment(sessionId, "active");
+      } else {
+        this.db.prepare("delete from active_turns where thread_id = ?").run(sessionId);
+      }
+      return;
+    }
     this.db
       .prepare("update sessions set active_turn_id = ?, updated_at = ? where id = ?")
       .run(turnId, Date.now(), sessionId);
   }
 
   getSession(sessionId: string): StoredSession | undefined {
+    const thread = this.getCodexThreadRow(sessionId);
+    if (thread) return mapCodexThread(thread);
     const row = this.db.prepare("select * from sessions where id = ?").get(sessionId) as Row | undefined;
     return row ? mapSession(row) : undefined;
   }
 
-  listSessions(): StoredSession[] {
-    const rows = this.db.prepare("select * from sessions order by updated_at desc").all() as Row[];
-    return rows.map(mapSession);
+  getSessionByCodexThreadId(codexThreadId: string): StoredSession | undefined {
+    const row = this.db.prepare(`${CODEX_THREAD_SELECT} where t.codex_thread_id = ?`).get(codexThreadId) as Row | undefined;
+    return row ? mapCodexThread(row) : undefined;
+  }
+
+  listSessions(includeAll = false): StoredSession[] {
+    const threadRows = this.db.prepare(
+      `${CODEX_THREAD_SELECT}${includeAll ? "" : " where t.lifecycle_status = 'available'"}`
+    ).all() as Row[];
+    const legacyRows = this.db.prepare(
+      includeAll
+        ? "select * from sessions order by updated_at desc"
+        : "select * from sessions where adapter != 'appserver' and status != 'stopped' order by updated_at desc"
+    ).all() as Row[];
+    return [...threadRows.map(mapCodexThread), ...legacyRows.map(mapSession)]
+      .sort((left, right) => right.updatedAt - left.updatedAt);
+  }
+
+  markThreadDetached(sessionId: string): void {
+    const now = Date.now();
+    this.db.prepare("delete from active_turns where thread_id = ?").run(sessionId);
+    this.db.prepare(
+      `insert into appserver_attachments (thread_id, status, connection_generation, attached_at, updated_at)
+       values (?, 'detached', null, ?, ?)
+       on conflict(thread_id) do update set status='detached', connection_generation=null, updated_at=excluded.updated_at`
+    ).run(sessionId, now, now);
+    this.db.prepare("update codex_threads set updated_at = ? where id = ?").run(now, sessionId);
+  }
+
+  markThreadArchived(sessionId: string): void {
+    this.markThreadDetached(sessionId);
+    this.db.prepare("update codex_threads set lifecycle_status = 'archived', updated_at = ? where id = ?").run(Date.now(), sessionId);
+  }
+
+  forgetThread(sessionId: string): boolean {
+    const normalized = Boolean(this.getCodexThreadRow(sessionId));
+    const legacy = this.db.prepare("select id from sessions where id = ?").get(sessionId) as { id: string } | undefined;
+    if (!normalized && !legacy) return false;
+    const transaction = this.db.transaction(() => {
+      const actionIds = (this.db.prepare("select id from pending_actions where session_id = ?").all(sessionId) as Array<{ id: string }>).map((row) => row.id);
+      for (const actionId of actionIds) {
+        this.db.prepare("delete from callback_tokens where action_id = ?").run(actionId);
+        this.db.prepare("delete from interaction_drafts where action_id = ?").run(actionId);
+        this.db.prepare("delete from action_messages where action_id = ?").run(actionId);
+        this.db.prepare("delete from notification_outbox where action_id = ?").run(actionId);
+      }
+      this.db.prepare("delete from pending_actions where session_id = ?").run(sessionId);
+      for (const table of ["event_log", "transcript_chunks", "session_grants", "token_usage", "session_runtime"]) {
+        this.db.prepare(`delete from ${table} where session_id = ?`).run(sessionId);
+      }
+      this.db.prepare("delete from active_turns where thread_id = ?").run(sessionId);
+      this.db.prepare("delete from appserver_attachments where thread_id = ?").run(sessionId);
+      this.db.prepare("delete from codex_threads where id = ?").run(sessionId);
+      this.db.prepare("delete from sessions where id = ?").run(sessionId);
+      if (this.getRuntimeValue<string>("last_active_session_id") === sessionId) {
+        this.db.prepare("delete from global_runtime where key = 'last_active_session_id'").run();
+      }
+    });
+    transaction();
+    return true;
   }
 
   putPendingAction(action: PendingAction): void {
@@ -390,6 +502,10 @@ export class Store {
   getRuntimeValue<T>(key: string): T | undefined {
     const row = this.db.prepare("select value_json from global_runtime where key = ?").get(key) as Row | undefined;
     return row ? (JSON.parse(String(row.value_json)) as T) : undefined;
+  }
+
+  deleteRuntimeValue(key: string): void {
+    this.db.prepare("delete from global_runtime where key = ?").run(key);
   }
 
   resolvePendingAction(actionId: string, status: "resolved" | "expired" | "cancelled" | "orphaned"): void {
@@ -623,6 +739,33 @@ export class Store {
         updated_at integer not null
       );
 
+      create table if not exists codex_threads (
+        id text primary key,
+        codex_thread_id text not null unique,
+        label text not null,
+        cwd text,
+        lifecycle_status text not null default 'available',
+        paused integer not null default 0,
+        created_at integer not null,
+        updated_at integer not null
+      );
+
+      create table if not exists appserver_attachments (
+        thread_id text primary key,
+        status text not null,
+        connection_generation integer,
+        attached_at integer not null,
+        updated_at integer not null
+      );
+
+      create table if not exists active_turns (
+        thread_id text primary key,
+        codex_turn_id text not null,
+        status text not null,
+        started_at integer not null,
+        updated_at integer not null
+      );
+
       create table if not exists pending_actions (
         id text primary key,
         kind text not null,
@@ -756,6 +899,149 @@ export class Store {
     this.addColumnIfMissing("pending_actions", "connection_generation", "integer");
     this.addColumnIfMissing("pending_actions", "failure_reason", "text");
     this.addColumnIfMissing("sessions", "connection_generation", "integer");
+    this.migrateLegacyAppServerSessions();
+    this.reconcilePersistedAppServerRuntime();
+  }
+
+  private upsertCodexThread(session: SessionRef, status: SessionStatus): StoredSession {
+    const existing = this.getSessionByCodexThreadId(session.codexThreadId!);
+    const id = existing?.id ?? session.id;
+    const now = Date.now();
+    this.db.prepare(
+      `insert into codex_threads (id, codex_thread_id, label, cwd, lifecycle_status, paused, created_at, updated_at)
+       values (?, ?, ?, ?, 'available', 0, ?, ?)
+       on conflict(codex_thread_id) do update set
+         label=excluded.label,
+         cwd=coalesce(excluded.cwd, codex_threads.cwd),
+         lifecycle_status='available',
+         updated_at=excluded.updated_at`
+    ).run(id, session.codexThreadId, session.label, session.cwd ?? null, now, now);
+    this.upsertAttachment(id, status, session.connectionGeneration);
+    return this.getSession(id)!;
+  }
+
+  private upsertAttachment(sessionId: string, status: SessionStatus, connectionGeneration?: number): void {
+    const now = Date.now();
+    const attachmentStatus = status === "starting" || status === "attached" || status === "idle" || status === "active" || status === "blocked" || status === "error"
+      ? status
+      : "attached";
+    this.db.prepare(
+      `insert into appserver_attachments (thread_id, status, connection_generation, attached_at, updated_at)
+       values (?, ?, ?, ?, ?)
+       on conflict(thread_id) do update set
+         status=excluded.status,
+         connection_generation=coalesce(excluded.connection_generation, appserver_attachments.connection_generation),
+         updated_at=excluded.updated_at`
+    ).run(sessionId, attachmentStatus, connectionGeneration ?? null, now, now);
+    this.db.prepare("update codex_threads set updated_at = ? where id = ?").run(now, sessionId);
+  }
+
+  private getCodexThreadRow(sessionId: string): Row | undefined {
+    return this.db.prepare(`${CODEX_THREAD_SELECT} where t.id = ?`).get(sessionId) as Row | undefined;
+  }
+
+  private migrateLegacyAppServerSessions(): void {
+    const legacyRows = this.db.prepare(
+      `select * from sessions
+       where adapter = 'appserver' and codex_thread_id is not null
+       order by codex_thread_id, updated_at desc, id desc`
+    ).all() as Row[];
+    if (legacyRows.length === 0) return;
+
+    const groups = new Map<string, Row[]>();
+    for (const row of legacyRows) {
+      const threadId = String(row.codex_thread_id);
+      const group = groups.get(threadId) ?? [];
+      group.push(row);
+      groups.set(threadId, group);
+    }
+
+    const transaction = this.db.transaction(() => {
+      for (const [codexThreadId, rows] of groups) {
+        const canonical = rows[0]!;
+        const normalized = this.db.prepare("select id from codex_threads where codex_thread_id = ?").get(codexThreadId) as { id: string } | undefined;
+        const canonicalId = normalized?.id ?? String(canonical.id);
+        const ids = rows.map((row) => String(row.id));
+        const stateIds = ids.includes(canonicalId) ? ids : [...ids, canonicalId];
+        const marks = ids.map(() => "?").join(", ");
+        const createdAt = Math.min(...rows.map((row) => Number(row.created_at)));
+        const updatedAt = Math.max(...rows.map((row) => Number(row.updated_at)));
+
+        this.db.prepare(
+          `insert into codex_threads (id, codex_thread_id, label, cwd, lifecycle_status, paused, created_at, updated_at)
+           values (?, ?, ?, ?, 'available', ?, ?, ?)
+           on conflict(codex_thread_id) do nothing`
+        ).run(
+          canonicalId,
+          codexThreadId,
+          String(canonical.label),
+          canonical.cwd == null ? null : String(canonical.cwd),
+          Number(canonical.paused) === 1 ? 1 : 0,
+          createdAt,
+          updatedAt
+        );
+
+        this.mergeTokenUsage(stateIds, canonicalId);
+        this.mergeSessionRuntime(stateIds, canonicalId);
+        for (const table of ["pending_actions", "event_log", "transcript_chunks", "session_grants"]) {
+          this.db.prepare(`update ${table} set session_id = ? where session_id in (${marks})`).run(canonicalId, ...ids);
+        }
+
+        const lastActive = this.getRuntimeValue<string>("last_active_session_id");
+        if (lastActive && ids.includes(lastActive)) this.setRuntimeValue("last_active_session_id", canonicalId);
+        this.db.prepare(`delete from sessions where id in (${marks})`).run(...ids);
+      }
+    });
+    transaction();
+  }
+
+  private reconcilePersistedAppServerRuntime(): void {
+    const now = Date.now();
+    this.db.prepare("delete from active_turns").run();
+    this.db.prepare(
+      "update appserver_attachments set status = 'detached', connection_generation = null, updated_at = ? where status != 'detached' or connection_generation is not null"
+    ).run(now);
+  }
+
+  private mergeTokenUsage(sessionIds: string[], canonicalId: string): void {
+    const marks = sessionIds.map(() => "?").join(", ");
+    const rows = this.db.prepare(`select * from token_usage where session_id in (${marks}) order by updated_at desc, session_id desc`).all(...sessionIds) as Row[];
+    if (rows.length === 0) return;
+    const newest = rows[0]!;
+    this.db.prepare(`delete from token_usage where session_id in (${marks})`).run(...sessionIds);
+    this.db.prepare(
+      `insert into token_usage
+        (session_id, updated_at, total_tokens, input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens,
+         last_total_tokens, last_input_tokens, last_cached_input_tokens, last_output_tokens, last_reasoning_output_tokens,
+         model_context_window)
+       values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      canonicalId,
+      newest.updated_at,
+      newest.total_tokens,
+      newest.input_tokens,
+      newest.cached_input_tokens,
+      newest.output_tokens,
+      newest.reasoning_output_tokens,
+      newest.last_total_tokens,
+      newest.last_input_tokens,
+      newest.last_cached_input_tokens,
+      newest.last_output_tokens,
+      newest.last_reasoning_output_tokens,
+      newest.model_context_window ?? null
+    );
+  }
+
+  private mergeSessionRuntime(sessionIds: string[], canonicalId: string): void {
+    const marks = sessionIds.map(() => "?").join(", ");
+    const rows = this.db.prepare(`select * from session_runtime where session_id in (${marks}) order by updated_at desc, session_id desc`).all(...sessionIds) as Row[];
+    if (rows.length === 0) return;
+    const newestValue = (column: string): unknown => rows.find((row) => row[column] != null)?.[column] ?? null;
+    const updatedAt = Math.max(...rows.map((row) => Number(row.updated_at)));
+    this.db.prepare(`delete from session_runtime where session_id in (${marks})`).run(...sessionIds);
+    this.db.prepare(
+      "insert into session_runtime (session_id, progress_json, diff_text, goal_json, updated_at) values (?, ?, ?, ?, ?)"
+    ).run(canonicalId, newestValue("progress_json"), newestValue("diff_text"), newestValue("goal_json"), updatedAt);
   }
 
   private addColumnIfMissing(table: string, column: string, type: string): void {
@@ -771,6 +1057,43 @@ export class Store {
        on conflict(session_id) do update set ${column}=excluded.${column}, updated_at=excluded.updated_at`
     ).run(sessionId, value, Date.now());
   }
+}
+
+function mapCodexThread(row: Row): StoredSession {
+  const lifecycle = String(row.lifecycle_status);
+  const attachmentStatus = row.attachment_status == null ? "detached" : String(row.attachment_status);
+  const status: SessionStatus = lifecycle === "archived"
+    ? "archived"
+    : row.codex_turn_id
+      ? "active"
+      : isSessionStatus(attachmentStatus)
+        ? attachmentStatus
+        : "detached";
+  const updatedAt = Math.max(
+    Number(row.updated_at),
+    Number(row.attachment_updated_at ?? 0),
+    Number(row.turn_updated_at ?? 0)
+  );
+  const session: StoredSession = {
+    id: String(row.id),
+    adapter: "appserver",
+    label: String(row.label),
+    codexThreadId: String(row.codex_thread_id),
+    status,
+    paused: Number(row.paused) === 1,
+    createdAt: Number(row.created_at),
+    updatedAt
+  };
+  if (row.cwd) session.cwd = String(row.cwd);
+  if (row.codex_turn_id) session.activeTurnId = String(row.codex_turn_id);
+  if (row.connection_generation != null) session.connectionGeneration = Number(row.connection_generation);
+  return session;
+}
+
+function isSessionStatus(value: string): value is SessionStatus {
+  return value === "starting" || value === "attached" || value === "idle" || value === "active" ||
+    value === "paused" || value === "blocked" || value === "error" || value === "detached" ||
+    value === "archived" || value === "stopped";
 }
 
 function mapSession(row: Row): StoredSession {

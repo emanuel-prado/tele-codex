@@ -98,6 +98,8 @@ export class TelegramGateway {
       { command: "mode", description: "Switch collaboration mode" },
       { command: "compact", description: "Start context compaction" },
       { command: "archive", description: "Archive active app-server thread" },
+      { command: "detach", description: "Detach active app-server thread" },
+      { command: "forget", description: "Forget local thread metadata" },
       { command: "send", description: "Forward slash-prefixed text to Codex" },
       { command: "attach", description: "Attach app-server thread or tmux fallback" },
       { command: "tmux", description: "Attach tmux fallback session" },
@@ -119,7 +121,7 @@ export class TelegramGateway {
       { command: "deny", description: "Deny a pending request by id" },
       { command: "pause", description: "Pause Telegram input forwarding" },
       { command: "unpause", description: "Resume Telegram input forwarding" },
-      { command: "kill", description: "Interrupt/stop active session" },
+      { command: "kill", description: "Interrupt active turn" },
       { command: "help", description: "Show help" }
     ]);
     await this.sendStartupPicker();
@@ -145,7 +147,7 @@ export class TelegramGateway {
         [
           "/status - active session",
           "/panel - session control panel",
-          "/sessions - list and control sessions",
+          "/sessions - list current and recoverable threads; /sessions all includes diagnostics",
           "/new - pick a workspace project",
           "/new <project-or-path> - start app-server session in a workspace folder",
           "/resume - list previous Codex sessions",
@@ -157,6 +159,8 @@ export class TelegramGateway {
           "/mode <plan|default> - switch active app-server session mode",
           "/compact - start Codex context compaction for the active thread",
           "/archive - archive the active app-server thread",
+          "/detach - remove the active live attachment without deleting its thread",
+          "/forget <sessionId> - remove local tele-codex metadata after confirmation",
           "/send <text> - forward slash-prefixed text to Codex",
           "/attach appserver <threadId> - attach Codex thread",
           "/attach tmux <target> - attach a specific tmux pane",
@@ -192,7 +196,8 @@ export class TelegramGateway {
     });
 
     this.bot.command("sessions", async (ctx) => {
-      const sessions = this.sessions.listSessions();
+      const includeAll = String(ctx.match ?? "").trim().toLowerCase() === "all";
+      const sessions = this.sessions.listSessions(includeAll);
       await ctx.reply(formatSessions(sessions), { reply_markup: sessionsKeyboard(sessions) });
     });
 
@@ -284,6 +289,27 @@ export class TelegramGateway {
       }
       const keyboard = new InlineKeyboard().text("Confirm archive", `archive:${active.id}:confirm`);
       await ctx.reply(`Archive active app-server thread?\n${active.id}`, { reply_markup: keyboard });
+    });
+
+    this.bot.command("detach", async (ctx) => {
+      const active = this.sessions.getActiveSession();
+      if (!active) {
+        await ctx.reply("No active attached session.");
+        return;
+      }
+      await this.sessions.detach(active.id);
+      await ctx.reply(`Detached thread:\n${active.id}\nUse /sessions to resume it.`);
+    });
+
+    this.bot.command("forget", async (ctx) => {
+      const requestedId = String(ctx.match ?? "").trim();
+      const sessionId = requestedId || this.sessions.getActiveSession()?.id;
+      if (!sessionId || !this.store.getSession(sessionId)) {
+        await ctx.reply("Usage: /forget <sessionId>. Use /sessions all to find diagnostic records.");
+        return;
+      }
+      const keyboard = new InlineKeyboard().text("Confirm forget", `forget:${sessionId}:confirm`);
+      await ctx.reply(`Forget local tele-codex metadata for this thread? Codex history is not deleted.\n${sessionId}`, { reply_markup: keyboard });
     });
 
     this.bot.command("send", async (ctx) => {
@@ -614,6 +640,15 @@ export class TelegramGateway {
       }
     });
 
+    this.bot.callbackQuery(/^forget:/, async (ctx) => {
+      const [, sessionId, confirm] = String(ctx.callbackQuery.data).split(":");
+      if (sessionId && confirm === "confirm") {
+        await this.sessions.forget(sessionId);
+        await ctx.answerCallbackQuery({ text: "Local metadata forgotten." });
+        await ctx.editMessageText(`Forgot local thread metadata:\n${sessionId}`);
+      }
+    });
+
     this.bot.callbackQuery(/^proj:/, async (ctx) => {
       const [, selectionId] = String(ctx.callbackQuery.data).split(":");
       const project = selectionId ? this.projectSelections.get(selectionId) : undefined;
@@ -681,6 +716,24 @@ export class TelegramGateway {
         if (action === "transcript") {
           await ctx.answerCallbackQuery({ text: "Exporting transcript." });
           await this.sendTranscript(ctx, sessionId);
+          return;
+        }
+        if (action === "detach") {
+          await this.sessions.detach(sessionId);
+          await ctx.answerCallbackQuery({ text: "Detached." });
+          await ctx.editMessageText(`Detached thread:\n${sessionId}\nUse /sessions to resume it.`);
+          return;
+        }
+        if (action === "archive") {
+          const keyboard = new InlineKeyboard().text("Confirm archive", `archive:${sessionId}:confirm`);
+          await ctx.answerCallbackQuery({ text: "Confirm archive." });
+          await ctx.reply(`Archive thread?\n${sessionId}`, { reply_markup: keyboard });
+          return;
+        }
+        if (action === "forget") {
+          const keyboard = new InlineKeyboard().text("Confirm forget", `forget:${sessionId}:confirm`);
+          await ctx.answerCallbackQuery({ text: "Confirm forget." });
+          await ctx.reply(`Forget local metadata? Codex history is not deleted.\n${sessionId}`, { reply_markup: keyboard });
           return;
         }
         if (action === "kill") {
@@ -1221,15 +1274,27 @@ function interactionKeyboard(view: InteractionView): InlineKeyboard {
 function sessionsKeyboard(sessions: StoredSession[]): InlineKeyboard {
   const keyboard = new InlineKeyboard();
   sessions.slice(0, 10).forEach((session, index) => {
-    const action = session.status === "stopped" ? "use" : session.adapter === "appserver" ? "resume" : "use";
+    const resumable = session.adapter === "appserver" && session.status !== "archived";
+    const usable =
+      !session.paused &&
+      (session.status === "attached" ||
+        session.status === "idle" ||
+        session.status === "active" ||
+        session.status === "blocked");
+    const action = usable ? "use" : resumable ? "resume" : undefined;
+    if (action) {
+      keyboard.text(`${index + 1}. ${action === "resume" ? "Resume thread" : "Use"}`, `sess:${action}:${session.id}`);
+    }
     keyboard
-      .text(`${index + 1}. ${action === "resume" ? "Resume thread" : "Use"}`, `sess:${action}:${session.id}`)
       .text("Transcript", `sess:transcript:${session.id}`)
       .row();
-    keyboard
-      .text(session.paused ? "Resume input" : "Pause input", `sess:${session.paused ? "unpause" : "pause"}:${session.id}`)
-      .text("Kill", `sess:kill:${session.id}`)
-      .row();
+    if (session.adapter === "appserver") {
+      if (usable) keyboard.text("Detach", `sess:detach:${session.id}`).text("Archive", `sess:archive:${session.id}`).row();
+      keyboard.text("Forget local", `sess:forget:${session.id}`).row();
+    } else if (usable) {
+      keyboard.text(session.paused ? "Resume input" : "Pause input", `sess:${session.paused ? "unpause" : "pause"}:${session.id}`)
+        .text("Interrupt", `sess:kill:${session.id}`).row();
+    }
   });
   return keyboard;
 }

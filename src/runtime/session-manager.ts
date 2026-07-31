@@ -73,18 +73,24 @@ export class SessionManager {
     this.ptyAdapter().markReady(session.id);
   }
 
-  listSessions(): StoredSession[] {
-    return this.store.listSessions();
+  listSessions(includeAll = false): StoredSession[] {
+    return this.store.listSessions(includeAll);
   }
 
   getActiveSession(): StoredSession | undefined {
     if (!this.activeSessionId) return undefined;
-    return this.store.getSession(this.activeSessionId);
+    const session = this.store.getSession(this.activeSessionId);
+    if (!session || !this.canReceiveInput(session)) {
+      this.clearActiveId(this.activeSessionId);
+      return undefined;
+    }
+    return session;
   }
 
   setActiveSession(sessionId: string): StoredSession {
     const session = this.store.getSession(sessionId);
     if (!session) throw new Error(`Unknown session: ${sessionId}`);
+    if (!this.canReceiveInput(session)) throw new Error("This session cannot receive input. Resume it before selecting it.");
     this.setActiveId(sessionId);
     return session;
   }
@@ -92,12 +98,14 @@ export class SessionManager {
   async resumeSession(sessionId: string): Promise<StoredSession> {
     const session = this.store.getSession(sessionId);
     if (!session) throw new Error(`Unknown session: ${sessionId}`);
+    if (session.status === "archived") throw new Error("Archived threads cannot be resumed from local metadata. Use /resume to restore it from Codex history if available.");
     const adapter = this.adapters[session.adapter];
     if (adapter.resume) {
       await adapter.resume(session);
     } else if (session.status === "stopped") {
       throw new Error("Stopped session cannot be resumed.");
     }
+    this.store.setPaused(session.id, false);
     this.setActiveId(session.id);
     return this.store.getSession(session.id) ?? session;
   }
@@ -105,6 +113,7 @@ export class SessionManager {
   async resumeThread(threadId: string, options: SessionControlOptions = {}): Promise<SessionRef> {
     const adapter = this.appServerAdapter();
     const session = await adapter.resumeThread(threadId, options);
+    this.store.setPaused(session.id, false);
     this.setActiveId(session.id);
     return session;
   }
@@ -205,7 +214,29 @@ export class SessionManager {
 
   async archive(sessionId?: string): Promise<void> {
     const session = this.resolveSession(sessionId);
-    await this.requireAppServerSession(session).archiveThread(session.id);
+    if (session.adapter !== "appserver" || !this.adapters.appserver.archiveThread) {
+      throw new Error("Archive is only available for app-server threads.");
+    }
+    await this.adapters.appserver.archiveThread(session.id);
+    this.store.markThreadArchived(session.id);
+    this.clearActiveId(session.id);
+  }
+
+  async detach(sessionId?: string): Promise<void> {
+    const session = this.resolveSession(sessionId);
+    if (session.adapter !== "appserver") throw new Error("Detach is only available for app-server threads.");
+    const adapter = this.adapters.appserver;
+    if (adapter.detach) await adapter.detach(session.id);
+    this.store.markThreadDetached(session.id);
+    this.clearActiveId(session.id);
+  }
+
+  async forget(sessionId?: string): Promise<void> {
+    const session = this.resolveSession(sessionId);
+    if (session.adapter !== "appserver") throw new Error("Forget is only available for app-server threads.");
+    if (session.codexThreadId && this.adapters.appserver.detach) await this.adapters.appserver.detach(session.id);
+    this.store.forgetThread(session.id);
+    this.clearActiveId(session.id);
   }
 
   async sendToActive(text: string): Promise<void> {
@@ -213,7 +244,6 @@ export class SessionManager {
     if (!session) {
       throw new Error("No active Codex session. Use /new to start one or /sessions to resume an existing session.");
     }
-    if (session.paused) throw new Error("Active session is paused.");
     await this.adapters[session.adapter].sendUserText(session.id, text);
   }
 
@@ -300,11 +330,13 @@ export class SessionManager {
   pause(sessionId?: string): void {
     const session = this.resolveSession(sessionId);
     this.store.setPaused(session.id, true);
+    this.clearActiveId(session.id);
   }
 
   resume(sessionId?: string): void {
     const session = this.resolveSession(sessionId);
     this.store.setPaused(session.id, false);
+    this.setActiveId(session.id);
   }
 
   async interrupt(sessionId?: string): Promise<void> {
@@ -314,7 +346,7 @@ export class SessionManager {
 
   async kill(sessionId?: string): Promise<void> {
     const session = this.resolveSession(sessionId);
-    await this.adapters[session.adapter].kill(session.id);
+    await this.adapters[session.adapter].interrupt(session.id);
   }
 
   async logs(sessionId?: string, limit = 30): Promise<LogEntry[]> {
@@ -346,8 +378,24 @@ export class SessionManager {
   }
 
   private setActiveId(sessionId: string): void {
+    const session = this.store.getSession(sessionId);
+    if (!session || !this.canReceiveInput(session)) {
+      throw new Error("This session cannot receive input. Resume it before selecting it.");
+    }
     this.activeSessionId = sessionId;
     this.store.setRuntimeValue("last_active_session_id", sessionId);
+  }
+
+  private clearActiveId(sessionId: string): void {
+    if (this.activeSessionId === sessionId) delete this.activeSessionId;
+    if (this.store.getRuntimeValue<string>("last_active_session_id") === sessionId) {
+      this.store.deleteRuntimeValue("last_active_session_id");
+    }
+  }
+
+  private canReceiveInput(session: StoredSession): boolean {
+    if (session.paused) return false;
+    return session.status === "attached" || session.status === "idle" || session.status === "active" || session.status === "blocked";
   }
 
   private ptyAdapter(): PtyAdapter {

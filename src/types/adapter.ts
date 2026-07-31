@@ -22,6 +22,7 @@ export interface CodexAdapter {
   start(opts: StartSession): Promise<SessionRef>;
   attach(opts: AttachSession): Promise<SessionRef>;
   resume?(session: StoredSession): Promise<SessionRef>;
+  detach?(sessionId: string): Promise<void>;
   sendUserText(sessionId: string, text: string): Promise<void>;
   respondAction(decision: UserDecision): Promise<void>;
   updateSettings?(sessionId: string, options: SessionControlOptions): Promise<void>;

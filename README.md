@@ -91,7 +91,7 @@ Core:
 
 - `/status` shows the active session.
 - `/panel` shows a Telegram control panel for common actions.
-- `/sessions` lists local bridge sessions with controls.
+- `/sessions` lists current and recoverable Codex threads with controls; `/sessions all` includes archived and legacy diagnostic records.
 - `/new` opens a workspace project picker.
 - `/new <project-or-path>` starts an app-server session in a workspace folder.
 - `/send <text>` forwards slash-prefixed text to Codex.
@@ -109,7 +109,9 @@ App-server controls:
 - `/plan [on|off]` switches between plan/default mode.
 - `/mode <plan|default>` switches collaboration mode.
 - `/compact` starts context compaction for the active thread.
-- `/archive` archives the active app-server thread after confirmation.
+- `/archive` archives the active durable Codex thread after confirmation.
+- `/detach` removes the live app-server attachment while keeping the thread recoverable.
+- `/forget <sessionId>` removes local tele-codex metadata without deleting Codex history.
 
 Session utilities:
 
@@ -125,7 +127,7 @@ Session utilities:
 - `/processes` lists and safely terminates background terminals.
 - `/transcript` exports the active session transcript.
 - `/pause` and `/unpause` toggle Telegram input forwarding.
-- `/kill` interrupts the active session after confirmation.
+- `/kill` interrupts the active turn after confirmation; it does not delete or detach the durable thread.
 
 Fallback tmux:
 
