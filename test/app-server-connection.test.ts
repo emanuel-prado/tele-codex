@@ -137,15 +137,14 @@ function config(): AppConfig {
     allowedUserIds: new Set([1]),
     allowedChatIds: new Set([1]),
     dbPath: ":memory:",
-    defaultAdapter: "appserver",
     logLevel: "silent",
     approvalTimeoutMs: 60_000,
     rpcTimeoutMs: 100,
     rateLimitWarnPercent: 80,
     allowSessionGrants: true,
     codexCommand: "codex",
-    ptySubmitKey: "enter",
-    ptyPasteSettleMs: 0,
+    tmuxSubmitKey: "enter",
+    tmuxPasteSettleMs: 0,
     workspaceRoot: "/tmp"
   };
 }

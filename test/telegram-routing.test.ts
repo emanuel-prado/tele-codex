@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { SessionManager } from "../src/runtime/session-manager.js";
 import { Store } from "../src/store/store.js";
 import { TelegramRouting } from "../src/telegram/routing.js";
-import type { CodexAdapter } from "../src/types/adapter.js";
+import type { AppServerRuntime } from "../src/types/adapter.js";
 import type { SessionRef } from "../src/types/events.js";
 
 describe("TelegramRouting", () => {
@@ -124,8 +124,7 @@ function setup(path = ":memory:") {
   const store = new Store(path);
   const sent: Array<{ sessionId: string; text: string }> = [];
   const resumed: string[] = [];
-  const appserver: CodexAdapter = {
-    kind: "appserver",
+  const appserver: AppServerRuntime = {
     async start() { throw new Error("unused"); },
     async attach() { throw new Error("unused"); },
     async resume(session) {
@@ -138,16 +137,27 @@ function setup(path = ":memory:") {
       return store.upsertSession({ id: `session_${threadId}`, adapter: "appserver", label: threadId, codexThreadId: threadId }, "idle");
     },
     async listThreads() { return []; },
+    async searchThreads() { return []; },
     async listModels() { return []; },
     async sendUserText(sessionId, text) { sent.push({ sessionId, text }); },
     async respondAction() {},
+    async updateSettings() {},
+    async compactThread() {},
+    async archiveThread() {},
+    async setCollaborationMode() {},
+    async readRateLimits() { return undefined; },
+    async getGoal() { return undefined; },
+    async setGoal() { throw new Error("unused"); },
+    async clearGoal() { return false; },
+    async listBackgroundTerminals() { return []; },
+    async terminateBackgroundTerminal() { return false; },
+    async detach() {},
     async interrupt() {},
-    async kill() {},
     async getRecentLog() { return []; },
+    close() {},
     async *events() {}
   };
-  const pty: CodexAdapter = { ...appserver, kind: "pty" };
-  const manager = new SessionManager({ appserver, pty }, store, "appserver", { error() {} } as never);
+  const manager = new SessionManager(appserver, store, { error() {} } as never);
   return {
     store,
     manager,

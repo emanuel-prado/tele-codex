@@ -1,7 +1,7 @@
 import type { Logger } from "pino";
 import { JsonRpcClient, type JsonRpcMessage } from "./json-rpc-client.js";
 import type { AppConfig } from "../config.js";
-import type { CodexAdapter } from "../types/adapter.js";
+import type { AppServerRuntime } from "../types/adapter.js";
 import type { AttachSession, CodexEvent, LogEntry, PendingAction, SessionRef, StartSession, UserDecision } from "../types/events.js";
 import type {
   BackgroundTerminalSummary,
@@ -25,8 +25,7 @@ import {
   parseTokenUsage
 } from "./app-server-protocol.js";
 
-export class AppServerAdapter implements CodexAdapter {
-  readonly kind = "appserver" as const;
+export class AppServerAdapter implements AppServerRuntime {
   private readonly rpc: JsonRpcClient;
   private readonly queue = new AsyncQueue<CodexEvent>();
   private readonly sessionsByThread = new Map<string, { sessionId: string; generation: number }>();
@@ -57,7 +56,7 @@ export class AppServerAdapter implements CodexAdapter {
     this.rpc.on("message", (message: JsonRpcMessage, generation: number) => void this.handleMessage(message, generation));
     this.rpc.on("stderr", (chunk: string, generation: number) => {
       if (generation !== this.connectionGeneration) return;
-      for (const session of this.store.listSessions().filter((item) => item.adapter === "appserver")) {
+      for (const session of this.store.listSessions()) {
         this.store.appendLog({ sessionId: session.id, type: "appserver.stderr", severity: "debug", text: chunk });
       }
     });
@@ -353,10 +352,6 @@ export class AppServerAdapter implements CodexAdapter {
     const turnId = this.activeTurns.get(sessionId);
     if (!turnId) return;
     await this.rpc.request("turn/interrupt", { threadId: session.codexThreadId, turnId });
-  }
-
-  async kill(sessionId: string): Promise<void> {
-    await this.interrupt(sessionId);
   }
 
   async getRecentLog(sessionId: string, limit: number): Promise<LogEntry[]> {

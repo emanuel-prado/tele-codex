@@ -33,8 +33,7 @@ export async function runDoctor(config: AppConfig, options: DoctorOptions = {}):
   const checks: HealthCheck[] = [
     nodeCheck(),
     configCheck("Telegram bot token", Boolean(config.botToken && !config.botToken.includes("replace-")), "configured"),
-    configCheck("Allowed users", config.allowedUserIds.size > 0, `${config.allowedUserIds.size} user(s)`),
-    configCheck("Default adapter", config.defaultAdapter === "appserver", config.defaultAdapter)
+    configCheck("Allowed users", config.allowedUserIds.size > 0, `${config.allowedUserIds.size} user(s)`)
   ];
 
   checks.push(await directoryCheck("Workspace root", config.workspaceRoot));

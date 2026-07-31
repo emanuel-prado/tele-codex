@@ -29,6 +29,7 @@ describe("Telegram formatting", () => {
       {
         id: "s",
         adapter: "appserver",
+        codexThreadId: "thread_1",
         label: "tele-codex",
         cwd: "/home/me/Workspace/tele-codex",
         status: "idle",
@@ -48,6 +49,7 @@ describe("Telegram formatting", () => {
     const session = {
       id: "s",
       adapter: "appserver" as const,
+      codexThreadId: "thread_1",
       label: "project",
       status: "active" as const,
       paused: false,
@@ -61,22 +63,6 @@ describe("Telegram formatting", () => {
     );
 
     expect(text).toBe("The handoff says.");
-  });
-
-  it("keeps PTY summary chunks separated by newlines", () => {
-    const session = {
-      id: "s",
-      adapter: "pty" as const,
-      label: "tmux",
-      status: "active" as const,
-      paused: false,
-      createdAt: 1,
-      updatedAt: 2
-    };
-
-    const text = ["first", "second"].reduce((buffer, chunk) => appendAgentMessageChunk(buffer, chunk, session), "");
-
-    expect(text).toBe("first\nsecond");
   });
 
   it("formats session status with pending count and usage", () => {

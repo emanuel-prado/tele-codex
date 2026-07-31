@@ -25,6 +25,7 @@ describe("Codex thread persistence", () => {
     initial.close();
 
     const db = new Database(path);
+    createLegacySessionsTable(db);
     insertLegacySession(db, "session_old", "thread_1", "Old", 10, "stopped");
     insertLegacySession(db, "session_new", "thread_1", "New", 20, "idle");
     db.close();
@@ -78,6 +79,18 @@ describe("Codex thread persistence", () => {
     restarted.close();
   });
 });
+
+function createLegacySessionsTable(db: Database.Database): void {
+  db.exec(`
+    create table sessions (
+      id text primary key, adapter text not null, label text not null, cwd text,
+      codex_thread_id text, connection_generation integer, tmux_target text, status text not null,
+      paused integer not null default 0, active_turn_id text, attach_status text,
+      submit_strategy text, last_probe text, last_probe_at integer,
+      created_at integer not null, updated_at integer not null
+    )
+  `);
+}
 
 function insertLegacySession(db: Database.Database, id: string, threadId: string, label: string, updatedAt: number, status: string): void {
   db.prepare(

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { SessionManager } from "../src/runtime/session-manager.js";
 import { Store } from "../src/store/store.js";
-import type { CodexAdapter } from "../src/types/adapter.js";
+import type { AppServerRuntime } from "../src/types/adapter.js";
 import type { CodexThreadSummary } from "../src/types/control.js";
 import type { SessionRef } from "../src/types/events.js";
 
@@ -10,12 +10,7 @@ describe("SessionManager resume", () => {
     const store = new Store(":memory:");
     const calls: Array<{ operation: string; value?: unknown }> = [];
     const appserver = fakeAppServer(store, [{ id: "thread_newest", updatedAt: 2 }], calls);
-    const manager = new SessionManager(
-      { appserver, pty: fakePty() },
-      store,
-      "appserver",
-      silentLogger()
-    );
+    const manager = new SessionManager(appserver, store, silentLogger());
 
     const session = await manager.resumeLatestThread();
 
@@ -30,12 +25,7 @@ describe("SessionManager resume", () => {
 
   it("reports when there is no Codex history to resume", async () => {
     const store = new Store(":memory:");
-    const manager = new SessionManager(
-      { appserver: fakeAppServer(store, [], []), pty: fakePty() },
-      store,
-      "appserver",
-      silentLogger()
-    );
+    const manager = new SessionManager(fakeAppServer(store, [], []), store, silentLogger());
 
     await expect(manager.resumeLatestThread()).rejects.toThrow("No previous Codex sessions found.");
     store.close();
@@ -46,7 +36,7 @@ describe("SessionManager approval acknowledgement", () => {
   it("keeps app-server actions submitting until server acknowledgement", async () => {
     const store = new Store(":memory:");
     const appserver = fakeAppServer(store, [], []);
-    const manager = new SessionManager({ appserver, pty: fakePty() }, store, "appserver", silentLogger());
+    const manager = new SessionManager(appserver, store, silentLogger());
     store.upsertSession({ id: "session_1", adapter: "appserver", label: "one", codexThreadId: "thread_1" }, "idle");
     store.putPendingAction(pendingAction());
 
@@ -61,12 +51,7 @@ describe("SessionManager approval acknowledgement", () => {
 
   it("orphans a submission when Codex never acknowledges it", async () => {
     const store = new Store(":memory:");
-    const manager = new SessionManager(
-      { appserver: fakeAppServer(store, [], []), pty: fakePty() },
-      store,
-      "appserver",
-      silentLogger()
-    );
+    const manager = new SessionManager(fakeAppServer(store, [], []), store, silentLogger());
     store.upsertSession({ id: "session_1", adapter: "appserver", label: "one", codexThreadId: "thread_1" }, "idle");
     store.putPendingAction({ ...pendingAction(), expiresAt: Date.now() - 1 });
     store.claimExpiredAction("action_1");
@@ -78,12 +63,7 @@ describe("SessionManager approval acknowledgement", () => {
 
   it("keeps a submission failure available for retry", async () => {
     const store = new Store(":memory:");
-    const manager = new SessionManager(
-      { appserver: fakeAppServer(store, [], []), pty: fakePty() },
-      store,
-      "appserver",
-      silentLogger()
-    );
+    const manager = new SessionManager(fakeAppServer(store, [], []), store, silentLogger());
     store.putPendingAction(pendingAction());
 
     await expect(manager.respondAction({ actionId: "action_1", decision: "accept" })).rejects.toThrow(/session/i);
@@ -101,7 +81,7 @@ describe("SessionManager thread lifecycle", () => {
     const store = new Store(":memory:");
     const calls: Array<{ operation: string; value?: unknown }> = [];
     const appserver = fakeAppServer(store, [], calls);
-    const manager = new SessionManager({ appserver, pty: fakePty() }, store, "appserver", silentLogger());
+    const manager = new SessionManager(appserver, store, silentLogger());
     const session = store.upsertSession({ id: "session_1", adapter: "appserver", label: "one", codexThreadId: "thread_1" }, "idle");
     manager.setActiveSession(session.id);
 
@@ -129,12 +109,7 @@ describe("SessionManager thread lifecycle", () => {
 
   it("rejects invalid sticky send targets", () => {
     const store = new Store(":memory:");
-    const manager = new SessionManager(
-      { appserver: fakeAppServer(store, [], []), pty: fakePty() },
-      store,
-      "appserver",
-      silentLogger()
-    );
+    const manager = new SessionManager(fakeAppServer(store, [], []), store, silentLogger());
     const session = store.upsertSession({ id: "session_1", adapter: "appserver", label: "one", codexThreadId: "thread_1" }, "idle");
     store.setPaused(session.id, true);
 
@@ -147,9 +122,9 @@ function fakeAppServer(
   store: Store,
   threads: CodexThreadSummary[],
   calls: Array<{ operation: string; value?: unknown }>
-): CodexAdapter {
+): AppServerRuntime {
   return {
-    kind: "appserver",
+    ...unusedAdapterMethods(),
     async listThreads(limit) {
       calls.push({ operation: "list", value: limit });
       return threads;
@@ -177,18 +152,13 @@ function fakeAppServer(
     async listModels() {
       return [];
     },
-    ...unusedAdapterMethods(),
     async interrupt(sessionId) {
       calls.push({ operation: "interrupt", value: sessionId });
     }
   };
 }
 
-function fakePty(): CodexAdapter {
-  return { kind: "pty", ...unusedAdapterMethods() };
-}
-
-function unusedAdapterMethods(): Omit<CodexAdapter, "kind"> {
+function unusedAdapterMethods(): AppServerRuntime {
   return {
     async start() {
       throw new Error("unused");
@@ -198,14 +168,30 @@ function unusedAdapterMethods(): Omit<CodexAdapter, "kind"> {
     },
     async sendUserText() {},
     async respondAction() {},
+    async updateSettings() {},
+    async listModels() { return []; },
+    async listThreads() { return []; },
+    async searchThreads() { return []; },
+    async resumeThread() { throw new Error("unused"); },
+    async compactThread() {},
+    async archiveThread() {},
+    async setCollaborationMode() {},
+    async readRateLimits() { return undefined; },
+    async getGoal() { return undefined; },
+    async setGoal() { throw new Error("unused"); },
+    async clearGoal() { return false; },
+    async listBackgroundTerminals() { return []; },
+    async terminateBackgroundTerminal() { return false; },
+    async resume() { throw new Error("unused"); },
+    async detach() {},
     async interrupt(sessionId) {
       // Individual fakes may observe this through their shared calls array.
       void sessionId;
     },
-    async kill() {},
     async getRecentLog() {
       return [];
     },
+    close() {},
     async *events() {}
   };
 }

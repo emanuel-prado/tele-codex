@@ -30,18 +30,18 @@ import {
   formatUsage,
   truncateMiddle
 } from "./format.js";
-import type { ProbeResult, TmuxPane } from "../adapters/pty-adapter.js";
+import { LegacyTmuxBridge, type ProbeResult } from "../legacy/legacy-tmux-bridge.js";
+import type { LegacyTmuxAttachment } from "../types/legacy-tmux.js";
 import { formatDoctorReport, runDoctor } from "../runtime/doctor.js";
 import { parseResumeCommand } from "./resume-command.js";
 import { PendingInteractionManager, type InteractionView } from "./pending-interaction.js";
-import { createId } from "../utils/ids.js";
+import { createId, createNonce } from "../utils/ids.js";
 import { TelegramRouting } from "./routing.js";
 
 export class TelegramGateway {
   private readonly bot: Bot;
   private readonly runtimeId = createId("runtime");
   private readonly messageBuffers = new Map<string, { text: string; timer: NodeJS.Timeout }>();
-  private readonly paneSelections = new Map<string, TmuxPane>();
   private readonly projectSelections = new Map<string, WorkspaceProject>();
   private readonly threadSelections = new Map<string, CodexThreadSummary>();
   private readonly modelSelections = new Map<string, CodexModelSummary>();
@@ -55,6 +55,7 @@ export class TelegramGateway {
   constructor(
     private readonly config: AppConfig,
     private readonly sessions: SessionManager,
+    private readonly legacyTmux: LegacyTmuxBridge,
     private readonly store: Store,
     private readonly policy: PolicyEngine,
     private readonly logger: Logger
@@ -105,9 +106,8 @@ export class TelegramGateway {
       { command: "forget", description: "Forget local thread metadata" },
       { command: "send", description: "Send one message to a selected thread" },
       { command: "use", description: "Opt into sticky routing for this chat" },
-      { command: "attach", description: "Attach app-server thread or tmux fallback" },
-      { command: "tmux", description: "Attach tmux fallback session" },
-      { command: "testinput", description: "Test tmux fallback input" },
+      { command: "attach", description: "Attach an app-server thread" },
+      { command: "tmux", description: "Use explicit legacy tmux fallback" },
       { command: "log", description: "Show recent session log" },
       { command: "usage", description: "Show active session token usage" },
       { command: "pending", description: "Show pending Codex interactions" },
@@ -169,9 +169,11 @@ export class TelegramGateway {
           "/send <thread-alias-or-id> <message> - send directly to one thread",
           "/use <thread-alias-or-id> - opt into sticky routing; /use off disables it",
           "/attach appserver <threadId> - attach Codex thread",
-          "/attach tmux <target> - attach a specific tmux pane",
-          "/tmux - list tmux panes to attach as a fallback",
-          "/testinput - test tmux input/submit readiness",
+          "/tmux - list panes for the legacy fallback",
+          "/tmux attach <target> - attach a legacy tmux pane",
+          "/tmux send <attachmentId> <text> - send through the legacy fallback",
+          "/tmux test <attachmentId> - test legacy tmux input",
+          "/tmux interrupt <attachmentId> - send Ctrl-C through tmux",
           "/log [n] - recent logs",
           "/usage - current token usage",
           "/pending - pending questions and approvals",
@@ -208,20 +210,9 @@ export class TelegramGateway {
     });
 
     this.bot.command("new", async (ctx) => {
-      const { adapter, rest } = parseAdapterCommand(ctx.match);
-      if (!adapter && !rest) {
+      const rest = parseAppServerCommand(ctx.match);
+      if (!rest) {
         await this.showWorkspacePicker(ctx);
-        return;
-      }
-      if (adapter === "appserver" && !rest) {
-        await this.showWorkspacePicker(ctx);
-        return;
-      }
-      if (adapter === "pty") {
-        const opts: { adapter: "pty"; prompt?: string } = { adapter };
-        if (rest) opts.prompt = rest;
-        const session = await this.sessions.newSession(opts);
-        await ctx.reply(`Started ${session.adapter} session:\n${session.id}`);
         return;
       }
       const project = resolveWorkspacePath(this.config.workspaceRoot, rest || String(ctx.match ?? "").trim());
@@ -353,36 +344,50 @@ export class TelegramGateway {
       const kind = parts[0];
       const target = parts[1];
       if (!kind) {
-        await ctx.reply("Usage: /attach appserver <threadId> or /attach tmux <target>. Use /resume to pick previous app-server threads, or /tmux for fallback tmux attachment.");
-        return;
-      }
-      if (kind === "tmux" && target) {
-        const session = await this.sessions.attach({ adapter: "pty", tmuxTarget: target });
-        await ctx.reply(`Attached tmux pane:\n${session.id}\n\nSending input test...`);
-        await this.sendProbeResult(ctx.chat?.id, await this.sessions.probeTmuxSession(session.id));
+        await ctx.reply("Usage: /attach appserver <threadId>. Use /resume to pick previous threads, or /tmux for the separate legacy fallback.");
         return;
       }
       if (kind === "appserver" && target) {
-        const session = await this.sessions.attach({ adapter: "appserver", codexThreadId: target });
+        const session = await this.sessions.attach({ codexThreadId: target });
         await ctx.reply(`Attached app-server thread:\n${session.id}`);
         return;
       }
-      await ctx.reply("Usage: /attach tmux <target> OR /attach appserver <threadId>");
+      await ctx.reply("Usage: /attach appserver <threadId>. Legacy tmux is available only through /tmux.");
     });
 
     this.bot.command("tmux", async (ctx) => {
-      const target = String(ctx.match ?? "").trim();
-      if (!target) {
+      const input = String(ctx.match ?? "").trim();
+      if (!input) {
         await this.showAttachPicker(ctx);
         return;
       }
-      const session = await this.sessions.attach({ adapter: "pty", tmuxTarget: target });
-      await ctx.reply(`Attached tmux fallback pane:\n${session.id}\n\nSending input test...`);
-      await this.sendProbeResult(ctx.chat?.id, await this.sessions.probeTmuxSession(session.id));
-    });
-
-    this.bot.command("testinput", async (ctx) => {
-      await this.showTestInput(ctx);
+      const [action, target, ...rest] = input.split(/\s+/);
+      if (action === "list") {
+        await ctx.reply(formatLegacyAttachments(this.legacyTmux.listAttachments(ctx.chat.id)));
+        return;
+      }
+      if (action === "send" && target && rest.length > 0) {
+        const preview = await this.legacyTmux.send(target, ctx.chat.id, rest.join(" "));
+        await ctx.reply(`Legacy tmux fallback sent text. Verify the pane locally.\n\n${preview.slice(-800)}`);
+        return;
+      }
+      if (action === "test" && target) {
+        await this.sendProbeResult(ctx.chat.id, ctx.from!.id, await this.legacyTmux.probe(target, ctx.chat.id));
+        return;
+      }
+      if (action === "interrupt" && target) {
+        await this.legacyTmux.interrupt(target, ctx.chat.id);
+        await ctx.reply("Sent Ctrl-C through the legacy tmux fallback.");
+        return;
+      }
+      const paneTarget = action === "attach" ? target : input;
+      if (!paneTarget) {
+        await ctx.reply("Usage: /tmux attach <target> | send <attachmentId> <text> | test <attachmentId> | interrupt <attachmentId>");
+        return;
+      }
+      const attachment = await this.legacyTmux.attach(paneTarget, ctx.chat.id);
+      await ctx.reply(`Attached legacy tmux fallback pane:\n${attachment.id}\n\nSending input test...`);
+      await this.sendProbeResult(ctx.chat.id, ctx.from!.id, await this.legacyTmux.probe(attachment.id, ctx.chat.id));
     });
 
     this.bot.command("log", async (ctx) => {
@@ -786,47 +791,54 @@ export class TelegramGateway {
       }
     });
 
-    this.bot.callbackQuery(/^pane:/, async (ctx) => {
-      const [, selectionId] = String(ctx.callbackQuery.data).split(":");
-      const pane = selectionId ? this.paneSelections.get(selectionId) : undefined;
-      if (!pane) {
-        await ctx.answerCallbackQuery({ text: "Pane selection expired. Run /attach again.", show_alert: true });
+    this.bot.callbackQuery(/^legacy:/, async (ctx) => {
+      const token = String(ctx.callbackQuery.data).slice(7);
+      const chatId = ctx.chat?.id;
+      if (!chatId) return;
+      const callback = this.store.consumeCallbackToken(token, chatId, ctx.from.id);
+      if (!callback) {
+        await ctx.answerCallbackQuery({ text: "This legacy tmux control expired, was used, or belongs to another chat.", show_alert: true });
         return;
       }
-      await ctx.answerCallbackQuery({ text: "Attaching and testing input..." });
-      const session = await this.sessions.attach({ adapter: "pty", tmuxTarget: pane.target, label: `tmux ${pane.target}` });
-      await ctx.reply(`Attached tmux pane ${pane.target}:\n${session.id}\n\nSending input test...`);
-      await this.sendProbeResult(ctx.chat?.id, await this.sessions.probeTmuxSession(session.id));
-    });
-
-    this.bot.callbackQuery(/^probe:/, async (ctx) => {
-      const [, action, sessionId] = String(ctx.callbackQuery.data).split(":");
-      await ctx.answerCallbackQuery({ text: "Updating input test..." });
-      if (action === "retry") {
-        await this.sendProbeResult(ctx.chat?.id, await this.sessions.probeTmuxSession(sessionId));
-        return;
-      }
-      if (action === "next") {
-        await this.sendProbeResult(ctx.chat?.id, await this.sessions.tryNextTmuxStrategy(sessionId));
-        return;
-      }
-      if (action === "key") {
-        const strategy = String(ctx.callbackQuery.data).split(":")[3];
-        if (!strategy) {
-          await ctx.reply("Missing input strategy.");
+      const payload = callback.payload as { target?: string; attachmentId?: string; action?: string; strategy?: string; expectedVersion?: number };
+      let answered = false;
+      try {
+        if (callback.operation === "legacy-tmux-attach" && payload.target) {
+          await ctx.answerCallbackQuery({ text: "Attaching legacy tmux fallback..." });
+          answered = true;
+          const attachment = await this.legacyTmux.attach(payload.target, chatId, `tmux ${payload.target}`);
+          await ctx.reply(`Attached legacy tmux pane ${payload.target}:\n${attachment.id}\n\nSending input test...`);
+          await this.sendProbeResult(chatId, ctx.from.id, await this.legacyTmux.probe(attachment.id, chatId));
           return;
         }
-        await this.sendProbeResult(ctx.chat?.id, await this.sessions.probeTmuxSession(sessionId, strategy));
-        return;
-      }
-      if (action === "ready") {
-        this.sessions.markTmuxReady(sessionId);
-        await ctx.reply("Marked as ready. Telegram messages will now be submitted to Codex with the selected key.");
-        return;
-      }
-      if (action === "manual") {
-        this.sessions.markTmuxManualSubmit(sessionId);
-        await ctx.reply("Marked as paste-only. Telegram can paste text into the pane, but you must press submit locally.");
+        if (callback.operation !== "legacy-tmux-probe" || !payload.attachmentId || !payload.action) {
+          throw new Error("Invalid legacy tmux control.");
+        }
+        const attachment = this.store.getLegacyTmuxAttachment(payload.attachmentId);
+        if (!attachment || attachment.chatId !== chatId || attachment.updatedAt !== payload.expectedVersion) {
+          throw new Error("This legacy tmux attachment changed or belongs to another chat. Run /tmux again.");
+        }
+        await ctx.answerCallbackQuery({ text: "Updating legacy input test..." });
+        answered = true;
+        if (payload.action === "retry") {
+          await this.sendProbeResult(chatId, ctx.from.id, await this.legacyTmux.probe(attachment.id, chatId));
+        } else if (payload.action === "next") {
+          await this.sendProbeResult(chatId, ctx.from.id, await this.legacyTmux.tryNextStrategy(attachment.id, chatId));
+        } else if (payload.action === "key" && payload.strategy) {
+          await this.sendProbeResult(chatId, ctx.from.id, await this.legacyTmux.probe(attachment.id, chatId, payload.strategy));
+        } else if (payload.action === "ready") {
+          this.legacyTmux.markReady(attachment.id, chatId);
+          await ctx.reply("Marked legacy tmux input as ready. Continue with /tmux send <attachmentId> <text>.");
+        } else if (payload.action === "manual") {
+          this.legacyTmux.markPasteOnly(attachment.id, chatId);
+          await ctx.reply("Marked as paste-only. Telegram can paste text, but you must submit locally.");
+        } else {
+          throw new Error("Invalid legacy tmux action.");
+        }
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : "Legacy tmux action failed.";
+        if (answered) await ctx.reply(detail);
+        else await ctx.answerCallbackQuery({ text: detail, show_alert: true });
       }
     });
 
@@ -978,7 +990,7 @@ export class TelegramGateway {
 
   private async showSendPicker(ctx: Context): Promise<void> {
     const remote = await this.sessions.listRemoteThreads(12);
-    const local = this.store.listSessions(true).filter((session) => session.adapter === "appserver");
+    const local = this.store.listSessions(true);
     const threads = [...remote];
     for (const session of local) {
       if (!session.codexThreadId || threads.some((thread) => thread.id === session.codexThreadId)) continue;
@@ -1041,7 +1053,7 @@ export class TelegramGateway {
   }
 
   private async showAttachPicker(ctx: Context): Promise<void> {
-    const panes = await this.sessions.listTmuxPanes();
+    const panes = await this.legacyTmux.listPanes();
     if (panes.length === 0) {
       await ctx.reply("No tmux panes found. Start Codex in tmux, then run /attach again.");
       return;
@@ -1049,9 +1061,8 @@ export class TelegramGateway {
 
     const keyboard = new InlineKeyboard();
     panes.slice(0, 12).forEach((pane, index) => {
-      const selectionId = Math.random().toString(36).slice(2, 10);
-      this.paneSelections.set(selectionId, pane);
-      keyboard.text(`${index + 1}. ${pane.target} ${pane.command}`, `pane:${selectionId}`).row();
+      const token = this.legacyCallbackToken(ctx.chat!.id, ctx.from!.id, "legacy-tmux-attach", { target: pane.target });
+      keyboard.text(`${index + 1}. ${pane.target} ${pane.command}`, `legacy:${token}`).row();
     });
 
     const text = panes
@@ -1064,27 +1075,49 @@ export class TelegramGateway {
     await ctx.reply(`Select a tmux pane to attach:\n\n${text}`, { reply_markup: keyboard });
   }
 
-  private async showTestInput(ctx: Context): Promise<void> {
-    const session = this.sessions.getActiveSession();
-    if (!session?.tmuxTarget) {
-      await ctx.reply("Active session is not a tmux attachment. Use /attach first.");
-      return;
-    }
-
-    await ctx.reply(formatTestInput(session), { reply_markup: testInputKeyboard(session.id) });
+  private async sendProbeResult(chatId: number | undefined, userId: number, result: ProbeResult): Promise<void> {
+    if (!chatId) return;
+    const attachment = this.store.getLegacyTmuxAttachment(result.sessionId);
+    if (!attachment || attachment.chatId !== chatId) throw new Error("Legacy tmux attachment is unavailable for this chat.");
+    await this.bot.api.sendMessage(chatId, formatProbeResult(result), {
+      reply_markup: this.legacyProbeKeyboard(chatId, userId, attachment)
+    });
   }
 
-  private async sendProbeResult(chatId: number | undefined, result: ProbeResult): Promise<void> {
-    if (!chatId) return;
-    await this.bot.api.sendMessage(chatId, formatProbeResult(result), {
-      reply_markup: testInputKeyboard(result.sessionId)
+  private legacyProbeKeyboard(chatId: number, userId: number, attachment: LegacyTmuxAttachment): InlineKeyboard {
+    const callback = (action: string, strategy?: string) => this.legacyCallbackToken(chatId, userId, "legacy-tmux-probe", {
+      attachmentId: attachment.id,
+      action,
+      strategy,
+      expectedVersion: attachment.updatedAt
     });
+    return new InlineKeyboard()
+      .text("Codex answered", `legacy:${callback("ready")}`).row()
+      .text("Test Enter", `legacy:${callback("key", "enter")}`)
+      .text("Test F12", `legacy:${callback("key", "f12")}`).row()
+      .text("Retry test", `legacy:${callback("retry")}`)
+      .text("Try next key", `legacy:${callback("next")}`).row()
+      .text("Paste only", `legacy:${callback("manual")}`);
+  }
+
+  private legacyCallbackToken(chatId: number, userId: number, operation: string, payload: unknown): string {
+    const token = createNonce(12);
+    this.store.putCallbackToken({
+      token,
+      actionId: createId("legacy_tmux"),
+      chatId,
+      userId,
+      operation,
+      payload,
+      expiresAt: Date.now() + 10 * 60_000
+    });
+    return token;
   }
 
   private async startProjectSession(ctx: Context, project: WorkspaceProject): Promise<void> {
     try {
       await this.ensureDirectory(project.path);
-      const session = await this.sessions.newSession({ adapter: "appserver", cwd: project.path, label: project.name });
+      const session = await this.sessions.newSession({ cwd: project.path, label: project.name });
       await ctx.reply(`Started app-server session in ${project.name}:\n${session.id}`);
     } catch (error) {
       const detail = error instanceof Error ? error.message : "Unknown startup error.";
@@ -1373,7 +1406,7 @@ function formatSendPicker(threads: CodexThreadSummary[], store: Store): string {
 function sessionsKeyboard(sessions: StoredSession[]): InlineKeyboard {
   const keyboard = new InlineKeyboard();
   sessions.slice(0, 10).forEach((session, index) => {
-    const resumable = session.adapter === "appserver" && session.status !== "archived";
+    const resumable = session.status !== "archived";
     const usable =
       !session.paused &&
       (session.status === "attached" ||
@@ -1387,13 +1420,8 @@ function sessionsKeyboard(sessions: StoredSession[]): InlineKeyboard {
     keyboard
       .text("Transcript", `sess:transcript:${session.id}`)
       .row();
-    if (session.adapter === "appserver") {
-      if (usable) keyboard.text("Detach", `sess:detach:${session.id}`).text("Archive", `sess:archive:${session.id}`).row();
-      keyboard.text("Forget local", `sess:forget:${session.id}`).row();
-    } else if (usable) {
-      keyboard.text(session.paused ? "Resume input" : "Pause input", `sess:${session.paused ? "unpause" : "pause"}:${session.id}`)
-        .text("Interrupt", `sess:kill:${session.id}`).row();
-    }
+    if (usable) keyboard.text("Detach", `sess:detach:${session.id}`).text("Archive", `sess:archive:${session.id}`).row();
+    keyboard.text("Forget local", `sess:forget:${session.id}`).row();
   });
   return keyboard;
 }
@@ -1470,36 +1498,6 @@ function formatGoal(goal: ThreadGoalSummary): string {
   ].join("\n");
 }
 
-function testInputKeyboard(sessionId: string): InlineKeyboard {
-  return new InlineKeyboard()
-    .text("Codex answered", `probe:ready:${sessionId}`)
-    .row()
-    .text("Test Enter", `probe:key:${sessionId}:enter`)
-    .text("Test F12", `probe:key:${sessionId}:f12`)
-    .row()
-    .text("Retry test", `probe:retry:${sessionId}`)
-    .text("Try next key", `probe:next:${sessionId}`)
-    .row()
-    .text("Paste only", `probe:manual:${sessionId}`);
-}
-
-function formatTestInput(session: StoredSession): string {
-  return [
-    "Input test status",
-    "",
-    `session: ${session.id}`,
-    `target: ${session.tmuxTarget ?? "none"}`,
-    `status: ${session.attachStatus ?? "unknown"}`,
-    `submit: ${session.submitStrategy ?? "default"}`,
-    session.lastProbe ? `last probe: ${session.lastProbe}` : undefined,
-    session.lastProbeAt ? `last probe at: ${new Date(session.lastProbeAt).toISOString()}` : undefined,
-    "",
-    "Use Retry test to send a probe with the current key. Press Codex answered only if Codex actually replied to the probe in the tmux pane."
-  ]
-    .filter(Boolean)
-    .join("\n");
-}
-
 function formatProbeResult(result: ProbeResult): string {
   const header = result.status === "stale" ? "Input test could not reach pane" : "Confirm input test";
   return [
@@ -1519,10 +1517,18 @@ function formatProbeResult(result: ProbeResult): string {
     .join("\n");
 }
 
-function parseAdapterCommand(match: string | undefined): { adapter?: "appserver" | "pty"; rest: string } {
+function parseAppServerCommand(match: string | undefined): string {
   const value = String(match ?? "").trim();
-  if (value.startsWith("pty ")) return { adapter: "pty", rest: value.slice(4).trim() };
-  if (value.startsWith("appserver ")) return { adapter: "appserver", rest: value.slice(10).trim() };
-  if (value === "pty" || value === "appserver") return { adapter: value, rest: "" };
-  return { rest: value };
+  if (value.startsWith("appserver ")) return value.slice(10).trim();
+  if (value === "appserver") return "";
+  return value;
+}
+
+function formatLegacyAttachments(attachments: LegacyTmuxAttachment[]): string {
+  if (attachments.length === 0) return "No legacy tmux attachments for this chat.";
+  return [
+    "Legacy tmux fallback attachments",
+    "",
+    ...attachments.map((item) => `${item.id}\n${item.target} | ${item.status} | ${item.inputStatus}\n${item.label}`)
+  ].join("\n\n");
 }

@@ -14,9 +14,7 @@ export function formatSessions(sessions: StoredSession[]): string {
   return sessions
     .map((session, index) => {
       const marker = index === 0 ? "•" : "-";
-      const health = session.tmuxTarget ? ` | ${session.attachStatus ?? "unknown"}` : "";
-      const strategy = session.submitStrategy ? `\n  submit: ${session.submitStrategy}` : "";
-      return `${marker} ${session.id}\n  ${session.adapter} | ${session.status}${health}${session.paused ? " | paused" : ""}\n  ${session.label}${strategy}`;
+      return `${marker} ${session.id}\n  appserver | ${session.status}${session.paused ? " | paused" : ""}\n  ${session.label}`;
     })
     .join("\n\n");
 }
@@ -27,13 +25,11 @@ export function formatStatus(session: StoredSession, pendingCount: number, usage
     "",
     `name: ${session.label}`,
     `id: ${session.id}`,
-    `adapter: ${session.adapter}${session.tmuxTarget ? " (tmux fallback)" : ""}`,
+    "adapter: appserver",
     `status: ${session.status}${session.paused ? " | paused" : ""}`,
     session.cwd ? `cwd: ${session.cwd}` : undefined,
     session.codexThreadId ? `thread: ${session.codexThreadId}` : undefined,
     session.activeTurnId ? `turn: ${session.activeTurnId}` : undefined,
-    session.tmuxTarget ? `tmux: ${session.tmuxTarget}` : undefined,
-    session.attachStatus ? `input: ${session.attachStatus}` : undefined,
     `pending: ${pendingCount}`,
     `updated: ${new Date(session.updatedAt).toISOString()}`,
     usage ? `usage: ${formatUsageLine(usage)}` : "usage: no usage reported yet"
@@ -95,10 +91,7 @@ export function formatAgentMessage(session: StoredSession | undefined, text: str
 }
 
 export function appendAgentMessageChunk(existing: string, chunk: string, session?: StoredSession): string {
-  if (session?.adapter === "appserver") return `${existing}${chunk}`;
-  const trimmed = chunk.trim();
-  if (!trimmed) return existing;
-  return existing ? `${existing}\n${trimmed}` : trimmed;
+  return `${existing}${chunk}`;
 }
 
 export function truncateMiddle(value: string, maxChars = DEFAULT_MESSAGE_BUDGET): string {

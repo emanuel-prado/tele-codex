@@ -73,11 +73,11 @@ describe("Store reliability state", () => {
 
   it("clears only attachments owned by the disconnected generation", () => {
     const store = new Store(":memory:");
-    store.upsertSession({ id: "session_1", adapter: "appserver", label: "one", connectionGeneration: 1 }, "idle");
-    store.upsertSession({ id: "session_2", adapter: "appserver", label: "two", connectionGeneration: 2 }, "idle");
+    store.upsertSession({ id: "session_1", adapter: "appserver", label: "one", codexThreadId: "thread_1", connectionGeneration: 1 }, "idle");
+    store.upsertSession({ id: "session_2", adapter: "appserver", label: "two", codexThreadId: "thread_2", connectionGeneration: 2 }, "idle");
 
     expect(store.clearSessionAttachments(1)).toEqual(["session_1"]);
-    expect(store.getSession("session_1")).toMatchObject({ status: "error" });
+    expect(store.getSession("session_1")).toMatchObject({ status: "detached" });
     expect(store.getSession("session_1")?.connectionGeneration).toBeUndefined();
     expect(store.getSession("session_2")).toMatchObject({ status: "idle", connectionGeneration: 2 });
     store.close();

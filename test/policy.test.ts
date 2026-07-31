@@ -8,15 +8,14 @@ const baseConfig: AppConfig = {
   allowedUserIds: new Set([100]),
   allowedChatIds: new Set(),
   dbPath: "/tmp/test.db",
-  defaultAdapter: "appserver",
   logLevel: "silent",
   approvalTimeoutMs: 1000,
   rpcTimeoutMs: 30000,
   rateLimitWarnPercent: 80,
   allowSessionGrants: false,
   codexCommand: "codex",
-  ptySubmitKey: "C-j",
-  ptyPasteSettleMs: 250,
+  tmuxSubmitKey: "C-j",
+  tmuxPasteSettleMs: 250,
   workspaceRoot: "/tmp"
 };
 

@@ -43,15 +43,14 @@ function config(workspaceRoot: string, dbPath: string): AppConfig {
     allowedUserIds: new Set([1]),
     allowedChatIds: new Set(),
     dbPath,
-    defaultAdapter: "appserver",
     logLevel: "info",
     approvalTimeoutMs: 900000,
     rpcTimeoutMs: 30000,
     rateLimitWarnPercent: 80,
     allowSessionGrants: true,
     codexCommand: "codex",
-    ptySubmitKey: "enter",
-    ptyPasteSettleMs: 250,
+    tmuxSubmitKey: "enter",
+    tmuxPasteSettleMs: 250,
     workspaceRoot
   };
 }
