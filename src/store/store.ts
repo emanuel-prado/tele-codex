@@ -2,7 +2,7 @@ import Database from "better-sqlite3";
 import { existsSync, statSync } from "node:fs";
 import type { RateLimitSummary, SessionProgress, SessionTokenUsage, ThreadGoalSummary } from "../types/control.js";
 import type { LogEntry, PendingAction, SessionRef, SessionStatus } from "../types/events.js";
-import type { LegacyTmuxAttachment, LegacyTmuxInputStatus, LegacyTmuxStatus } from "../types/legacy-tmux.js";
+import type { LegacyTmuxAttachment, LegacyTmuxInputStatus, LegacyTmuxObservation, LegacyTmuxStatus } from "../types/legacy-tmux.js";
 import { migrateDatabase, schemaVersion } from "./migrations.js";
 import {
   InteractionRepository,
@@ -96,6 +96,7 @@ export interface MaintenanceResult {
   interactionDrafts: number;
   sentOutbox: number;
   logs: number;
+  legacyTmuxObservations: number;
   actions: number;
   transcripts: number;
 }
@@ -286,6 +287,62 @@ export class Store {
       Date.now(),
       id
     );
+  }
+
+  updateLegacyTmuxCapture(
+    id: string,
+    capture: Pick<LegacyTmuxAttachment, "paneIdentity" | "capturePosition" | "captureHash" | "captureTail" | "lastCaptureAt">
+  ): void {
+    this.db.prepare(
+      `update legacy_tmux_attachments set
+        pane_identity = ?, capture_position = ?, capture_hash = ?, capture_tail = ?, last_capture_at = ?, updated_at = ?
+       where id = ?`
+    ).run(
+      capture.paneIdentity ?? null,
+      capture.capturePosition ?? null,
+      capture.captureHash ?? null,
+      capture.captureTail ?? null,
+      capture.lastCaptureAt ?? null,
+      Date.now(),
+      id
+    );
+  }
+
+  appendLegacyTmuxObservation(observation: LegacyTmuxObservation): boolean {
+    return this.db.prepare(
+      `insert into legacy_tmux_observations
+        (event_key, attachment_id, pane_identity, capture_position, kind, text, confidence, reason, observed_at)
+       values (?, ?, ?, ?, ?, ?, ?, ?, ?) on conflict(event_key) do nothing`
+    ).run(
+      observation.eventKey,
+      observation.attachmentId,
+      observation.paneIdentity,
+      observation.capturePosition,
+      observation.kind,
+      observation.text,
+      observation.confidence ?? null,
+      observation.reason ?? null,
+      observation.observedAt
+    ).changes === 1;
+  }
+
+  listLegacyTmuxObservations(attachmentId: string, limit = 50): LegacyTmuxObservation[] {
+    return (this.db.prepare(
+      "select * from legacy_tmux_observations where attachment_id = ? order by id desc limit ?"
+    ).all(attachmentId, limit) as Row[]).reverse().map(mapLegacyTmuxObservation);
+  }
+
+  hasRecentLegacyTmuxObservation(input: {
+    attachmentId: string;
+    paneIdentity: string;
+    kind: LegacyTmuxObservation["kind"];
+    text: string;
+    since: number;
+  }): boolean {
+    return Boolean(this.db.prepare(
+      `select 1 from legacy_tmux_observations
+       where attachment_id = ? and pane_identity = ? and kind = ? and text = ? and observed_at >= ? limit 1`
+    ).get(input.attachmentId, input.paneIdentity, input.kind, input.text, input.since));
   }
 
   markThreadDetached(sessionId: string): void {
@@ -811,6 +868,7 @@ export class Store {
         "delete from notification_outbox where status = 'sent' and updated_at < ?"
       ).run(outboxCutoff).changes;
       const logs = this.db.prepare("delete from event_log where timestamp < ?").run(logCutoff).changes;
+      const legacyTmuxObservations = this.db.prepare("delete from legacy_tmux_observations where observed_at < ?").run(logCutoff).changes;
       this.db.prepare(
         `delete from callback_tokens where action_id in
           (select id from pending_actions where status not in ('pending', 'submitting', 'failed')
@@ -831,7 +889,7 @@ export class Store {
       const transcripts = policy.transcriptRetentionMs === undefined ? 0 : this.db.prepare(
         "delete from transcript_chunks where timestamp < ? and finalized_at is not null"
       ).run(now - policy.transcriptRetentionMs).changes;
-      return { callbackTokens, interactionDrafts, sentOutbox, logs, actions, transcripts };
+      return { callbackTokens, interactionDrafts, sentOutbox, logs, legacyTmuxObservations, actions, transcripts };
     })();
   }
 
@@ -961,7 +1019,26 @@ function mapLegacyTmuxAttachment(row: Row): LegacyTmuxAttachment {
   if (row.cwd) attachment.cwd = String(row.cwd);
   if (row.last_probe) attachment.lastProbe = String(row.last_probe);
   if (row.last_probe_at) attachment.lastProbeAt = Number(row.last_probe_at);
+  if (row.pane_identity) attachment.paneIdentity = String(row.pane_identity);
+  if (row.capture_position != null) attachment.capturePosition = Number(row.capture_position);
+  if (row.capture_hash) attachment.captureHash = String(row.capture_hash);
+  if (row.capture_tail) attachment.captureTail = String(row.capture_tail);
+  if (row.last_capture_at != null) attachment.lastCaptureAt = Number(row.last_capture_at);
   return attachment;
+}
+
+function mapLegacyTmuxObservation(row: Row): LegacyTmuxObservation {
+  return {
+    eventKey: String(row.event_key),
+    attachmentId: String(row.attachment_id),
+    paneIdentity: String(row.pane_identity),
+    capturePosition: Number(row.capture_position),
+    kind: row.kind as LegacyTmuxObservation["kind"],
+    text: String(row.text),
+    ...(row.confidence ? { confidence: row.confidence as "high" | "medium" | "low" } : {}),
+    ...(row.reason ? { reason: String(row.reason) } : {}),
+    observedAt: Number(row.observed_at)
+  };
 }
 
 function mapPendingAction(row: Row): StoredPendingAction {

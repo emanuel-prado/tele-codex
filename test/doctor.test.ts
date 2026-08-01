@@ -48,7 +48,7 @@ describe("doctor", () => {
     });
 
     expect(report.checks.find((check) => check.name === "Database integrity")?.detail)
-      .toMatch(/^schema v4, database .* MiB, WAL .* MiB$/);
+      .toMatch(/^schema v5, database .* MiB, WAL .* MiB$/);
   });
 });
 

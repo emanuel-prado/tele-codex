@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
-import { LegacyTmuxBridge, type TmuxCommandRunner } from "../src/legacy/legacy-tmux-bridge.js";
+import { LegacyTmuxBridge, type TmuxCommandRunner, type TmuxRunOptions } from "../src/legacy/legacy-tmux-bridge.js";
 import { Store } from "../src/store/store.js";
 
 describe("LegacyTmuxBridge", () => {
@@ -24,12 +24,8 @@ describe("LegacyTmuxBridge", () => {
 
   it("persists tmux attachments separately and sends only after explicit input confirmation", async () => {
     const store = new Store(":memory:");
-    const commands: string[][] = [];
-    const run: TmuxCommandRunner = async (_file, args) => {
-      commands.push(args);
-      return { stdout: args[0] === "capture-pane" ? "pane preview" : "" };
-    };
-    const bridge = new LegacyTmuxBridge(config(), store, logger(), run, async () => {});
+    const tmux = fakeTmux("pane preview");
+    const bridge = new LegacyTmuxBridge(config(), store, logger(), tmux.run, async () => {});
     const attachment = await bridge.attach("work:1.0", 10);
 
     expect(store.getSession(attachment.id)).toBeUndefined();
@@ -41,18 +37,16 @@ describe("LegacyTmuxBridge", () => {
 
     bridge.markReady(attachment.id, 10);
     await expect(bridge.send(attachment.id, 10, "hello")).resolves.toBe("pane preview");
-    expect(commands.some((args) => args[0] === "set-buffer" && args.includes("hello"))).toBe(true);
-    expect(commands.some((args) => args[0] === "paste-buffer" && args.includes("work:1.0"))).toBe(true);
+    expect(tmux.commands.some((item) => item.args[0] === "set-buffer" && item.args.includes("hello"))).toBe(true);
+    expect(tmux.commands.some((item) => item.args[0] === "paste-buffer" && item.args.includes("work:1.0"))).toBe(true);
+    expect(tmux.commands.every((item) => item.options.timeoutMs === 5_000 && item.options.maxBuffer === 128 * 1024)).toBe(true);
     store.close();
   });
 
   it("lists panes and keeps probe state on the legacy attachment", async () => {
     const store = new Store(":memory:");
-    const run: TmuxCommandRunner = async (_file, args) => {
-      if (args[0] === "list-panes") return { stdout: "work\t1\t0\tcodex\tAgent\t1\n" };
-      return { stdout: "recent output" };
-    };
-    const bridge = new LegacyTmuxBridge(config(), store, logger(), run, async () => {});
+    const tmux = fakeTmux("recent output");
+    const bridge = new LegacyTmuxBridge(config(), store, logger(), tmux.run, async () => {});
 
     await expect(bridge.listPanes()).resolves.toEqual([
       expect.objectContaining({ target: "work:1.0", command: "codex", title: "Agent", active: true })
@@ -64,6 +58,105 @@ describe("LegacyTmuxBridge", () => {
       inputStatus: "needs-confirmation",
       submitStrategy: "f12"
     });
+    store.close();
+  });
+
+  it("processes only new output across unchanged and overlapping bounded captures", async () => {
+    const store = new Store(":memory:");
+    const tmux = fakeTmux("old line\nworking");
+    const bridge = new LegacyTmuxBridge(config(), store, logger(), tmux.run, async () => {});
+    const attachment = await bridge.attach("work:1.0", 10);
+
+    await expect(bridge.capture(attachment.id, 10)).resolves.toMatchObject({ status: "unchanged", observations: [] });
+    tmux.state.text = "working\nnew result";
+    tmux.state.position += 1;
+    const first = await bridge.capture(attachment.id, 10);
+    expect(first).toMatchObject({ status: "updated", newOutput: "new result" });
+    expect(first.observations).toHaveLength(1);
+
+    tmux.state.text = "new result\nThis operation requires approval. [y/N]";
+    tmux.state.position += 1;
+    const approval = await bridge.capture(attachment.id, 10);
+    expect(approval.observations).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: "heuristic-interaction", confidence: "high", reason: expect.any(String) })
+    ]));
+    await expect(bridge.capture(attachment.id, 10)).resolves.toMatchObject({ status: "unchanged", observations: [] });
+
+    tmux.state.text = "This operation requires approval. [y/N]\ndone";
+    tmux.state.position += 1;
+    const resolvedScrollback = await bridge.capture(attachment.id, 10);
+    expect(resolvedScrollback.newOutput).toBe("done");
+    expect(resolvedScrollback.observations.filter((item) => item.kind === "heuristic-interaction")).toEqual([]);
+
+    tmux.state.text = "done\nThis operation requires approval. [y/N]";
+    tmux.state.position += 1;
+    const repeatedPrompt = await bridge.capture(attachment.id, 10);
+    expect(repeatedPrompt.newOutput).toContain("requires approval");
+    expect(repeatedPrompt.observations.filter((item) => item.kind === "heuristic-interaction")).toEqual([]);
+    expect(store.listLegacyTmuxObservations(attachment.id).filter((item) => item.kind === "heuristic-interaction")).toHaveLength(1);
+    expect(store.getTranscript(attachment.id)).toBe("");
+    expect(store.recentLogs(attachment.id, 10)).toEqual([]);
+    expect(store.listPendingActions(attachment.id)).toEqual([]);
+    expect(tmux.commands.filter((item) => item.args[0] === "capture-pane").every((item) => item.args.includes("-200") || item.args.includes("-30"))).toBe(true);
+    store.close();
+  });
+
+  it("bounds persisted pane captures", async () => {
+    const store = new Store(":memory:");
+    const tmux = fakeTmux("x".repeat(100 * 1024));
+    const bridge = new LegacyTmuxBridge(config(), store, logger(), tmux.run, async () => {});
+    const attachment = await bridge.attach("work:1.0", 10);
+
+    expect(Buffer.byteLength(store.getLegacyTmuxAttachment(attachment.id)?.captureTail ?? "", "utf8")).toBeLessThanOrEqual(64 * 1024);
+    store.close();
+  });
+
+  it("skips ambiguous redraws instead of replaying the pane", async () => {
+    const store = new Store(":memory:");
+    const tmux = fakeTmux("\u001b[31moriginal screen\u001b[0m   ");
+    const bridge = new LegacyTmuxBridge(config(), store, logger(), tmux.run, async () => {});
+    const attachment = await bridge.attach("work:1.0", 10);
+    tmux.state.text = "original screen";
+    await expect(bridge.capture(attachment.id, 10)).resolves.toMatchObject({ status: "unchanged", observations: [] });
+    tmux.state.text = "redrawn screen with Approve this command?";
+
+    await expect(bridge.capture(attachment.id, 10)).resolves.toMatchObject({
+      status: "uncertain",
+      newOutput: "",
+      observations: []
+    });
+    store.close();
+  });
+
+  it("marks missing and replaced panes stale", async () => {
+    const store = new Store(":memory:");
+    const tmux = fakeTmux("output");
+    const bridge = new LegacyTmuxBridge(config(), store, logger(), tmux.run, async () => {});
+    const replaced = await bridge.attach("work:1.0", 10);
+    bridge.markReady(replaced.id, 10);
+    tmux.state.identity = "%2:222";
+    await expect(bridge.send(replaced.id, 10, "must not leak")).rejects.toThrow(/replaced by a different pane/i);
+    expect(tmux.commands.some((item) => item.args[0] === "set-buffer" && item.args.includes("must not leak"))).toBe(false);
+    expect(store.getLegacyTmuxAttachment(replaced.id)).toMatchObject({ status: "stale", inputStatus: "stale" });
+
+    tmux.state.identity = "%1:111";
+    const missing = await bridge.attach("work:1.0", 10);
+    tmux.state.exists = false;
+    await expect(bridge.capture(missing.id, 10)).resolves.toMatchObject({ status: "stale" });
+    expect(store.getLegacyTmuxAttachment(missing.id)).toMatchObject({ status: "stale", inputStatus: "stale" });
+    store.close();
+  });
+
+  it("interrupts an external pane with Ctrl-C without killing it or claiming lifecycle ownership", async () => {
+    const store = new Store(":memory:");
+    const tmux = fakeTmux("running");
+    const bridge = new LegacyTmuxBridge(config(), store, logger(), tmux.run, async () => {});
+    const attachment = await bridge.attach("work:1.0", 10);
+    await bridge.interrupt(attachment.id, 10);
+
+    expect(tmux.commands.some((item) => item.args.join(" ") === "send-keys -t work:1.0 C-c")).toBe(true);
+    expect(tmux.commands.some((item) => item.args.includes("kill-pane") || item.args.includes("kill-session"))).toBe(false);
+    expect(store.getLegacyTmuxAttachment(attachment.id)?.status).toBe("attached");
     store.close();
   });
 });
@@ -113,6 +206,34 @@ describe("legacy tmux migration", () => {
 
 function config() {
   return { tmuxSubmitKey: "enter", tmuxPasteSettleMs: 0 };
+}
+
+function fakeTmux(initialText: string) {
+  const state = {
+    text: initialText,
+    identity: "%1:111",
+    position: 20,
+    exists: true
+  };
+  const commands: Array<{ args: string[]; options: TmuxRunOptions }> = [];
+  const run: TmuxCommandRunner = async (_file, args, options) => {
+    commands.push({ args: [...args], options });
+    if (!state.exists && (args[0] === "display-message" || args[0] === "capture-pane")) {
+      throw new Error("can't find pane: work:1.0");
+    }
+    if (args[0] === "list-panes") {
+      if (!state.exists) return { stdout: "" };
+      const [paneId, panePid] = state.identity.split(":");
+      return { stdout: `work\t1\t0\tcodex\tAgent\t1\t${paneId}\t${panePid}\n` };
+    }
+    if (args[0] === "display-message") {
+      const [paneId, panePid] = state.identity.split(":");
+      return { stdout: `${paneId}\t${panePid}\t${state.position}\t0\t0\n` };
+    }
+    if (args[0] === "capture-pane") return { stdout: state.text };
+    return { stdout: "" };
+  };
+  return { state, commands, run };
 }
 
 function logger(): never {

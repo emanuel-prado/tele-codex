@@ -77,7 +77,7 @@ describe("versioned SQLite storage", () => {
     expect(store.getPendingAction("delivering")).toBeDefined();
     expect(store.claimCallbackToken("active-control", 1, undefined, "claim")).toBeUndefined();
     expect(store.dueOutbox()).toHaveLength(1);
-    expect(store.diagnostics()).toMatchObject({ schemaVersion: 4, walBytes: 0 });
+    expect(store.diagnostics()).toMatchObject({ schemaVersion: 5, walBytes: 0 });
     store.close();
   });
 });

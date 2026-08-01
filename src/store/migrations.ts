@@ -1,6 +1,6 @@
 import type Database from "better-sqlite3";
 
-export const CURRENT_SCHEMA_VERSION = 4;
+export const CURRENT_SCHEMA_VERSION = 5;
 
 export interface Migration {
   version: number;
@@ -199,6 +199,33 @@ const MIGRATIONS: readonly Migration[] = [
         create index if not exists event_log_cleanup on event_log(timestamp);
         create index if not exists transcript_retention on transcript_chunks(timestamp);
         create index if not exists transcript_identity on transcript_chunks(session_id, turn_id, item_id, chunk_index);
+      `);
+    }
+  },
+  {
+    version: 5,
+    name: "legacy-tmux-capture-boundaries",
+    up(db) {
+      addColumn(db, "legacy_tmux_attachments", "pane_identity", "text");
+      addColumn(db, "legacy_tmux_attachments", "capture_position", "integer");
+      addColumn(db, "legacy_tmux_attachments", "capture_hash", "text");
+      addColumn(db, "legacy_tmux_attachments", "capture_tail", "text");
+      addColumn(db, "legacy_tmux_attachments", "last_capture_at", "integer");
+      db.exec(`
+        create table if not exists legacy_tmux_observations (
+          id integer primary key autoincrement,
+          event_key text not null unique,
+          attachment_id text not null,
+          pane_identity text not null,
+          capture_position integer not null,
+          kind text not null,
+          text text not null,
+          confidence text,
+          reason text,
+          observed_at integer not null
+        );
+        create index if not exists legacy_tmux_observations_attachment
+          on legacy_tmux_observations(attachment_id, observed_at);
       `);
     }
   }
