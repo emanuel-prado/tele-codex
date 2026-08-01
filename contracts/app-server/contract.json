@@ -1,0 +1,62 @@
+{
+  "codexVersion": "codex-cli 0.146.0",
+  "generatedAt": "2026-08-01",
+  "clientMethods": [
+    "account/rateLimits/read",
+    "initialize",
+    "model/list",
+    "thread/archive",
+    "thread/backgroundTerminals/list",
+    "thread/backgroundTerminals/terminate",
+    "thread/compact/start",
+    "thread/goal/clear",
+    "thread/goal/get",
+    "thread/goal/set",
+    "thread/list",
+    "thread/resume",
+    "thread/search",
+    "thread/settings/update",
+    "thread/start",
+    "turn/interrupt",
+    "turn/start",
+    "turn/steer"
+  ],
+  "serverMethods": [
+    "applyPatchApproval",
+    "execCommandApproval",
+    "item/commandExecution/requestApproval",
+    "item/fileChange/requestApproval",
+    "item/permissions/requestApproval",
+    "item/tool/requestUserInput",
+    "mcpServer/elicitation/request"
+  ],
+  "notifications": [
+    "account/rateLimits/updated",
+    "configWarning",
+    "deprecationNotice",
+    "error",
+    "guardianWarning",
+    "item/agentMessage/delta",
+    "model/rerouted",
+    "serverRequest/resolved",
+    "thread/goal/cleared",
+    "thread/goal/updated",
+    "thread/settings/updated",
+    "thread/status/changed",
+    "thread/tokenUsage/updated",
+    "turn/completed",
+    "turn/diff/updated",
+    "turn/plan/updated",
+    "turn/started",
+    "warning"
+  ],
+  "requiredFields": {
+    "CommandExecutionRequestApprovalParams.json": ["itemId", "startedAtMs", "threadId", "turnId"],
+    "ToolRequestUserInputParams.json": ["itemId", "questions", "threadId", "turnId"],
+    "v1/InitializeResponse.json": ["codexHome", "platformFamily", "platformOs", "userAgent"],
+    "v2/ServerRequestResolvedNotification.json": ["requestId", "threadId"],
+    "v2/ThreadResumeResponse.json": ["approvalPolicy", "approvalsReviewer", "cwd", "model", "modelProvider", "sandbox", "thread"],
+    "v2/ThreadStartResponse.json": ["approvalPolicy", "approvalsReviewer", "cwd", "model", "modelProvider", "sandbox", "thread"],
+    "v2/TurnStartResponse.json": ["turn"]
+  }
+}

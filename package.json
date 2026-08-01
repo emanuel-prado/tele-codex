@@ -21,10 +21,13 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
+    "contract:check": "node scripts/appserver-contract.mjs",
+    "contract:fixture": "node scripts/appserver-contract.mjs --fixture-only",
+    "contract:refresh": "node scripts/appserver-contract.mjs --refresh",
     "dev": "tsx src/cli.ts",
     "start": "node dist/cli.js",
     "test": "vitest run",
-    "test:appserver": "node scripts/appserver-smoke.mjs",
+    "test:appserver": "npm run contract:check && node scripts/appserver-smoke.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {

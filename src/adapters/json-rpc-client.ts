@@ -11,6 +11,21 @@ export interface JsonRpcMessage {
   error?: { code: number; message: string; data?: unknown };
 }
 
+export interface AppServerRpcClient {
+  connectStdio(command: string, generation?: number): Promise<number>;
+  connectWebSocket(url: string, token?: string, generation?: number): Promise<number>;
+  request(method: string, params?: unknown): Promise<unknown>;
+  notify(method: string, params?: unknown, generation?: number): void;
+  respond(id: string | number, result: unknown, generation?: number): void;
+  fail(id: string | number, code: number, message: string, generation?: number): void;
+  close(): void;
+  transportInfo(): { kind?: "stdio" | "websocket"; pid?: number };
+  on(event: "activity", listener: (generation: number) => void): this;
+  on(event: "message", listener: (message: JsonRpcMessage, generation: number) => void): this;
+  on(event: "stderr", listener: (chunk: string, generation: number) => void): this;
+  on(event: "close", listener: (details: unknown, generation: number) => void): this;
+}
+
 interface PendingRequest {
   resolve: (value: unknown) => void;
   reject: (error: Error) => void;
@@ -18,7 +33,7 @@ interface PendingRequest {
   generation: number;
 }
 
-export class JsonRpcClient extends EventEmitter {
+export class JsonRpcClient extends EventEmitter implements AppServerRpcClient {
   private nextId = 1;
   private readonly pending = new Map<string | number, PendingRequest>();
   private child: ChildProcessWithoutNullStreams | undefined;

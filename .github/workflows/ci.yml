@@ -29,3 +29,6 @@ jobs:
 
       - name: Build
         run: npm run build
+
+      - name: App-server contract fixture
+        run: npm run contract:fixture

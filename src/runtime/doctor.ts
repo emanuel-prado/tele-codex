@@ -6,6 +6,7 @@ import { promisify } from "node:util";
 import type { AppConfig } from "../config.js";
 import Database from "better-sqlite3";
 import { ServiceManager, type ServiceStatus } from "./service-manager.js";
+import { APP_SERVER_CONTRACT_VERSION } from "../adapters/app-server-contract.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -39,8 +40,12 @@ export async function runDoctor(config: AppConfig, options: DoctorOptions = {}):
   checks.push(await directoryCheck("Workspace root", config.workspaceRoot));
   checks.push(await writableDirectoryCheck("Database directory", dirname(config.dbPath)));
   checks.push(await (options.databaseCheck ?? (() => databaseIntegrityCheck(config.dbPath)))());
-  checks.push(await commandCheck("Codex CLI", config.codexCommand, ["--version"], runCommand));
-  checks.push(await commandCheck("Codex app-server", config.codexCommand, ["app-server", "--help"], runCommand));
+  const codex = await commandCheck("Codex CLI", config.codexCommand, ["--version"], runCommand);
+  checks.push(codex);
+  const appServer = await commandCheck("Codex app-server", config.codexCommand, ["app-server", "--help"], runCommand);
+  checks.push(appServer.status === "pass"
+    ? { ...appServer, detail: `installed ${codex.detail}; checked contract ${APP_SERVER_CONTRACT_VERSION}` }
+    : appServer);
   checks.push(await optionalCommandCheck("tmux fallback", "tmux", ["-V"], runCommand));
   checks.push(await serviceCheck(options.serviceStatus ?? (() => new ServiceManager().status())));
 

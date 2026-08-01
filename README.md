@@ -166,8 +166,11 @@ Never commit `.env`, bot tokens, app-server tokens, SQLite databases, or transcr
 npm run typecheck
 npm test
 npm run build
-# optional: verify the installed Codex app-server contract
+# optional: verify the installed Codex app-server contract and generated schema fingerprints
 npm run test:appserver
+
+# after intentionally upgrading Codex, refresh and review the checked contract
+npm run contract:refresh
 ```
 
 The project is intentionally small:

@@ -10,6 +10,8 @@
 
 App-server and tmux do not share an interface: they have different identity, lifecycle, interaction, and failure semantics. The core interface is mandatory and app-server-specific. The legacy bridge exposes pane listing, attachment, probing, bounded incremental capture, sending, and interrupt operations against `LegacyTmuxAttachment`; it does not emit structured Codex events or create app-server pending actions from parsed terminal text. Capture stores legacy-only observations with pane identity, position, content hash, confidence, and reason. A missing tmux binary therefore affects only an explicit fallback command, never normal construction or startup.
 
+The app-server boundary has a deterministic fake transport for lifecycle scenarios. Its diagnostics retain message order, direction, and connection generation so reconnect and stale-message failures are reproducible without Telegram or a live Codex process. A compact checked contract fingerprints the generated client requests, server requests, notifications, and critical lifecycle shapes from a named Codex CLI version. `npm run contract:check` compares an installed CLI with that fixture; intentional upgrades use `npm run contract:refresh` and require protocol review. `/doctor` and CI diagnostics report the checked version.
+
 ## State
 
 SQLite tables:
