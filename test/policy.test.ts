@@ -5,7 +5,7 @@ import type { PendingAction } from "../src/types/events.js";
 
 const baseConfig: AppConfig = {
   botToken: "token",
-  allowedUserIds: new Set([100]),
+  controllerUserId: 100,
   allowedChatIds: new Set(),
   dbPath: "/tmp/test.db",
   logLevel: "silent",
@@ -25,6 +25,18 @@ describe("PolicyEngine", () => {
     const policy = new PolicyEngine(baseConfig);
     expect(policy.authorizeTelegramUser(100, 100)).toBe(true);
     expect(policy.authorizeTelegramUser(101, 101)).toBe(false);
+  });
+
+  it("limits an empty chat allow-list to the Controller's private chat", () => {
+    const policy = new PolicyEngine(baseConfig);
+    expect(policy.authorizeTelegramUser(100, 100)).toBe(true);
+    expect(policy.authorizeTelegramUser(100, -100123)).toBe(false);
+  });
+
+  it("allows the Controller in explicitly configured chats", () => {
+    const policy = new PolicyEngine({ ...baseConfig, allowedChatIds: new Set([-100123]) });
+    expect(policy.authorizeTelegramUser(100, -100123)).toBe(true);
+    expect(policy.authorizeTelegramUser(100, 100)).toBe(false);
   });
 
   it("rejects session grants when disabled", () => {

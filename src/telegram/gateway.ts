@@ -1444,7 +1444,7 @@ export class TelegramGateway {
 
   private allowedDeliveryChats(): number[] {
     if (this.config.allowedChatIds.size > 0) return [...this.config.allowedChatIds];
-    return [...this.config.allowedUserIds];
+    return [this.config.controllerUserId];
   }
 
   private deliveryChatsForSession(sessionId: string): number[] {

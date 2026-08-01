@@ -6,8 +6,10 @@ export class PolicyEngine {
 
   authorizeTelegramUser(userId: number | undefined, chatId: number | undefined): boolean {
     if (userId === undefined || chatId === undefined) return false;
-    if (!this.config.allowedUserIds.has(userId)) return false;
-    return this.config.allowedChatIds.size === 0 || this.config.allowedChatIds.has(chatId);
+    if (this.config.controllerUserId !== userId) return false;
+    return this.config.allowedChatIds.size === 0
+      ? chatId === this.config.controllerUserId
+      : this.config.allowedChatIds.has(chatId);
   }
 
   validateDecision(action: PendingAction, decision: UserDecision, nonce: string): void {

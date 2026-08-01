@@ -71,20 +71,27 @@ node dist/cli.js doctor
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `TELE_CODEX_BOT_TOKEN` | required | Telegram bot token. |
-| `TELE_CODEX_ALLOWED_USER_IDS` | required | Comma-separated Telegram user IDs allowed to control Codex. |
-| `TELE_CODEX_ALLOWED_CHAT_IDS` | empty | Optional comma-separated chat IDs. |
+| `TELE_CODEX_ALLOWED_USER_IDS` | required | Exactly one numeric Telegram user ID: the Controller. The plural environment name is retained for compatibility. |
+| `TELE_CODEX_ALLOWED_CHAT_IDS` | empty | Optional comma-separated chat IDs. When empty, only the Controller's private chat is accepted. |
 | `TELE_CODEX_DB_PATH` | `.tele-codex/tele-codex.db` | SQLite database path. |
+| `TELE_CODEX_LOG_LEVEL` | `info` | Structured operational log level. |
+| `TELE_CODEX_APPROVAL_TIMEOUT_MS` | `900000` | Expiry for approval and question interactions. |
 | `TELE_CODEX_WORKSPACE_ROOT` | `~/Workspace` | Root used by `/new` project discovery. |
 | `TELE_CODEX_CODEX_COMMAND` | `codex` | Codex executable. |
 | `TELE_CODEX_APP_SERVER_URL` | unset | Optional remote app-server websocket URL. |
 | `TELE_CODEX_TMUX_SUBMIT_KEY` | `enter` | Submit strategy for the legacy tmux fallback. |
 | `TELE_CODEX_TMUX_PASTE_SETTLE_MS` | `250` | Delay between tmux paste and submit key. |
-| `TELE_CODEX_ALLOW_SESSION_GRANTS` | `true` | Enables “approve for session.” |
+| `TELE_CODEX_ALLOW_SESSION_GRANTS` | `false` | Enables native Codex “approve for session” decisions. Opt in only when needed. |
 | `TELE_CODEX_RPC_TIMEOUT_MS` | `30000` | Maximum wait for an app-server JSON-RPC response. |
 | `TELE_CODEX_APP_SERVER_MAX_RECONNECT_ATTEMPTS` | `8` | Failed reconnect attempts before the supervised runtime exits for systemd restart. |
 | `TELE_CODEX_RATE_LIMIT_WARN_PERCENT` | `80` | First account-limit warning threshold. |
 
 Manual project paths passed to `/new` must stay inside `TELE_CODEX_WORKSPACE_ROOT`.
+
+`doctor` is safe to run with a missing or malformed `.env`: it reports the
+invalid fields and skips dependent runtime checks. It does not create the
+database or its parent directory. Correct the reported configuration and rerun
+`doctor` before starting the bot.
 
 ## Telegram Commands
 
@@ -147,15 +154,15 @@ Legacy tmux fallback:
 
 This is designed for a single trusted user controlling a local machine. Do not expose it as a public webhook or shared bot without revisiting the threat model.
 
-- Unauthorized Telegram users are rejected before command handling.
-- If `TELE_CODEX_ALLOWED_CHAT_IDS` is set, both user ID and chat ID must match.
+- The single configured Controller is checked before command handling.
+- With no chat allow-list, only the Controller's private chat is accepted. If `TELE_CODEX_ALLOWED_CHAT_IDS` is set, both the Controller ID and chat ID must match.
 - Approval and thread-picker callbacks contain short opaque tokens; action details, intended chat/user, target, expiry, and expected resource version remain in SQLite.
 - Expired, cross-chat, duplicate, and already-resolved interactions are rejected transactionally.
 - Agent output is delivered only to chats associated with its thread, and bot message-to-thread associations make reply routing explicit.
-- Session-level approval grants can be disabled with:
+- Session-level approvals are disabled by default. Enable them explicitly with:
 
 ```bash
-TELE_CODEX_ALLOW_SESSION_GRANTS=false
+TELE_CODEX_ALLOW_SESSION_GRANTS=true
 ```
 
 Never commit `.env`, bot tokens, app-server tokens, SQLite databases, or transcripts that may contain private code or credentials.

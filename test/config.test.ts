@@ -1,22 +1,46 @@
+import { existsSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { tmpdir } from "node:os";
 import { describe, expect, it } from "vitest";
-import { loadConfig } from "../src/config.js";
+import { inspectConfig, loadConfig } from "../src/config.js";
 
 describe("loadConfig", () => {
   it("parses allow-lists and defaults", () => {
     const config = loadConfig({
       TELE_CODEX_BOT_TOKEN: "token",
-      TELE_CODEX_ALLOWED_USER_IDS: "1,2",
+      TELE_CODEX_ALLOWED_USER_IDS: "1",
       TELE_CODEX_DB_PATH: "/tmp/tele-codex-test.db"
     });
 
-    expect(config.allowedUserIds.has(1)).toBe(true);
-    expect(config.allowedUserIds.has(2)).toBe(true);
-    expect(config.allowSessionGrants).toBe(true);
+    expect(config.controllerUserId).toBe(1);
+    expect(config.allowSessionGrants).toBe(false);
     expect(config.rpcTimeoutMs).toBe(30_000);
     expect(config.appServerMaxReconnectAttempts).toBe(8);
     expect(config.rateLimitWarnPercent).toBe(80);
     expect(config.tmuxSubmitKey).toBe("enter");
     expect(config.tmuxPasteSettleMs).toBe(250);
     expect(config.workspaceRoot.endsWith("/Workspace")).toBe(true);
+  });
+
+  it("rejects zero or multiple Controllers", () => {
+    expect(() => loadConfig({
+      TELE_CODEX_BOT_TOKEN: "token",
+      TELE_CODEX_ALLOWED_USER_IDS: "1,2"
+    })).toThrow(/exactly one/);
+    expect(() => loadConfig({
+      TELE_CODEX_BOT_TOKEN: "token",
+      TELE_CODEX_ALLOWED_USER_IDS: ""
+    })).toThrow();
+  });
+
+  it("inspects invalid configuration without creating the database directory", () => {
+    const dbPath = join(tmpdir(), `tele-codex-doctor-missing-${process.pid}-${Date.now()}`, "db.sqlite");
+    const inspection = inspectConfig({ TELE_CODEX_DB_PATH: dbPath });
+
+    expect(inspection.config).toBeUndefined();
+    expect(inspection.botTokenConfigured).toBe(false);
+    expect(inspection.controllerCount).toBe(0);
+    expect(inspection.errors.length).toBeGreaterThan(0);
+    expect(existsSync(dirname(dbPath))).toBe(false);
   });
 });

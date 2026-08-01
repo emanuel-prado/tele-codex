@@ -15,7 +15,7 @@ const envSchema = z.object({
   TELE_CODEX_ALLOW_SESSION_GRANTS: z
     .enum(["true", "false"])
     .optional()
-    .default("true")
+    .default("false")
     .transform((value) => value === "true"),
   TELE_CODEX_CODEX_COMMAND: z.string().optional().default("codex"),
   TELE_CODEX_TMUX_SUBMIT_KEY: z.string().optional().default("enter"),
@@ -26,7 +26,7 @@ const envSchema = z.object({
 
 export interface AppConfig {
   botToken: string;
-  allowedUserIds: Set<number>;
+  controllerUserId: number;
   allowedChatIds: Set<number>;
   dbPath: string;
   logLevel: string;
@@ -42,14 +42,28 @@ export interface AppConfig {
   appServerUrl?: string;
 }
 
-export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
+export interface ConfigInspection {
+  config?: AppConfig;
+  botTokenConfigured: boolean;
+  controllerCount?: number;
+  errors: string[];
+}
+
+export function loadConfig(
+  env: NodeJS.ProcessEnv = process.env,
+  options: { createDatabaseDirectory?: boolean } = {}
+): AppConfig {
   const parsed = envSchema.parse(env);
+  const controllerIds = parseNumberSet(parsed.TELE_CODEX_ALLOWED_USER_IDS);
+  if (controllerIds.size !== 1) {
+    throw new Error("TELE_CODEX_ALLOWED_USER_IDS must contain exactly one numeric Controller ID.");
+  }
   const dbPath = resolve(parsed.TELE_CODEX_DB_PATH);
-  mkdirSync(dirname(dbPath), { recursive: true });
+  if (options.createDatabaseDirectory !== false) mkdirSync(dirname(dbPath), { recursive: true });
 
   const config: AppConfig = {
     botToken: parsed.TELE_CODEX_BOT_TOKEN,
-    allowedUserIds: parseNumberSet(parsed.TELE_CODEX_ALLOWED_USER_IDS),
+    controllerUserId: [...controllerIds][0]!,
     allowedChatIds: parseNumberSet(parsed.TELE_CODEX_ALLOWED_CHAT_IDS),
     dbPath,
     logLevel: parsed.TELE_CODEX_LOG_LEVEL,
@@ -65,6 +79,33 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   };
   if (parsed.TELE_CODEX_APP_SERVER_URL) config.appServerUrl = parsed.TELE_CODEX_APP_SERVER_URL;
   return config;
+}
+
+export function inspectConfig(env: NodeJS.ProcessEnv = process.env): ConfigInspection {
+  const rawToken = env.TELE_CODEX_BOT_TOKEN?.trim() ?? "";
+  let controllerCount: number | undefined;
+  const errors: string[] = [];
+  try {
+    controllerCount = parseNumberSet(env.TELE_CODEX_ALLOWED_USER_IDS ?? "").size;
+  } catch (error) {
+    errors.push(errorMessage(error));
+  }
+  try {
+    return {
+      config: loadConfig(env, { createDatabaseDirectory: false }),
+      botTokenConfigured: Boolean(rawToken && !rawToken.includes("replace-")),
+      ...(controllerCount === undefined ? {} : { controllerCount }),
+      errors
+    };
+  } catch (error) {
+    const message = errorMessage(error);
+    if (!errors.includes(message)) errors.push(message);
+    return {
+      botTokenConfigured: Boolean(rawToken && !rawToken.includes("replace-")),
+      ...(controllerCount === undefined ? {} : { controllerCount }),
+      errors
+    };
+  }
 }
 
 function resolveHome(value: string): string {
@@ -83,4 +124,11 @@ function parseNumberSet(raw: string): Set<number> {
     throw new Error(`Expected comma-separated numeric Telegram IDs, got: ${raw}`);
   }
   return new Set(values);
+}
+
+function errorMessage(error: unknown): string {
+  if (error instanceof z.ZodError) {
+    return error.issues.map((issue) => `${issue.path.join(".") || "configuration"}: ${issue.message}`).join("; ");
+  }
+  return error instanceof Error ? error.message : "Invalid configuration.";
 }

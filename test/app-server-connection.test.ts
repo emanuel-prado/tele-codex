@@ -186,7 +186,7 @@ function action(connectionGeneration: number): PendingAction {
 function config(): AppConfig {
   return {
     botToken: "token",
-    allowedUserIds: new Set([1]),
+    controllerUserId: 1,
     allowedChatIds: new Set([1]),
     dbPath: ":memory:",
     logLevel: "silent",

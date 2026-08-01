@@ -3,7 +3,7 @@ import { constants } from "node:fs";
 import { dirname } from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import type { AppConfig } from "../config.js";
+import { inspectConfig, type AppConfig } from "../config.js";
 import Database from "better-sqlite3";
 import { ServiceManager, type ServiceStatus } from "./service-manager.js";
 import { APP_SERVER_CONTRACT_VERSION } from "../adapters/app-server-contract.js";
@@ -34,7 +34,7 @@ export async function runDoctor(config: AppConfig, options: DoctorOptions = {}):
   const checks: HealthCheck[] = [
     nodeCheck(),
     configCheck("Telegram bot token", Boolean(config.botToken && !config.botToken.includes("replace-")), "configured"),
-    configCheck("Allowed users", config.allowedUserIds.size > 0, `${config.allowedUserIds.size} user(s)`)
+    configCheck("Controller", Number.isSafeInteger(config.controllerUserId), `user ${config.controllerUserId}`)
   ];
 
   checks.push(await directoryCheck("Workspace root", config.workspaceRoot));
@@ -55,9 +55,37 @@ export async function runDoctor(config: AppConfig, options: DoctorOptions = {}):
   };
 }
 
+export async function runDoctorFromEnv(
+  env: NodeJS.ProcessEnv = process.env,
+  options: DoctorOptions = {}
+): Promise<DoctorReport> {
+  const inspection = inspectConfig(env);
+  if (inspection.config) return runDoctor(inspection.config, options);
+  const checks: HealthCheck[] = [
+    nodeCheck(),
+    configCheck("Telegram bot token", inspection.botTokenConfigured, "configured"),
+    configCheck(
+      "Controller",
+      inspection.controllerCount === 1,
+      inspection.controllerCount === undefined ? "invalid numeric ID" : `${inspection.controllerCount} configured`
+    ),
+    {
+      name: "Configuration",
+      status: "fail",
+      detail: inspection.errors.join("; ") || "missing or invalid"
+    },
+    {
+      name: "Runtime checks",
+      status: "warn",
+      detail: "skipped until configuration is valid"
+    }
+  ];
+  return { ok: false, checks };
+}
+
 async function databaseIntegrityCheck(path: string): Promise<HealthCheck> {
   try {
-    const db = new Database(path);
+    const db = new Database(path, { readonly: true, fileMustExist: true });
     const rows = db.pragma("quick_check") as Array<{ quick_check: string }>;
     const migrationTable = db.prepare("select name from sqlite_master where type = 'table' and name = 'schema_migrations'").get();
     const version = migrationTable
