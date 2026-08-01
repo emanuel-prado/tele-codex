@@ -1,7 +1,16 @@
 import Database from "better-sqlite3";
+import { existsSync, statSync } from "node:fs";
 import type { RateLimitSummary, SessionProgress, SessionTokenUsage, ThreadGoalSummary } from "../types/control.js";
 import type { LogEntry, PendingAction, SessionRef, SessionStatus } from "../types/events.js";
 import type { LegacyTmuxAttachment, LegacyTmuxInputStatus, LegacyTmuxStatus } from "../types/legacy-tmux.js";
+import { migrateDatabase, schemaVersion } from "./migrations.js";
+import {
+  InteractionRepository,
+  NotificationOutboxRepository,
+  RuntimeStateRepository,
+  ThreadAttachmentRepository,
+  TranscriptLogRepository
+} from "./repositories.js";
 
 export type PendingActionStatus = "pending" | "submitting" | "resolved" | "expired" | "cancelled" | "orphaned" | "failed";
 
@@ -64,6 +73,33 @@ export interface StoredSession extends SessionRef {
   updatedAt: number;
 }
 
+export interface StorageDiagnostics {
+  schemaVersion: number;
+  databaseBytes: number;
+  walBytes: number;
+  pageCount: number;
+  freelistPages: number;
+  warnings: string[];
+}
+
+export interface MaintenancePolicy {
+  now?: number;
+  consumedCallbackRetentionMs?: number;
+  completedInteractionRetentionMs?: number;
+  sentOutboxRetentionMs?: number;
+  logRetentionMs?: number;
+  transcriptRetentionMs?: number;
+}
+
+export interface MaintenanceResult {
+  callbackTokens: number;
+  interactionDrafts: number;
+  sentOutbox: number;
+  logs: number;
+  actions: number;
+  transcripts: number;
+}
+
 type Row = Record<string, unknown>;
 
 const CODEX_THREAD_SELECT = `
@@ -87,12 +123,25 @@ const CODEX_THREAD_SELECT = `
 
 export class Store {
   private readonly db: Database.Database;
+  private readonly path: string;
   private closed = false;
+  readonly threads: ThreadAttachmentRepository;
+  readonly interactions: InteractionRepository;
+  readonly notifications: NotificationOutboxRepository;
+  readonly transcripts: TranscriptLogRepository;
+  readonly runtimeState: RuntimeStateRepository;
 
   constructor(path: string) {
+    this.path = path;
     this.db = new Database(path);
     this.db.pragma("journal_mode = WAL");
     this.migrate();
+    this.threads = new ThreadAttachmentRepository(this.db);
+    this.interactions = new InteractionRepository(this.db);
+    this.notifications = new NotificationOutboxRepository(this.db);
+    this.transcripts = new TranscriptLogRepository(this.db);
+    this.runtimeState = new RuntimeStateRepository(this.db);
+    this.reconcilePersistedAppServerRuntime();
     this.releaseStaleCallbackClaims(Date.now() + 1);
   }
 
@@ -404,10 +453,7 @@ export class Store {
   }
 
   countPendingActions(sessionId: string): number {
-    const row = this.db
-      .prepare("select count(*) as count from pending_actions where session_id = ? and status in ('pending', 'failed') and expires_at > ?")
-      .get(sessionId, Date.now()) as { count: number };
-    return Number(row.count);
+    return this.interactions.countPending(sessionId);
   }
 
   setTokenUsage(sessionId: string, usage: Omit<SessionTokenUsage, "updatedAt"> & { updatedAt?: number }): void {
@@ -497,19 +543,15 @@ export class Store {
   }
 
   setRuntimeValue(key: string, value: unknown): void {
-    this.db.prepare(
-      `insert into global_runtime (key, value_json, updated_at) values (?, ?, ?)
-       on conflict(key) do update set value_json=excluded.value_json, updated_at=excluded.updated_at`
-    ).run(key, JSON.stringify(value), Date.now());
+    this.runtimeState.set(key, value);
   }
 
   getRuntimeValue<T>(key: string): T | undefined {
-    const row = this.db.prepare("select value_json from global_runtime where key = ?").get(key) as Row | undefined;
-    return row ? (JSON.parse(String(row.value_json)) as T) : undefined;
+    return this.runtimeState.get<T>(key);
   }
 
   deleteRuntimeValue(key: string): void {
-    this.db.prepare("delete from global_runtime where key = ?").run(key);
+    this.runtimeState.delete(key);
   }
 
   resolvePendingAction(actionId: string, status: "resolved" | "expired" | "cancelled" | "orphaned"): void {
@@ -578,14 +620,7 @@ export class Store {
   }
 
   consumeRoutingCompose(chatId: number, userId: number): RoutingCompose | undefined {
-    const transaction = this.db.transaction(() => {
-      const row = this.db.prepare(
-        "select * from routing_composes where chat_id = ? and user_id = ? and expires_at > ?"
-      ).get(chatId, userId, Date.now()) as Row | undefined;
-      this.db.prepare("delete from routing_composes where chat_id = ? and user_id = ?").run(chatId, userId);
-      return row ? mapRoutingCompose(row) : undefined;
-    });
-    return transaction();
+    return this.interactions.consumeCompose(chatId, userId);
   }
 
   setStickyRoute(chatId: number, userId: number, sessionId: string): void {
@@ -606,33 +641,23 @@ export class Store {
   }
 
   rememberSessionChat(sessionId: string, chatId: number): void {
-    this.db.prepare(
-      `insert into session_chats (session_id, chat_id, updated_at) values (?, ?, ?)
-       on conflict(session_id, chat_id) do update set updated_at=excluded.updated_at`
-    ).run(sessionId, chatId, Date.now());
+    this.threads.rememberChat(sessionId, chatId);
   }
 
   listSessionChats(sessionId: string): number[] {
-    return (this.db.prepare("select chat_id from session_chats where session_id = ? order by updated_at desc")
-      .all(sessionId) as Array<{ chat_id: number }>).map((row) => row.chat_id);
+    return this.threads.listChats(sessionId);
   }
 
   setMessageThread(chatId: number, messageId: number, sessionId: string): void {
-    this.db.prepare(
-      `insert into telegram_thread_messages (chat_id, message_id, session_id, created_at) values (?, ?, ?, ?)
-       on conflict(chat_id, message_id) do update set session_id=excluded.session_id, created_at=excluded.created_at`
-    ).run(chatId, messageId, sessionId, Date.now());
+    this.threads.setMessageThread(chatId, messageId, sessionId);
   }
 
   getMessageThread(chatId: number, messageId: number): string | undefined {
-    const row = this.db.prepare("select session_id from telegram_thread_messages where chat_id = ? and message_id = ?")
-      .get(chatId, messageId) as { session_id: string } | undefined;
-    return row?.session_id;
+    return this.threads.messageThread(chatId, messageId);
   }
 
   getSessionResourceVersion(sessionId: string): number | undefined {
-    const thread = this.db.prepare("select updated_at from codex_threads where id = ?").get(sessionId) as { updated_at: number } | undefined;
-    return thread?.updated_at;
+    return this.threads.resourceVersion(sessionId);
   }
 
   putInteractionDraft(draft: InteractionDraft): void {
@@ -688,52 +713,27 @@ export class Store {
     payload: OutboxMessage["payload"],
     actionId?: string
   ): void {
-    this.db.prepare(
-      `insert into notification_outbox
-        (event_key, chat_id, action_id, payload_json, status, attempts, next_attempt_at, created_at, updated_at)
-       values (?, ?, ?, ?, 'pending', 0, ?, ?, ?)
-       on conflict(event_key, chat_id) do nothing`
-    ).run(eventKey, chatId, actionId ?? null, JSON.stringify(payload), Date.now(), Date.now(), Date.now());
+    this.notifications.enqueue(eventKey, chatId, payload, actionId);
   }
 
   dueOutbox(limit = 20): OutboxMessage[] {
-    const rows = this.db
-      .prepare(
-        `select * from notification_outbox
-         where status = 'pending' and next_attempt_at <= ?
-         order by id limit ?`
-      )
-      .all(Date.now(), limit) as Row[];
-    return rows.map(mapOutboxMessage);
+    return this.notifications.due(limit);
   }
 
   markOutboxSent(id: number): void {
-    this.db.prepare("update notification_outbox set status = 'sent', updated_at = ? where id = ?").run(Date.now(), id);
+    this.notifications.markSent(id);
   }
 
   retryOutbox(id: number, attempts: number, error: string): void {
-    const status = attempts >= 20 ? "failed" : "pending";
-    const delay = Math.min(300_000, 1_000 * 2 ** Math.min(attempts, 8));
-    this.db.prepare(
-      "update notification_outbox set status = ?, attempts = ?, next_attempt_at = ?, last_error = ?, updated_at = ? where id = ?"
-    ).run(status, attempts, Date.now() + delay, error.slice(0, 1000), Date.now(), id);
+    this.notifications.retry(id, attempts, error);
   }
 
   outboxCounts(): { pending: number; failed: number } {
-    const rows = this.db
-      .prepare("select status, count(*) as count from notification_outbox where status in ('pending', 'failed') group by status")
-      .all() as Array<{ status: string; count: number }>;
-    return {
-      pending: Number(rows.find((row) => row.status === "pending")?.count ?? 0),
-      failed: Number(rows.find((row) => row.status === "failed")?.count ?? 0)
-    };
+    return this.notifications.counts();
   }
 
   retryFailedOutbox(): number {
-    const result = this.db
-      .prepare("update notification_outbox set status = 'pending', attempts = 0, next_attempt_at = ?, updated_at = ? where status = 'failed'")
-      .run(Date.now(), Date.now());
-    return result.changes;
+    return this.notifications.retryFailed();
   }
 
   setTelegramMessage(actionId: string, chatId: number, messageId: number): void {
@@ -752,47 +752,87 @@ export class Store {
   }
 
   appendLog(entry: Omit<LogEntry, "id" | "timestamp"> & { timestamp?: number }): void {
-    this.db
-      .prepare(
-        `insert into event_log (session_id, timestamp, type, severity, text, payload_json)
-         values (?, ?, ?, ?, ?, ?)`
-      )
-      .run(
-        entry.sessionId,
-        entry.timestamp ?? Date.now(),
-        entry.type,
-        entry.severity,
-        entry.text,
-        entry.payload === undefined ? null : JSON.stringify(entry.payload)
-      );
+    this.transcripts.appendLog(entry);
   }
 
   recentLogs(sessionId: string, limit: number): LogEntry[] {
-    const rows = this.db
-      .prepare("select * from event_log where session_id = ? order by id desc limit ?")
-      .all(sessionId, limit) as Row[];
-    return rows.reverse().map(mapLog);
+    return this.transcripts.recentLogs(sessionId, limit);
   }
 
   appendTranscript(sessionId: string, text: string, metadata?: unknown): void {
-    this.db
-      .prepare(
-        `insert into transcript_chunks (session_id, timestamp, text, metadata_json)
-         values (?, ?, ?, ?)`
-      )
-      .run(sessionId, Date.now(), text, metadata === undefined ? null : JSON.stringify(metadata));
+    this.transcripts.append(sessionId, text, metadata);
+  }
+
+  finalizeTranscriptTurn(sessionId: string, turnId: string): number {
+    return this.transcripts.finalizeTurn(sessionId, turnId);
   }
 
   getTranscript(sessionId: string): string {
-    const rows = this.db
-      .prepare("select timestamp, text from transcript_chunks where session_id = ? order by id asc")
-      .all(sessionId) as Array<{ timestamp: number; text: string }>;
-    return rows
-      .map((row) => {
-        const ts = new Date(Number(row.timestamp)).toISOString();
-        return `[${ts}]\n${String(row.text).trim()}`;
-      })
-      .join("\n\n");
+    return this.transcripts.text(sessionId);
+  }
+
+  transcriptChunkCount(sessionId: string): number {
+    return this.transcripts.chunkCount(sessionId);
+  }
+
+  diagnostics(databaseWarningBytes = 256 * 1024 * 1024, walWarningBytes = 64 * 1024 * 1024): StorageDiagnostics {
+    const pageCount = Number(this.db.pragma("page_count", { simple: true }));
+    const pageSize = Number(this.db.pragma("page_size", { simple: true }));
+    const freelistPages = Number(this.db.pragma("freelist_count", { simple: true }));
+    const databaseBytes = this.path === ":memory:" ? pageCount * pageSize : fileSize(this.path);
+    const walBytes = this.path === ":memory:" ? 0 : fileSize(`${this.path}-wal`);
+    const warnings: string[] = [];
+    if (databaseBytes > databaseWarningBytes) warnings.push(`database is ${formatBytes(databaseBytes)}`);
+    if (walBytes > walWarningBytes) warnings.push(`WAL is ${formatBytes(walBytes)}; run maintenance/checkpoint`);
+    return { schemaVersion: schemaVersion(this.db), databaseBytes, walBytes, pageCount, freelistPages, warnings };
+  }
+
+  checkpoint(mode: "PASSIVE" | "RESTART" | "TRUNCATE" = "TRUNCATE"): void {
+    this.db.pragma(`wal_checkpoint(${mode})`);
+  }
+
+  maintain(policy: MaintenancePolicy = {}): MaintenanceResult {
+    const now = policy.now ?? Date.now();
+    const callbackCutoff = now - (policy.consumedCallbackRetentionMs ?? 24 * 60 * 60 * 1000);
+    const interactionCutoff = now - (policy.completedInteractionRetentionMs ?? 7 * 24 * 60 * 60 * 1000);
+    const outboxCutoff = now - (policy.sentOutboxRetentionMs ?? 7 * 24 * 60 * 60 * 1000);
+    const logCutoff = now - (policy.logRetentionMs ?? 30 * 24 * 60 * 60 * 1000);
+    return this.db.transaction(() => {
+      const callbackTokens = this.db.prepare(
+        `delete from callback_tokens
+         where (expires_at < ? or (consumed_at is not null and consumed_at < ?))
+         and action_id not in (select id from pending_actions where status in ('pending', 'submitting', 'failed'))`
+      ).run(now, callbackCutoff).changes;
+      const interactionDrafts = this.db.prepare(
+        `delete from interaction_drafts where action_id in
+          (select id from pending_actions where status not in ('pending', 'submitting', 'failed') and coalesce(resolved_at, created_at) < ?)`
+      ).run(interactionCutoff).changes;
+      const sentOutbox = this.db.prepare(
+        "delete from notification_outbox where status = 'sent' and updated_at < ?"
+      ).run(outboxCutoff).changes;
+      const logs = this.db.prepare("delete from event_log where timestamp < ?").run(logCutoff).changes;
+      this.db.prepare(
+        `delete from callback_tokens where action_id in
+          (select id from pending_actions where status not in ('pending', 'submitting', 'failed')
+           and coalesce(resolved_at, created_at) < ?
+           and id not in (select action_id from notification_outbox where action_id is not null and status != 'sent'))`
+      ).run(interactionCutoff);
+      this.db.prepare(
+        `delete from action_messages where action_id in
+          (select id from pending_actions where status not in ('pending', 'submitting', 'failed')
+           and coalesce(resolved_at, created_at) < ?
+           and id not in (select action_id from notification_outbox where action_id is not null and status != 'sent'))`
+      ).run(interactionCutoff);
+      const actions = this.db.prepare(
+        `delete from pending_actions where status not in ('pending', 'submitting', 'failed')
+         and coalesce(resolved_at, created_at) < ?
+         and id not in (select action_id from notification_outbox where action_id is not null and status != 'sent')`
+      ).run(interactionCutoff).changes;
+      const transcripts = policy.transcriptRetentionMs === undefined ? 0 : this.db.prepare(
+        "delete from transcript_chunks where timestamp < ? and finalized_at is not null"
+      ).run(now - policy.transcriptRetentionMs).changes;
+      return { callbackTokens, interactionDrafts, sentOutbox, logs, actions, transcripts };
+    })();
   }
 
   grantSession(actionId: string, sessionId: string, payload: unknown, expiresAt: number): void {
@@ -805,244 +845,7 @@ export class Store {
   }
 
   private migrate(): void {
-    this.db.exec(`
-      create table if not exists sessions (
-        id text primary key,
-        adapter text not null,
-        label text not null,
-        cwd text,
-        codex_thread_id text,
-        connection_generation integer,
-        tmux_target text,
-        status text not null,
-        paused integer not null default 0,
-        active_turn_id text,
-        attach_status text,
-        submit_strategy text,
-        last_probe text,
-        last_probe_at integer,
-        created_at integer not null,
-        updated_at integer not null
-      );
-
-      create table if not exists legacy_tmux_attachments (
-        id text primary key,
-        target text not null,
-        label text not null,
-        cwd text,
-        chat_id integer not null,
-        status text not null,
-        input_status text not null,
-        submit_strategy text not null,
-        last_probe text,
-        last_probe_at integer,
-        created_at integer not null,
-        updated_at integer not null
-      );
-
-      create table if not exists codex_threads (
-        id text primary key,
-        codex_thread_id text not null unique,
-        label text not null,
-        cwd text,
-        lifecycle_status text not null default 'available',
-        paused integer not null default 0,
-        created_at integer not null,
-        updated_at integer not null
-      );
-
-      create table if not exists appserver_attachments (
-        thread_id text primary key,
-        status text not null,
-        connection_generation integer,
-        attached_at integer not null,
-        updated_at integer not null
-      );
-
-      create table if not exists active_turns (
-        thread_id text primary key,
-        codex_turn_id text not null,
-        status text not null,
-        started_at integer not null,
-        updated_at integer not null
-      );
-
-      create table if not exists pending_actions (
-        id text primary key,
-        kind text not null,
-        session_id text not null,
-        request_id text,
-        request_id_type text,
-        connection_generation integer,
-        thread_id text,
-        turn_id text,
-        item_id text,
-        title text not null,
-        body text not null,
-        payload_json text not null,
-        nonce text not null,
-        status text not null,
-        expires_at integer not null,
-        created_at integer not null,
-        resolved_at integer,
-        telegram_chat_id integer,
-        telegram_message_id integer,
-        failure_reason text
-      );
-
-      create table if not exists event_log (
-        id integer primary key autoincrement,
-        session_id text not null,
-        timestamp integer not null,
-        type text not null,
-        severity text not null,
-        text text not null,
-        payload_json text
-      );
-
-      create table if not exists session_grants (
-        id integer primary key autoincrement,
-        action_id text not null,
-        session_id text not null,
-        payload_json text not null,
-        expires_at integer not null,
-        created_at integer not null,
-        revoked integer not null default 0
-      );
-
-      create table if not exists transcript_chunks (
-        id integer primary key autoincrement,
-        session_id text not null,
-        timestamp integer not null,
-        text text not null,
-        metadata_json text
-      );
-
-      create table if not exists token_usage (
-        session_id text primary key,
-        updated_at integer not null,
-        total_tokens integer not null,
-        input_tokens integer not null,
-        cached_input_tokens integer not null,
-        output_tokens integer not null,
-        reasoning_output_tokens integer not null,
-        last_total_tokens integer not null,
-        last_input_tokens integer not null,
-        last_cached_input_tokens integer not null,
-        last_output_tokens integer not null,
-        last_reasoning_output_tokens integer not null,
-        model_context_window integer
-      );
-
-      create table if not exists callback_tokens (
-        token text primary key,
-        action_id text not null,
-        chat_id integer not null,
-        user_id integer,
-        operation text not null,
-        payload_json text not null,
-        expires_at integer not null,
-        created_at integer not null,
-        claim_id text,
-        claimed_at integer,
-        consumed_at integer
-      );
-
-      create table if not exists routing_composes (
-        chat_id integer not null,
-        user_id integer not null,
-        session_id text not null,
-        expected_version integer not null,
-        expires_at integer not null,
-        created_at integer not null,
-        primary key (chat_id, user_id)
-      );
-
-      create table if not exists sticky_routes (
-        chat_id integer not null,
-        user_id integer not null,
-        session_id text not null,
-        updated_at integer not null,
-        primary key (chat_id, user_id)
-      );
-
-      create table if not exists session_chats (
-        session_id text not null,
-        chat_id integer not null,
-        updated_at integer not null,
-        primary key (session_id, chat_id)
-      );
-
-      create table if not exists telegram_thread_messages (
-        chat_id integer not null,
-        message_id integer not null,
-        session_id text not null,
-        created_at integer not null,
-        primary key (chat_id, message_id)
-      );
-
-      create table if not exists interaction_drafts (
-        action_id text not null,
-        chat_id integer not null,
-        user_id integer not null,
-        question_index integer not null,
-        answers_json text not null,
-        awaiting_text integer not null,
-        updated_at integer not null,
-        primary key (action_id, chat_id, user_id)
-      );
-
-      create table if not exists notification_outbox (
-        id integer primary key autoincrement,
-        event_key text not null,
-        chat_id integer not null,
-        action_id text,
-        payload_json text not null,
-        status text not null,
-        attempts integer not null,
-        next_attempt_at integer not null,
-        last_error text,
-        created_at integer not null,
-        updated_at integer not null,
-        unique(event_key, chat_id)
-      );
-
-      create table if not exists session_runtime (
-        session_id text primary key,
-        progress_json text,
-        diff_text text,
-        goal_json text,
-        updated_at integer not null
-      );
-
-      create table if not exists global_runtime (
-        key text primary key,
-        value_json text not null,
-        updated_at integer not null
-      );
-
-      create table if not exists action_messages (
-        action_id text not null,
-        chat_id integer not null,
-        message_id integer not null,
-        primary key (action_id, chat_id)
-      );
-    `);
-    this.addColumnIfMissing("sessions", "attach_status", "text");
-    this.addColumnIfMissing("sessions", "submit_strategy", "text");
-    this.addColumnIfMissing("sessions", "last_probe", "text");
-    this.addColumnIfMissing("sessions", "last_probe_at", "integer");
-    this.addColumnIfMissing("pending_actions", "request_id_type", "text");
-    this.addColumnIfMissing("pending_actions", "connection_generation", "integer");
-    this.addColumnIfMissing("pending_actions", "failure_reason", "text");
-    this.addColumnIfMissing("callback_tokens", "user_id", "integer");
-    this.addColumnIfMissing("callback_tokens", "claim_id", "text");
-    this.addColumnIfMissing("callback_tokens", "claimed_at", "integer");
-    this.addColumnIfMissing("sessions", "connection_generation", "integer");
-    this.migrateLegacyAppServerSessions();
-    this.migrateLegacyTmuxSessions();
-    this.db.exec("drop table sessions");
-    this.reconcilePersistedAppServerRuntime();
+    migrateDatabase(this.db);
   }
 
   private upsertCodexThread(session: SessionRef, status: SessionStatus): StoredSession {
@@ -1082,146 +885,12 @@ export class Store {
     return this.db.prepare(`${CODEX_THREAD_SELECT} where t.id = ?`).get(sessionId) as Row | undefined;
   }
 
-  private migrateLegacyAppServerSessions(): void {
-    const legacyRows = this.db.prepare(
-      `select * from sessions
-       where adapter = 'appserver' and codex_thread_id is not null
-       order by codex_thread_id, updated_at desc, id desc`
-    ).all() as Row[];
-    if (legacyRows.length === 0) return;
-
-    const groups = new Map<string, Row[]>();
-    for (const row of legacyRows) {
-      const threadId = String(row.codex_thread_id);
-      const group = groups.get(threadId) ?? [];
-      group.push(row);
-      groups.set(threadId, group);
-    }
-
-    const transaction = this.db.transaction(() => {
-      for (const [codexThreadId, rows] of groups) {
-        const canonical = rows[0]!;
-        const normalized = this.db.prepare("select id from codex_threads where codex_thread_id = ?").get(codexThreadId) as { id: string } | undefined;
-        const canonicalId = normalized?.id ?? String(canonical.id);
-        const ids = rows.map((row) => String(row.id));
-        const stateIds = ids.includes(canonicalId) ? ids : [...ids, canonicalId];
-        const marks = ids.map(() => "?").join(", ");
-        const createdAt = Math.min(...rows.map((row) => Number(row.created_at)));
-        const updatedAt = Math.max(...rows.map((row) => Number(row.updated_at)));
-
-        this.db.prepare(
-          `insert into codex_threads (id, codex_thread_id, label, cwd, lifecycle_status, paused, created_at, updated_at)
-           values (?, ?, ?, ?, 'available', ?, ?, ?)
-           on conflict(codex_thread_id) do nothing`
-        ).run(
-          canonicalId,
-          codexThreadId,
-          String(canonical.label),
-          canonical.cwd == null ? null : String(canonical.cwd),
-          Number(canonical.paused) === 1 ? 1 : 0,
-          createdAt,
-          updatedAt
-        );
-
-        this.mergeTokenUsage(stateIds, canonicalId);
-        this.mergeSessionRuntime(stateIds, canonicalId);
-        for (const table of ["pending_actions", "event_log", "transcript_chunks", "session_grants"]) {
-          this.db.prepare(`update ${table} set session_id = ? where session_id in (${marks})`).run(canonicalId, ...ids);
-        }
-
-        const lastActive = this.getRuntimeValue<string>("last_active_session_id");
-        if (lastActive && ids.includes(lastActive)) this.setRuntimeValue("last_active_session_id", canonicalId);
-        this.db.prepare(`delete from sessions where id in (${marks})`).run(...ids);
-      }
-    });
-    transaction();
-  }
-
-  private migrateLegacyTmuxSessions(): void {
-    const rows = this.db.prepare("select * from sessions where adapter = 'pty'").all() as Row[];
-    if (rows.length === 0) return;
-    const transaction = this.db.transaction(() => {
-      for (const row of rows) {
-        if (row.tmux_target) {
-          this.db.prepare(
-            `insert into legacy_tmux_attachments
-              (id, target, label, cwd, chat_id, status, input_status, submit_strategy, last_probe, last_probe_at, created_at, updated_at)
-             values (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)
-             on conflict(id) do nothing`
-          ).run(
-            String(row.id),
-            String(row.tmux_target),
-            String(row.label),
-            row.cwd ?? null,
-            row.status === "stopped" ? "stale" : "attached",
-            row.attach_status ?? "unknown",
-            row.submit_strategy ?? "enter",
-            row.last_probe ?? null,
-            row.last_probe_at ?? null,
-            Number(row.created_at),
-            Number(row.updated_at)
-          );
-        }
-      }
-      this.db.prepare("delete from sessions where adapter = 'pty'").run();
-    });
-    transaction();
-  }
-
   private reconcilePersistedAppServerRuntime(): void {
     const now = Date.now();
     this.db.prepare("delete from active_turns").run();
     this.db.prepare(
       "update appserver_attachments set status = 'detached', connection_generation = null, updated_at = ? where status != 'detached' or connection_generation is not null"
     ).run(now);
-  }
-
-  private mergeTokenUsage(sessionIds: string[], canonicalId: string): void {
-    const marks = sessionIds.map(() => "?").join(", ");
-    const rows = this.db.prepare(`select * from token_usage where session_id in (${marks}) order by updated_at desc, session_id desc`).all(...sessionIds) as Row[];
-    if (rows.length === 0) return;
-    const newest = rows[0]!;
-    this.db.prepare(`delete from token_usage where session_id in (${marks})`).run(...sessionIds);
-    this.db.prepare(
-      `insert into token_usage
-        (session_id, updated_at, total_tokens, input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens,
-         last_total_tokens, last_input_tokens, last_cached_input_tokens, last_output_tokens, last_reasoning_output_tokens,
-         model_context_window)
-       values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    ).run(
-      canonicalId,
-      newest.updated_at,
-      newest.total_tokens,
-      newest.input_tokens,
-      newest.cached_input_tokens,
-      newest.output_tokens,
-      newest.reasoning_output_tokens,
-      newest.last_total_tokens,
-      newest.last_input_tokens,
-      newest.last_cached_input_tokens,
-      newest.last_output_tokens,
-      newest.last_reasoning_output_tokens,
-      newest.model_context_window ?? null
-    );
-  }
-
-  private mergeSessionRuntime(sessionIds: string[], canonicalId: string): void {
-    const marks = sessionIds.map(() => "?").join(", ");
-    const rows = this.db.prepare(`select * from session_runtime where session_id in (${marks}) order by updated_at desc, session_id desc`).all(...sessionIds) as Row[];
-    if (rows.length === 0) return;
-    const newestValue = (column: string): unknown => rows.find((row) => row[column] != null)?.[column] ?? null;
-    const updatedAt = Math.max(...rows.map((row) => Number(row.updated_at)));
-    this.db.prepare(`delete from session_runtime where session_id in (${marks})`).run(...sessionIds);
-    this.db.prepare(
-      "insert into session_runtime (session_id, progress_json, diff_text, goal_json, updated_at) values (?, ?, ?, ?, ?)"
-    ).run(canonicalId, newestValue("progress_json"), newestValue("diff_text"), newestValue("goal_json"), updatedAt);
-  }
-
-  private addColumnIfMissing(table: string, column: string, type: string): void {
-    const columns = this.db.prepare(`pragma table_info(${table})`).all() as Array<{ name: string }>;
-    if (!columns.some((item) => item.name === column)) {
-      this.db.exec(`alter table ${table} add column ${column} ${type}`);
-    }
   }
 
   private upsertRuntimeState(sessionId: string, column: "progress_json" | "diff_text" | "goal_json", value: string | null): void {
@@ -1261,6 +930,14 @@ function mapCodexThread(row: Row): StoredSession {
   if (row.codex_turn_id) session.activeTurnId = String(row.codex_turn_id);
   if (row.connection_generation != null) session.connectionGeneration = Number(row.connection_generation);
   return session;
+}
+
+function fileSize(path: string): number {
+  return existsSync(path) ? statSync(path).size : 0;
+}
+
+function formatBytes(bytes: number): string {
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
 }
 
 function isSessionStatus(value: string): value is SessionStatus {
@@ -1323,16 +1000,6 @@ function mapCallbackToken(row: Row): CallbackToken {
   return token;
 }
 
-function mapRoutingCompose(row: Row): RoutingCompose {
-  return {
-    chatId: Number(row.chat_id),
-    userId: Number(row.user_id),
-    sessionId: String(row.session_id),
-    expectedVersion: Number(row.expected_version),
-    expiresAt: Number(row.expires_at)
-  };
-}
-
 function mapInteractionDraft(row: Row): InteractionDraft {
   return {
     actionId: String(row.action_id),
@@ -1341,31 +1008,6 @@ function mapInteractionDraft(row: Row): InteractionDraft {
     questionIndex: Number(row.question_index),
     answers: JSON.parse(String(row.answers_json)) as Record<string, { answers: string[] }>,
     awaitingText: Number(row.awaiting_text) === 1
-  };
-}
-
-function mapOutboxMessage(row: Row): OutboxMessage {
-  const message: OutboxMessage = {
-    id: Number(row.id),
-    eventKey: String(row.event_key),
-    chatId: Number(row.chat_id),
-    payload: JSON.parse(String(row.payload_json)) as OutboxMessage["payload"],
-    attempts: Number(row.attempts)
-  };
-  if (row.action_id) message.actionId = String(row.action_id);
-  return message;
-}
-
-function mapLog(row: Row): LogEntry {
-  const payloadJson = row.payload_json ? String(row.payload_json) : undefined;
-  return {
-    id: Number(row.id),
-    sessionId: String(row.session_id),
-    timestamp: Number(row.timestamp),
-    type: String(row.type),
-    severity: row.severity as LogEntry["severity"],
-    text: String(row.text),
-    payload: payloadJson ? JSON.parse(payloadJson) : undefined
   };
 }
 

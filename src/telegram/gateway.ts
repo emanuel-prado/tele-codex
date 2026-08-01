@@ -61,6 +61,7 @@ export class TelegramGateway {
   private actionSweepPromise?: Promise<void>;
   private pollingStopPromise?: Promise<void>;
   private drainingOutbox = false;
+  private nextMaintenanceAt = 0;
 
   constructor(
     private readonly config: AppConfig,
@@ -218,6 +219,11 @@ export class TelegramGateway {
   private async runActionSweeper(signal: AbortSignal): Promise<void> {
     while (!signal.aborted) {
       await this.sessions.expirePendingActions();
+      if (Date.now() >= this.nextMaintenanceAt) {
+        this.store.maintain();
+        this.store.checkpoint("PASSIVE");
+        this.nextMaintenanceAt = Date.now() + 60 * 60 * 1000;
+      }
       this.health.heartbeat("action-sweeper");
       await waitForWorkerTick(signal, 1_000);
     }
@@ -508,7 +514,8 @@ export class TelegramGateway {
         session: active ? `${active.status} (${active.label})` : "none active",
         pending: this.store.listPendingActions().length,
         queued: outbox.pending,
-        failed: outbox.failed
+        failed: outbox.failed,
+        storage: this.store.diagnostics()
       }));
     });
 
@@ -1254,6 +1261,10 @@ export class TelegramGateway {
       return;
     }
 
+    if (event.type === "taskCompleted" && event.turnId) {
+      this.store.finalizeTranscriptTurn(event.sessionId, event.turnId);
+    }
+
     if (event.type === "actionResolved") {
       await this.finalizeActionMessages(event.actionId, "Codex confirmed the response.");
       return;
@@ -1439,14 +1450,15 @@ export class TelegramGateway {
 
 function formatRuntimeHealth(
   snapshot: ReturnType<RuntimeHealth["snapshot"]> | undefined,
-  counts: { session: string; pending: number; queued: number; failed: number }
+  counts: { session: string; pending: number; queued: number; failed: number; storage: ReturnType<Store["diagnostics"]> }
 ): string {
   if (!snapshot) {
     return [
       "tele-codex health: unavailable",
       `session: ${counts.session}`,
       `pending interactions: ${counts.pending}`,
-      `delivery queue: ${counts.queued} pending, ${counts.failed} failed`
+      `delivery queue: ${counts.queued} pending, ${counts.failed} failed`,
+      storageHealth(counts.storage)
     ].join("\n");
   }
   const app = snapshot.appServer;
@@ -1463,10 +1475,17 @@ function formatRuntimeHealth(
     `session: ${counts.session}`,
     `pending interactions: ${counts.pending}`,
     `delivery queue: ${counts.queued} pending, ${counts.failed} failed`,
+    storageHealth(counts.storage),
     snapshot.lastFatal
       ? `last fatal: ${snapshot.lastFatal.subsystem} (${snapshot.lastFatal.correlationId}) at ${formatHealthTime(snapshot.lastFatal.at)}`
       : "last fatal: none"
   ].join("\n");
+}
+
+function storageHealth(storage: ReturnType<Store["diagnostics"]>): string {
+  const size = (bytes: number) => `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+  return `storage: schema v${storage.schemaVersion}, database ${size(storage.databaseBytes)}, WAL ${size(storage.walBytes)}` +
+    (storage.warnings.length > 0 ? `; WARN ${storage.warnings.join("; ")}` : "");
 }
 
 function formatHealthTime(value?: number): string {

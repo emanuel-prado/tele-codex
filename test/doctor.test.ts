@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { describe, expect, it } from "vitest";
 import { formatDoctorReport, runDoctor } from "../src/runtime/doctor.js";
 import type { AppConfig } from "../src/config.js";
+import { Store } from "../src/store/store.js";
 
 describe("doctor", () => {
   it("reports healthy required checks and warns for missing optional tmux", async () => {
@@ -34,6 +35,20 @@ describe("doctor", () => {
 
     expect(report.ok).toBe(false);
     expect(report.checks.find((check) => check.name === "Codex CLI")?.status).toBe("fail");
+  });
+
+  it("reports the numbered schema version and database/WAL sizes", async () => {
+    const root = await mkdtemp(join(tmpdir(), "tele-codex-doctor-workspace-"));
+    const dbDir = await mkdtemp(join(tmpdir(), "tele-codex-doctor-db-"));
+    const path = join(dbDir, "db.sqlite");
+    new Store(path).close();
+    const report = await runDoctor(config(root, path), {
+      runCommand: async () => ({ stdout: "ok\n", stderr: "" }),
+      serviceStatus: healthyService
+    });
+
+    expect(report.checks.find((check) => check.name === "Database integrity")?.detail)
+      .toMatch(/^schema v4, database .* MiB, WAL .* MiB$/);
   });
 });
 
