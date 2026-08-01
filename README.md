@@ -106,6 +106,7 @@ Core:
 - `/send <thread-alias-or-id> <message>` sends directly to one thread.
 - Replying to a tele-codex agent message routes the reply to the thread that produced it.
 - `/use <thread-alias-or-id>` enables explicit sticky routing for that chat and user; `/use off` disables it.
+- `/attach appserver <threadId>` attaches a specific Codex thread. Use `/tmux` for the separate legacy fallback.
 - Other plain text is not forwarded and explains how to choose a destination.
 
 App-server controls:
@@ -130,6 +131,7 @@ Session utilities:
 - `/usage` shows the latest token usage reported by app-server.
 - `/doctor` runs local setup health checks.
 - `/health` shows overall lifecycle health, every critical worker, app-server transport/PID/generation/reconnect state, Telegram activity, delivery results, and the last fatal correlation ID.
+- `/retrydelivery` requeues failed high-signal notifications.
 - `/pending` lists unresolved questions and approvals across sessions.
 - `/search <term>` searches previous Codex sessions.
 - `/limits` shows current account limits.
@@ -139,6 +141,7 @@ Session utilities:
 - `/transcript` exports the active session transcript.
 - `/pause` and `/unpause` toggle Telegram input forwarding.
 - `/kill` interrupts the active turn after confirmation; it does not delete or detach the durable thread.
+- `/help` lists the commands supported by the running bot. Unknown commands return this guidance instead of failing silently.
 
 Legacy tmux fallback:
 
