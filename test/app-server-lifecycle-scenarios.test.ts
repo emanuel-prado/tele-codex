@@ -134,7 +134,7 @@ async function takeEvents(source: AsyncIterable<CodexEvent>, count: number): Pro
 
 function config(): AppConfig {
   return {
-    botToken: "token", allowedUserIds: new Set([1]), allowedChatIds: new Set([1]), dbPath: ":memory:", logLevel: "silent",
+    botToken: "token", controllerUserId: 1, allowedChatIds: new Set([1]), dbPath: ":memory:", logLevel: "silent",
     approvalTimeoutMs: 60_000, rpcTimeoutMs: 100, appServerMaxReconnectAttempts: 3, rateLimitWarnPercent: 80,
     allowSessionGrants: true, codexCommand: "codex", tmuxSubmitKey: "enter", tmuxPasteSettleMs: 0, workspaceRoot: "/tmp"
   };

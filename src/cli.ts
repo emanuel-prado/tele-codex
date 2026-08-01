@@ -8,7 +8,7 @@ import { TelegramGateway } from "./telegram/gateway.js";
 import { createLogger } from "./runtime/logger.js";
 import { SessionManager } from "./runtime/session-manager.js";
 import { loadDotEnv } from "./runtime/dotenv.js";
-import { formatDoctorReport, runDoctor } from "./runtime/doctor.js";
+import { formatDoctorReport, runDoctorFromEnv } from "./runtime/doctor.js";
 import { ServiceManager } from "./runtime/service-manager.js";
 import { RuntimeHealth } from "./runtime/health.js";
 import { RuntimeSupervisor, type SupervisedSubsystem } from "./runtime/supervisor.js";
@@ -20,13 +20,13 @@ async function main(): Promise<void> {
     await runServiceCommand(envFile);
     return;
   }
-  const config = loadConfig();
   if (process.argv[2] === "doctor") {
-    const report = await runDoctor(config);
+    const report = await runDoctorFromEnv(process.env);
     console.log(formatDoctorReport(report));
     process.exitCode = report.ok ? 0 : 1;
     return;
   }
+  const config = loadConfig();
   const logger = createLogger(config.logLevel);
   const store = new Store(config.dbPath);
   try {

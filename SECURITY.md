@@ -6,10 +6,10 @@
 
 - Run it locally.
 - Use Telegram long polling.
-- Restrict access with `TELE_CODEX_ALLOWED_USER_IDS`.
-- Add `TELE_CODEX_ALLOWED_CHAT_IDS` when possible.
+- Configure exactly one Controller with `TELE_CODEX_ALLOWED_USER_IDS`.
+- Leave `TELE_CODEX_ALLOWED_CHAT_IDS` empty to accept only the Controller's private chat, or explicitly list the group chats the Controller may use.
 - Treat Telegram bot chats as transport security, not end-to-end encryption. tele-codex refuses Codex questions marked secret.
-- Review session-scoped grants carefully; they increase the effect of a compromised Telegram account or device.
+- Keep session-level approvals disabled unless needed; they increase the effect of a compromised Telegram account or device.
 
 Do not expose it as a public webhook or shared multi-user bot without a separate security review.
 

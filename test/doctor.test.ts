@@ -1,8 +1,8 @@
-import { mkdtemp } from "node:fs/promises";
+import { access, mkdtemp } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, it } from "vitest";
-import { formatDoctorReport, runDoctor } from "../src/runtime/doctor.js";
+import { formatDoctorReport, runDoctor, runDoctorFromEnv } from "../src/runtime/doctor.js";
 import type { AppConfig } from "../src/config.js";
 import { Store } from "../src/store/store.js";
 
@@ -10,7 +10,9 @@ describe("doctor", () => {
   it("reports healthy required checks and warns for missing optional tmux", async () => {
     const root = await mkdtemp(join(tmpdir(), "tele-codex-doctor-workspace-"));
     const dbDir = await mkdtemp(join(tmpdir(), "tele-codex-doctor-db-"));
-    const report = await runDoctor(config(root, join(dbDir, "db.sqlite")), {
+    const dbPath = join(dbDir, "db.sqlite");
+    new Store(dbPath).close();
+    const report = await runDoctor(config(root, dbPath), {
       runCommand: async (command, args) => {
         if (command === "tmux") throw new Error("not found");
         return { stdout: args.includes("--version") ? "codex 1.0.0\n" : "app-server help\n", stderr: "" };
@@ -52,12 +54,24 @@ describe("doctor", () => {
     expect(report.checks.find((check) => check.name === "Database integrity")?.detail)
       .toMatch(/^schema v5, database .* MiB, WAL .* MiB$/);
   });
+
+  it("diagnoses missing configuration without creating runtime state", async () => {
+    const root = await mkdtemp(join(tmpdir(), "tele-codex-doctor-empty-"));
+    const dbPath = join(root, "missing", "db.sqlite");
+    const report = await runDoctorFromEnv({ TELE_CODEX_DB_PATH: dbPath });
+
+    expect(report.ok).toBe(false);
+    expect(report.checks.find((check) => check.name === "Telegram bot token")?.status).toBe("fail");
+    expect(report.checks.find((check) => check.name === "Controller")?.status).toBe("fail");
+    expect(formatDoctorReport(report)).toContain("skipped until configuration is valid");
+    await expect(access(dbPath)).rejects.toThrow();
+  });
 });
 
 function config(workspaceRoot: string, dbPath: string): AppConfig {
   return {
     botToken: "token",
-    allowedUserIds: new Set([1]),
+    controllerUserId: 1,
     allowedChatIds: new Set(),
     dbPath,
     logLevel: "info",
