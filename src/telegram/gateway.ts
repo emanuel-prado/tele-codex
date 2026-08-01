@@ -30,7 +30,7 @@ import {
   formatUsage,
   truncateMiddle
 } from "./format.js";
-import { LegacyTmuxBridge, type ProbeResult } from "../legacy/legacy-tmux-bridge.js";
+import { LegacyTmuxBridge, type LegacyCaptureResult, type ProbeResult } from "../legacy/legacy-tmux-bridge.js";
 import type { LegacyTmuxAttachment } from "../types/legacy-tmux.js";
 import { formatDoctorReport, runDoctor } from "../runtime/doctor.js";
 import { parseResumeCommand } from "./resume-command.js";
@@ -256,6 +256,7 @@ export class TelegramGateway {
           "/tmux - list panes for the legacy fallback",
           "/tmux attach <target> - attach a legacy tmux pane",
           "/tmux send <attachmentId> <text> - send through the legacy fallback",
+          "/tmux capture <attachmentId> - inspect only newly observed pane output",
           "/tmux test <attachmentId> - test legacy tmux input",
           "/tmux interrupt <attachmentId> - send Ctrl-C through tmux",
           "/log [n] - recent logs",
@@ -459,14 +460,18 @@ export class TelegramGateway {
         await this.sendProbeResult(ctx.chat.id, ctx.from!.id, await this.legacyTmux.probe(target, ctx.chat.id));
         return;
       }
+      if (action === "capture" && target) {
+        await ctx.reply(formatLegacyCapture(await this.legacyTmux.capture(target, ctx.chat.id)));
+        return;
+      }
       if (action === "interrupt" && target) {
         await this.legacyTmux.interrupt(target, ctx.chat.id);
-        await ctx.reply("Sent Ctrl-C through the legacy tmux fallback.");
+        await ctx.reply("Sent Ctrl-C to the externally managed tmux pane. The pane/process was not killed or taken over by tele-codex.");
         return;
       }
       const paneTarget = action === "attach" ? target : input;
       if (!paneTarget) {
-        await ctx.reply("Usage: /tmux attach <target> | send <attachmentId> <text> | test <attachmentId> | interrupt <attachmentId>");
+        await ctx.reply("Usage: /tmux attach <target> | send <attachmentId> <text> | capture <attachmentId> | test <attachmentId> | interrupt <attachmentId>");
         return;
       }
       const attachment = await this.legacyTmux.attach(paneTarget, ctx.chat.id);
@@ -1678,4 +1683,16 @@ function formatLegacyAttachments(attachments: LegacyTmuxAttachment[]): string {
     "",
     ...attachments.map((item) => `${item.id}\n${item.target} | ${item.status} | ${item.inputStatus}\n${item.label}`)
   ].join("\n\n");
+}
+
+function formatLegacyCapture(result: LegacyCaptureResult): string {
+  const heuristic = result.observations.find((item) => item.kind === "heuristic-interaction");
+  return [
+    `Legacy tmux capture: ${result.status}`,
+    result.detail,
+    heuristic
+      ? `\nHEURISTIC ${String(heuristic.confidence ?? "unknown").toUpperCase()}: ${heuristic.reason ?? "terminal text resembled an interaction"}\nInspect the local pane; no Approve/Deny action was created.`
+      : undefined,
+    result.newOutput ? `\nNew output:\n${result.newOutput.slice(-3000)}` : undefined
+  ].filter(Boolean).join("\n");
 }

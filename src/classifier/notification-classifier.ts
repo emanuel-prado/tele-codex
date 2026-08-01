@@ -1,23 +1,43 @@
-import type { PendingAction } from "../types/events.js";
-import { createId, createNonce, nowMs } from "../utils/ids.js";
+export type HeuristicConfidence = "high" | "medium" | "low";
 
-export interface ClassifierConfig {
-  approvalTimeoutMs: number;
+export interface HeuristicInteraction {
+  kind: "approval" | "question";
+  confidence: HeuristicConfidence;
+  reason: string;
+  prompt: string;
 }
 
 export class NotificationClassifier {
-  constructor(private readonly config: ClassifierConfig) {}
-
-  classifyPtyOutput(sessionId: string, text: string): PendingAction | undefined {
+  classifyLegacyOutput(text: string): HeuristicInteraction | undefined {
     const normalized = stripAnsi(text);
     if (!normalized.trim()) return undefined;
+    const prompt = summarize(normalized);
 
-    if (looksLikeApproval(normalized)) {
-      return this.pendingAction(sessionId, "commandApproval", "Codex approval required", summarize(normalized));
+    if (hasExplicitApprovalChoice(normalized)) {
+      return {
+        kind: "approval",
+        confidence: "high",
+        reason: "explicit approval language and an interactive allow/deny choice were observed",
+        prompt
+      };
     }
 
-    if (looksLikeQuestion(normalized)) {
-      return this.pendingAction(sessionId, "question", "Codex asked a question", summarize(normalized));
+    if (hasApprovalLanguage(normalized)) {
+      return {
+        kind: "approval",
+        confidence: "medium",
+        reason: "explicit approval language was observed without a reliable structured choice",
+        prompt
+      };
+    }
+
+    if (hasExplicitQuestionPrompt(normalized)) {
+      return {
+        kind: "question",
+        confidence: "medium",
+        reason: "an explicit Codex clarification/input marker was observed",
+        prompt
+      };
     }
 
     return undefined;
@@ -29,35 +49,22 @@ export class NotificationClassifier {
     return `${stripped.slice(0, maxChars - 80)}\n\n[truncated: ${stripped.length - maxChars + 80} chars omitted]`;
   }
 
-  private pendingAction(
-    sessionId: string,
-    kind: PendingAction["kind"],
-    title: string,
-    body: string
-  ): PendingAction {
-    return {
-      id: createId("action"),
-      kind,
-      sessionId,
-      title,
-      body,
-      payload: { source: "pty", body },
-      nonce: createNonce(),
-      expiresAt: nowMs() + this.config.approvalTimeoutMs
-    };
-  }
 }
 
 export function stripAnsi(value: string): string {
   return value.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
 }
 
-function looksLikeApproval(text: string): boolean {
-  return /approve\?|requires approval|do you want to allow|allow this command/i.test(text);
+function hasExplicitApprovalChoice(text: string): boolean {
+  return hasApprovalLanguage(text) && /(?:\[(?:y\/n|y\/N)\]|\((?:y\/n|y\/N)\)|\b(?:allow|approve)\b\s*[\/]\s*\b(?:deny|decline)\b)/i.test(text);
 }
 
-function looksLikeQuestion(text: string): boolean {
-  return /\?\s*$/.test(text.trim()) || /which .* should i|choose|requires clarification/i.test(text);
+function hasApprovalLanguage(text: string): boolean {
+  return /requires approval|do you want to allow (?:this )?(?:command|change|operation)|approve (?:this )?(?:command|change|operation)/i.test(text);
+}
+
+function hasExplicitQuestionPrompt(text: string): boolean {
+  return /(?:codex (?:asks|needs (?:your )?input)|requires clarification|input required)\s*:/i.test(text);
 }
 
 function summarize(text: string): string {

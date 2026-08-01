@@ -140,7 +140,8 @@ Legacy tmux fallback:
 - `/tmux list` lists this chat's separately persisted legacy attachments.
 - `/tmux test <attachmentId>` sends a heuristic probe and asks you to verify the pane locally.
 - `/tmux send <attachmentId> <text>` sends only after the attachment input was explicitly confirmed.
-- `/tmux interrupt <attachmentId>` sends Ctrl-C to the pane.
+- `/tmux capture <attachmentId>` inspects only newly observed bounded pane output. Heuristic interaction warnings never create normal Approve/Deny actions.
+- `/tmux interrupt <attachmentId>` sends Ctrl-C to the externally managed pane; it does not kill or take ownership of the pane/process.
 
 ## Security Model
 
@@ -185,7 +186,7 @@ App-server is the only Codex runtime because it exposes structured JSON-RPC even
 
 Token usage is captured from app-server `thread/tokenUsage/updated` notifications. `/usage`, `/status`, and `/panel` show the latest usage snapshot once Codex has reported one for the active thread.
 
-Legacy tmux is fallback-only. It has separate attachment identity, persistence, and Telegram commands. Terminal capture and submit-key behavior depend on the Codex TUI and local terminal stack, so the bridge returns previews and requires local confirmation rather than presenting parsed terminal state as authoritative app-server events.
+Legacy tmux is fallback-only. It has separate attachment identity, persistence, observations, and Telegram commands. Captures are bounded, track pane identity plus a durable last-seen boundary, and process only overlapping/new output; ambiguous redraws are skipped. Terminal interaction detection requires explicit markers, carries confidence/reason metadata, and only produces a warning to inspect the local pane. It never becomes an app-server approval, question, transcript, or log.
 
 ## Unattended Linux Operation
 
