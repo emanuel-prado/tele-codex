@@ -53,3 +53,14 @@ Run `npm run test:appserver` when the installed Codex app-server contract or ada
 Changes to routing, session lifecycle, persistence, approvals, retries, or Telegram commands require tests for happy paths, stale state, missing connections, timeouts, restarts, duplicate callbacks, and user-visible error reporting. Use fakes for Telegram, app-server, tmux, clocks, and process boundaries in the default test suite.
 
 Update `docs/technical-design.md` when adapter boundaries, session identity, persistence ownership, security policy, or unattended-operation guarantees change.
+
+## Agent skills
+
+Repository workflow context for planning and issue-management skills lives in:
+
+- `docs/agents/issue-tracker.md` for the canonical tracker and issue conventions.
+- `docs/agents/triage-labels.md` for the repository's triage state vocabulary.
+- `docs/agents/domain.md` for domain-document locations and ownership.
+
+Read those files before using `to-issues`, `to-prd`, `triage`, `diagnose`,
+`tdd`, `improve-codebase-architecture`, or `zoom-out` in this repository.
