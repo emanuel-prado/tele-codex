@@ -1,4 +1,4 @@
-import { Bot, InlineKeyboard, InputFile, type Context } from "grammy";
+import { InlineKeyboard, InputFile, type Context } from "grammy";
 import { stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -35,24 +35,24 @@ import type { LegacyTmuxAttachment } from "../types/legacy-tmux.js";
 import { formatDoctorReport, runDoctor } from "../runtime/doctor.js";
 import { parseResumeCommand } from "./resume-command.js";
 import { PendingInteractionManager, type InteractionView } from "./pending-interaction.js";
-import { createId, createNonce } from "../utils/ids.js";
+import { createId } from "../utils/ids.js";
 import { TelegramRouting } from "./routing.js";
+import { TelegramCallbackController } from "./callback-controller.js";
+import { TelegramPickerController } from "./picker-controller.js";
 import type { RuntimeHealth, RuntimeHealthReporter } from "../runtime/health.js";
 import { noopRuntimeHealth } from "../runtime/health.js";
 import type { SupervisedSubsystem } from "../runtime/supervisor.js";
-import { reportTelegramFailure, withPromptCallbackAck } from "./error-boundary.js";
+import { TelegramBotRuntime, type TelegramCommandDefinition } from "./bot-runtime.js";
 
 export class TelegramGateway {
-  private readonly bot: Bot;
+  private readonly runtime: TelegramBotRuntime;
+  private readonly bot: TelegramBotRuntime["bot"];
   private readonly runtimeId = createId("runtime");
   private readonly messageBuffers = new Map<string, { text: string; timer: NodeJS.Timeout }>();
-  private readonly projectSelections = new Map<string, WorkspaceProject>();
-  private readonly threadSelections = new Map<string, CodexThreadSummary>();
-  private readonly modelSelections = new Map<string, CodexModelSummary>();
-  private readonly processSelections = new Map<string, { sessionId: string; processId: string; command: string }>();
   private readonly interactions: PendingInteractionManager;
   private readonly routing: TelegramRouting;
-  private pollingPromise?: Promise<void>;
+  private readonly callbacks: TelegramCallbackController;
+  private readonly pickers: TelegramPickerController;
   private eventController?: AbortController;
   private eventPromise?: Promise<void>;
   private outboxController?: AbortController;
@@ -67,30 +67,21 @@ export class TelegramGateway {
     private readonly sessions: SessionManager,
     private readonly legacyTmux: LegacyTmuxBridge,
     private readonly store: Store,
-    private readonly policy: PolicyEngine,
+    policy: PolicyEngine,
     private readonly logger: Logger,
     private readonly health: RuntimeHealthReporter = noopRuntimeHealth
   ) {
-    this.bot = new Bot(config.botToken);
+    this.runtime = new TelegramBotRuntime(config.botToken, policy, health, logger);
+    this.bot = this.runtime.bot;
     this.interactions = new PendingInteractionManager(store, config.allowSessionGrants);
     this.routing = new TelegramRouting(store, sessions);
-    this.bot.use(async (ctx, next) => {
-      if (!this.policy.authorizeTelegramUser(ctx.from?.id, ctx.chat?.id)) {
-        this.logger.warn({ userId: ctx.from?.id, chatId: ctx.chat?.id }, "rejected unauthorized Telegram update");
-        return;
-      }
-      this.health.telegramUpdate();
-      await next();
-    });
-    this.bot.use((ctx, next) => withPromptCallbackAck(ctx, next, this.logger));
-    this.bot.catch(async (error) => {
-      await reportTelegramFailure(error.ctx, error.error, this.health, this.logger);
-    });
+    this.callbacks = new TelegramCallbackController(store);
+    this.pickers = new TelegramPickerController(config.workspaceRoot, store, sessions, this.callbacks);
     this.registerHandlers();
   }
 
   async startPolling(): Promise<void> {
-    await this.bot.api.setMyCommands([
+    const commands: TelegramCommandDefinition[] = [
       { command: "status", description: "Show active Codex session" },
       { command: "panel", description: "Show session control panel" },
       { command: "sessions", description: "List local sessions" },
@@ -128,22 +119,9 @@ export class TelegramGateway {
       { command: "unpause", description: "Resume Telegram input forwarding" },
       { command: "kill", description: "Interrupt active turn" },
       { command: "help", description: "Show help" }
-    ]);
+    ];
     await this.sendStartupPicker();
-    let ready!: () => void;
-    const started = new Promise<void>((resolve) => {
-      ready = resolve;
-    });
-    this.pollingPromise = this.bot.start({
-      allowed_updates: ["message", "callback_query"],
-      onStart: () => ready()
-    });
-    await Promise.race([
-      started,
-      this.pollingPromise.then(() => {
-        throw new Error("Telegram polling exited during startup.");
-      })
-    ]);
+    await this.runtime.start(commands);
   }
 
   runtimeSubsystems(): SupervisedSubsystem[] {
@@ -151,7 +129,7 @@ export class TelegramGateway {
       {
         name: "telegram-polling",
         start: () => this.startPolling(),
-        wait: () => this.pollingPromise ?? Promise.reject(new Error("Telegram polling was not started.")),
+        wait: () => this.runtime.wait(),
         stop: () => this.stopPolling()
       },
       {
@@ -224,7 +202,7 @@ export class TelegramGateway {
         this.health.deliveryFailure(error);
         this.logger.warn({ error }, "could not drain Telegram outbox during shutdown");
       }
-      if (this.bot.isRunning()) this.bot.stop();
+      this.runtime.stop();
     })();
     return this.pollingStopPromise;
   }
@@ -619,9 +597,8 @@ export class TelegramGateway {
       }
       const keyboard = new InlineKeyboard();
       const lines = processes.map((process, index) => {
-        const id = Math.random().toString(36).slice(2, 10);
-        this.processSelections.set(id, { sessionId: session.id, processId: process.processId, command: process.command });
-        keyboard.text(`Stop ${index + 1}`, `proc:${id}:ask`).row();
+        const token = this.pickers.processToken({ chatId: ctx.chat.id, userId: ctx.from!.id }, session, process);
+        keyboard.text(`Stop ${index + 1}`, `proc:${token}`).row();
         return `${index + 1}. ${process.command}\npid: ${process.osPid ?? process.processId}\ncwd: ${process.cwd}`;
       });
       await ctx.reply(`Background terminals\n\n${lines.join("\n\n")}`, { reply_markup: keyboard });
@@ -672,7 +649,6 @@ export class TelegramGateway {
         }
         if (result.kind === "submit") {
           await this.sessions.respondAction(result.decision);
-          this.store.consumeCallbackToken(token, chatId);
           await this.clearActionKeyboards(result.decision.actionId);
           await ctx.answerCallbackQuery({ text: result.text });
           await ctx.editMessageText(result.text);
@@ -795,38 +771,36 @@ export class TelegramGateway {
     });
 
     this.bot.callbackQuery(/^proj:/, async (ctx) => {
-      const [, selectionId] = String(ctx.callbackQuery.data).split(":");
-      const project = selectionId ? this.projectSelections.get(selectionId) : undefined;
-      if (!project) {
-        await ctx.answerCallbackQuery({ text: "Project selection expired. Run /new again.", show_alert: true });
-        return;
+      try {
+        const token = String(ctx.callbackQuery.data).slice(5);
+        const project = await this.pickers.selectProject(token, { chatId: ctx.chat!.id, userId: ctx.from.id });
+        await ctx.answerCallbackQuery({ text: "Starting Codex..." });
+        await this.startProjectSession(ctx, project);
+      } catch (error) {
+        await ctx.answerCallbackQuery({ text: callbackError(error, "Project selection failed."), show_alert: true });
       }
-      await ctx.answerCallbackQuery({ text: "Starting Codex..." });
-      await this.startProjectSession(ctx, project);
     });
 
     this.bot.callbackQuery(/^thread:/, async (ctx) => {
-      const [, selectionId] = String(ctx.callbackQuery.data).split(":");
-      const thread = selectionId ? this.threadSelections.get(selectionId) : undefined;
-      if (!thread) {
-        await ctx.answerCallbackQuery({ text: "Thread selection expired. Run /resume again.", show_alert: true });
-        return;
+      try {
+        const token = String(ctx.callbackQuery.data).slice(7);
+        const session = await this.pickers.selectThread(token, { chatId: ctx.chat!.id, userId: ctx.from.id });
+        await ctx.answerCallbackQuery({ text: "Thread resumed." });
+        await ctx.reply(`Resumed Codex session:\n${session.label}\n${session.id}`);
+      } catch (error) {
+        await ctx.answerCallbackQuery({ text: callbackError(error, "Thread selection failed."), show_alert: true });
       }
-      await ctx.answerCallbackQuery({ text: "Resuming thread..." });
-      const session = await this.sessions.resumeThread(thread.id);
-      await ctx.reply(`Resumed Codex session:\n${session.label}\n${session.id}`);
     });
 
     this.bot.callbackQuery(/^model:/, async (ctx) => {
-      const [, selectionId] = String(ctx.callbackQuery.data).split(":");
-      const model = selectionId ? this.modelSelections.get(selectionId) : undefined;
-      if (!model) {
-        await ctx.answerCallbackQuery({ text: "Model selection expired. Run /model again.", show_alert: true });
-        return;
+      try {
+        const token = String(ctx.callbackQuery.data).slice(6);
+        const modelId = await this.pickers.selectModel(token, { chatId: ctx.chat!.id, userId: ctx.from.id });
+        await ctx.answerCallbackQuery({ text: "Model changed." });
+        await ctx.reply(`Model changed for subsequent turns:\n${modelId}`);
+      } catch (error) {
+        await ctx.answerCallbackQuery({ text: callbackError(error, "Model selection failed."), show_alert: true });
       }
-      await this.sessions.setModel(model.id);
-      await ctx.answerCallbackQuery({ text: "Model changed." });
-      await ctx.reply(`Model changed for subsequent turns:\n${model.id}`);
     });
 
     this.bot.callbackQuery(/^sess:/, async (ctx) => {
@@ -895,46 +869,43 @@ export class TelegramGateway {
       const token = String(ctx.callbackQuery.data).slice(7);
       const chatId = ctx.chat?.id;
       if (!chatId) return;
-      const callback = this.store.consumeCallbackToken(token, chatId, ctx.from.id);
-      if (!callback) {
-        await ctx.answerCallbackQuery({ text: "This legacy tmux control expired, was used, or belongs to another chat.", show_alert: true });
-        return;
-      }
-      const payload = callback.payload as { target?: string; attachmentId?: string; action?: string; strategy?: string; expectedVersion?: number };
       let answered = false;
       try {
-        if (callback.operation === "legacy-tmux-attach" && payload.target) {
-          await ctx.answerCallbackQuery({ text: "Attaching legacy tmux fallback..." });
+        await this.callbacks.execute(token, { chatId, userId: ctx.from.id }, ["legacy-tmux-attach", "legacy-tmux-probe"], async (callback) => {
+          const payload = callback.payload as { target?: string; attachmentId?: string; action?: string; strategy?: string; expectedVersion?: number };
+          if (callback.operation === "legacy-tmux-attach" && payload.target) {
+            await ctx.answerCallbackQuery({ text: "Attaching legacy tmux fallback..." });
+            answered = true;
+            const attachment = await this.legacyTmux.attach(payload.target, chatId, `tmux ${payload.target}`);
+            await ctx.reply(`Attached legacy tmux pane ${payload.target}:\n${attachment.id}\n\nSending input test...`);
+            await this.sendProbeResult(chatId, ctx.from.id, await this.legacyTmux.probe(attachment.id, chatId));
+            return;
+          }
+          if (callback.operation !== "legacy-tmux-probe" || !payload.attachmentId || !payload.action) {
+            throw new Error("Invalid legacy tmux control.");
+          }
+          const attachment = this.store.getLegacyTmuxAttachment(payload.attachmentId);
+          if (!attachment || attachment.chatId !== chatId || attachment.updatedAt !== payload.expectedVersion) {
+            throw new Error("This legacy tmux attachment changed or belongs to another chat. Run /tmux again.");
+          }
+          await ctx.answerCallbackQuery({ text: "Updating legacy input test..." });
           answered = true;
-          const attachment = await this.legacyTmux.attach(payload.target, chatId, `tmux ${payload.target}`);
-          await ctx.reply(`Attached legacy tmux pane ${payload.target}:\n${attachment.id}\n\nSending input test...`);
-          await this.sendProbeResult(chatId, ctx.from.id, await this.legacyTmux.probe(attachment.id, chatId));
-          return;
-        }
-        if (callback.operation !== "legacy-tmux-probe" || !payload.attachmentId || !payload.action) {
-          throw new Error("Invalid legacy tmux control.");
-        }
-        const attachment = this.store.getLegacyTmuxAttachment(payload.attachmentId);
-        if (!attachment || attachment.chatId !== chatId || attachment.updatedAt !== payload.expectedVersion) {
-          throw new Error("This legacy tmux attachment changed or belongs to another chat. Run /tmux again.");
-        }
-        await ctx.answerCallbackQuery({ text: "Updating legacy input test..." });
-        answered = true;
-        if (payload.action === "retry") {
-          await this.sendProbeResult(chatId, ctx.from.id, await this.legacyTmux.probe(attachment.id, chatId));
-        } else if (payload.action === "next") {
-          await this.sendProbeResult(chatId, ctx.from.id, await this.legacyTmux.tryNextStrategy(attachment.id, chatId));
-        } else if (payload.action === "key" && payload.strategy) {
-          await this.sendProbeResult(chatId, ctx.from.id, await this.legacyTmux.probe(attachment.id, chatId, payload.strategy));
-        } else if (payload.action === "ready") {
-          this.legacyTmux.markReady(attachment.id, chatId);
-          await ctx.reply("Marked legacy tmux input as ready. Continue with /tmux send <attachmentId> <text>.");
-        } else if (payload.action === "manual") {
-          this.legacyTmux.markPasteOnly(attachment.id, chatId);
-          await ctx.reply("Marked as paste-only. Telegram can paste text, but you must submit locally.");
-        } else {
-          throw new Error("Invalid legacy tmux action.");
-        }
+          if (payload.action === "retry") {
+            await this.sendProbeResult(chatId, ctx.from.id, await this.legacyTmux.probe(attachment.id, chatId));
+          } else if (payload.action === "next") {
+            await this.sendProbeResult(chatId, ctx.from.id, await this.legacyTmux.tryNextStrategy(attachment.id, chatId));
+          } else if (payload.action === "key" && payload.strategy) {
+            await this.sendProbeResult(chatId, ctx.from.id, await this.legacyTmux.probe(attachment.id, chatId, payload.strategy));
+          } else if (payload.action === "ready") {
+            this.legacyTmux.markReady(attachment.id, chatId);
+            await ctx.reply("Marked legacy tmux input as ready. Continue with /tmux send <attachmentId> <text>.");
+          } else if (payload.action === "manual") {
+            this.legacyTmux.markPasteOnly(attachment.id, chatId);
+            await ctx.reply("Marked as paste-only. Telegram can paste text, but you must submit locally.");
+          } else {
+            throw new Error("Invalid legacy tmux action.");
+          }
+        });
       } catch (error) {
         const detail = error instanceof Error ? error.message : "Legacy tmux action failed.";
         if (answered) await ctx.reply(detail);
@@ -943,22 +914,26 @@ export class TelegramGateway {
     });
 
     this.bot.callbackQuery(/^proc:/, async (ctx) => {
-      const [, id, action] = String(ctx.callbackQuery.data).split(":");
-      const selection = id ? this.processSelections.get(id) : undefined;
-      if (!selection) {
-        await ctx.answerCallbackQuery({ text: "Process selection expired.", show_alert: true });
-        return;
-      }
-      if (action === "ask") {
-        const keyboard = new InlineKeyboard().text("Confirm stop", `proc:${id}:confirm`);
+      const token = String(ctx.callbackQuery.data).slice(5);
+      try {
+        const selected = await this.pickers.selectProcess(token, { chatId: ctx.chat!.id, userId: ctx.from.id });
+        const keyboard = new InlineKeyboard().text("Confirm stop", `proc-confirm:${selected.confirmationToken}`);
         await ctx.answerCallbackQuery();
-        await ctx.reply(`Terminate this background process?\n${selection.command}`, { reply_markup: keyboard });
-        return;
+        await ctx.reply(`Terminate this background process?\n${selected.selection.command}`, { reply_markup: keyboard });
+      } catch (error) {
+        await ctx.answerCallbackQuery({ text: callbackError(error, "Process selection failed."), show_alert: true });
       }
-      const terminated = await this.sessions.terminateBackgroundTerminal(selection.processId, selection.sessionId);
-      this.processSelections.delete(id!);
-      await ctx.answerCallbackQuery({ text: terminated ? "Terminated." : "Process was already gone." });
-      await ctx.editMessageText(terminated ? "Background process terminated." : "Background process was already gone.");
+    });
+
+    this.bot.callbackQuery(/^proc-confirm:/, async (ctx) => {
+      const token = String(ctx.callbackQuery.data).slice(13);
+      try {
+        const terminated = await this.pickers.terminateProcess(token, { chatId: ctx.chat!.id, userId: ctx.from.id });
+        await ctx.answerCallbackQuery({ text: terminated ? "Terminated." : "Process was already gone." });
+        await ctx.editMessageText(terminated ? "Background process terminated." : "Background process was already gone.");
+      } catch (error) {
+        await ctx.answerCallbackQuery({ text: callbackError(error, "Process termination failed."), show_alert: true });
+      }
     });
 
     this.bot.on("message:text", async (ctx) => {
@@ -986,7 +961,7 @@ export class TelegramGateway {
   }
 
   private async showWorkspacePicker(ctx: Context): Promise<void> {
-    const [text, options] = await this.workspacePickerMessage();
+    const [text, options] = await this.workspacePickerMessage(ctx.chat!.id, ctx.from!.id);
     await ctx.reply(text, options);
   }
 
@@ -1049,8 +1024,8 @@ export class TelegramGateway {
             keyboard: keyboard.inline_keyboard
           });
         }
-        const [text, options] = await this.workspacePickerMessage();
-        await this.bot.api.sendMessage(chatId, text, options);
+        const projects = await listWorkspaceProjects(this.config.workspaceRoot);
+        await this.bot.api.sendMessage(chatId, `${workspacePickerText(projects, this.config.workspaceRoot)}\n\nRun /new to open controls scoped to you.`);
         this.health.deliverySuccess();
       } catch (error) {
         this.health.deliveryFailure(error);
@@ -1061,22 +1036,14 @@ export class TelegramGateway {
     if (orphanedActionIds.length > 0) this.store.setRuntimeValue("startup_orphaned_action_ids", []);
   }
 
-  private async workspacePickerMessage(): Promise<[string, { reply_markup: InlineKeyboard }]> {
+  private async workspacePickerMessage(chatId: number, userId: number): Promise<[string, { reply_markup: InlineKeyboard }]> {
     const projects = await listWorkspaceProjects(this.config.workspaceRoot);
     const keyboard = new InlineKeyboard();
-    this.projectSelections.clear();
     projects.forEach((project, index) => {
-      const selectionId = Math.random().toString(36).slice(2, 10);
-      this.projectSelections.set(selectionId, project);
-      keyboard.text(`${index + 1}. ${project.name}`, `proj:${selectionId}`).row();
+      const token = this.pickers.projectToken({ chatId, userId }, project);
+      keyboard.text(`${index + 1}. ${project.name}`, `proj:${token}`).row();
     });
-    const text =
-      projects.length === 0
-        ? `No project folders found under ${this.config.workspaceRoot}.`
-        : `Start Codex in a workspace project:\n\n${projects
-            .map((project, index) => `${index + 1}. ${project.name}`)
-            .join("\n")}\n\nUse /new <project-or-path> for manual entry.`;
-    return [text, { reply_markup: keyboard }];
+    return [workspacePickerText(projects, this.config.workspaceRoot), { reply_markup: keyboard }];
   }
 
   private async showThreadPicker(ctx: Context): Promise<void> {
@@ -1120,11 +1087,9 @@ export class TelegramGateway {
 
   private async sendThreadPicker(ctx: Context, threads: CodexThreadSummary[]): Promise<void> {
     const keyboard = new InlineKeyboard();
-    this.threadSelections.clear();
     threads.forEach((thread, index) => {
-      const selectionId = Math.random().toString(36).slice(2, 10);
-      this.threadSelections.set(selectionId, thread);
-      keyboard.text(`${index + 1}. Resume`, `thread:${selectionId}`).row();
+      const token = this.pickers.threadToken({ chatId: ctx.chat!.id, userId: ctx.from!.id }, thread);
+      keyboard.text(`${index + 1}. Resume`, `thread:${token}`).row();
     });
 
     await ctx.reply(formatThreads(threads), { reply_markup: keyboard });
@@ -1142,12 +1107,15 @@ export class TelegramGateway {
       return;
     }
 
+    const active = this.sessions.getActiveSession();
+    if (!active) {
+      await ctx.reply("No active session. Start or resume a session before choosing a model.");
+      return;
+    }
     const keyboard = new InlineKeyboard();
-    this.modelSelections.clear();
     models.slice(0, 12).forEach((model, index) => {
-      const selectionId = Math.random().toString(36).slice(2, 10);
-      this.modelSelections.set(selectionId, model);
-      keyboard.text(`${index + 1}. ${model.id}`.slice(0, 60), `model:${selectionId}`).row();
+      const token = this.pickers.modelToken({ chatId: ctx.chat!.id, userId: ctx.from!.id }, model, active);
+      keyboard.text(`${index + 1}. ${model.id}`.slice(0, 60), `model:${token}`).row();
     });
 
     await ctx.reply(formatModels(models), { reply_markup: keyboard });
@@ -1202,9 +1170,7 @@ export class TelegramGateway {
   }
 
   private legacyCallbackToken(chatId: number, userId: number, operation: string, payload: unknown): string {
-    const token = createNonce(12);
-    this.store.putCallbackToken({
-      token,
+    return this.callbacks.issue({
       actionId: createId("legacy_tmux"),
       chatId,
       userId,
@@ -1212,7 +1178,6 @@ export class TelegramGateway {
       payload,
       expiresAt: Date.now() + 10 * 60_000
     });
-    return token;
   }
 
   private async startProjectSession(ctx: Context, project: WorkspaceProject): Promise<void> {
@@ -1531,6 +1496,18 @@ function interactionKeyboard(view: InteractionView): InlineKeyboard {
     keyboard.row();
   }
   return keyboard;
+}
+
+function workspacePickerText(projects: WorkspaceProject[], workspaceRoot: string): string {
+  return projects.length === 0
+    ? `No project folders found under ${workspaceRoot}.`
+    : `Start Codex in a workspace project:\n\n${projects
+        .map((project, index) => `${index + 1}. ${project.name}`)
+        .join("\n")}\n\nUse /new <project-or-path> for manual entry.`;
+}
+
+function callbackError(error: unknown, fallback: string): string {
+  return error instanceof Error ? error.message : fallback;
 }
 
 function formatSendPicker(threads: CodexThreadSummary[], store: Store): string {

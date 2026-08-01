@@ -22,6 +22,10 @@ export interface CallbackToken {
   expiresAt: number;
 }
 
+export interface ClaimedCallbackToken extends CallbackToken {
+  claimId: string;
+}
+
 export interface RoutingCompose {
   chatId: number;
   userId: number;
@@ -89,6 +93,7 @@ export class Store {
     this.db = new Database(path);
     this.db.pragma("journal_mode = WAL");
     this.migrate();
+    this.releaseStaleCallbackClaims(Date.now() + 1);
   }
 
   close(): void {
@@ -530,22 +535,34 @@ export class Store {
     ).run(token.token, token.actionId, token.chatId, token.userId ?? null, token.operation, JSON.stringify(token.payload), token.expiresAt, Date.now());
   }
 
-  consumeCallbackToken(token: string, chatId: number, userId?: number): CallbackToken | undefined {
+  claimCallbackToken(token: string, chatId: number, userId: number | undefined, claimId: string): ClaimedCallbackToken | undefined {
     const transaction = this.db.transaction(() => {
       const row = this.db
-        .prepare("select * from callback_tokens where token = ? and chat_id = ? and (user_id is null or user_id = ?) and consumed_at is null and expires_at > ?")
+        .prepare("select * from callback_tokens where token = ? and chat_id = ? and (user_id is null or user_id = ?) and claim_id is null and consumed_at is null and expires_at > ?")
         .get(token, chatId, userId ?? null, Date.now()) as Row | undefined;
       if (!row) return undefined;
-      this.db.prepare("update callback_tokens set consumed_at = ? where token = ?").run(Date.now(), token);
-      return mapCallbackToken(row);
+      this.db.prepare("update callback_tokens set claim_id = ?, claimed_at = ? where token = ?").run(claimId, Date.now(), token);
+      return { ...mapCallbackToken(row), claimId };
     });
     return transaction();
   }
 
-  releaseCallbackToken(token: string, chatId: number): void {
-    this.db
-      .prepare("update callback_tokens set consumed_at = null where token = ? and chat_id = ? and consumed_at is not null and expires_at > ?")
-      .run(token, chatId, Date.now());
+  commitCallbackToken(token: string, claimId: string): boolean {
+    return this.db
+      .prepare("update callback_tokens set consumed_at = ?, claim_id = null, claimed_at = null where token = ? and claim_id = ? and consumed_at is null")
+      .run(Date.now(), token, claimId).changes === 1;
+  }
+
+  releaseCallbackToken(token: string, claimId: string): boolean {
+    return this.db
+      .prepare("update callback_tokens set claim_id = null, claimed_at = null where token = ? and claim_id = ? and consumed_at is null and expires_at > ?")
+      .run(token, claimId, Date.now()).changes === 1;
+  }
+
+  releaseStaleCallbackClaims(olderThan: number): number {
+    return this.db
+      .prepare("update callback_tokens set claim_id = null, claimed_at = null where consumed_at is null and claimed_at is not null and claimed_at < ?")
+      .run(olderThan).changes;
   }
 
   putRoutingCompose(compose: RoutingCompose): void {
@@ -926,6 +943,8 @@ export class Store {
         payload_json text not null,
         expires_at integer not null,
         created_at integer not null,
+        claim_id text,
+        claimed_at integer,
         consumed_at integer
       );
 
@@ -1017,6 +1036,8 @@ export class Store {
     this.addColumnIfMissing("pending_actions", "connection_generation", "integer");
     this.addColumnIfMissing("pending_actions", "failure_reason", "text");
     this.addColumnIfMissing("callback_tokens", "user_id", "integer");
+    this.addColumnIfMissing("callback_tokens", "claim_id", "text");
+    this.addColumnIfMissing("callback_tokens", "claimed_at", "integer");
     this.addColumnIfMissing("sessions", "connection_generation", "integer");
     this.migrateLegacyAppServerSessions();
     this.migrateLegacyTmuxSessions();
