@@ -42,11 +42,11 @@ import { TelegramPickerController } from "./picker-controller.js";
 import type { RuntimeHealth, RuntimeHealthReporter } from "../runtime/health.js";
 import { noopRuntimeHealth } from "../runtime/health.js";
 import type { SupervisedSubsystem } from "../runtime/supervisor.js";
-import { TelegramBotRuntime, type TelegramCommandDefinition } from "./bot-runtime.js";
+import { TelegramBotRuntime, type TelegramCommandDefinition, type TelegramRuntime } from "./bot-runtime.js";
 
 export class TelegramGateway {
-  private readonly runtime: TelegramBotRuntime;
-  private readonly bot: TelegramBotRuntime["bot"];
+  private readonly runtime: TelegramRuntime;
+  private readonly bot: TelegramRuntime["bot"];
   private readonly runtimeId = createId("runtime");
   private readonly messageBuffers = new Map<string, { text: string; timer: NodeJS.Timeout }>();
   private readonly interactions: PendingInteractionManager;
@@ -70,9 +70,10 @@ export class TelegramGateway {
     private readonly store: Store,
     policy: PolicyEngine,
     private readonly logger: Logger,
-    private readonly health: RuntimeHealthReporter = noopRuntimeHealth
+    private readonly health: RuntimeHealthReporter = noopRuntimeHealth,
+    runtime?: TelegramRuntime
   ) {
-    this.runtime = new TelegramBotRuntime(config.botToken, policy, health, logger);
+    this.runtime = runtime ?? new TelegramBotRuntime(config.botToken, policy, health, logger);
     this.bot = this.runtime.bot;
     this.interactions = new PendingInteractionManager(store, config.allowSessionGrants);
     this.routing = new TelegramRouting(store, sessions);
@@ -652,7 +653,10 @@ export class TelegramGateway {
       const token = String(ctx.callbackQuery.data).slice(3);
       const userId = ctx.from.id;
       const chatId = ctx.chat?.id;
-      if (!chatId) return;
+      if (!chatId) {
+        await ctx.answerCallbackQuery({ text: "This interaction is not attached to a supported chat.", show_alert: true });
+        return;
+      }
       try {
         const result = this.interactions.handleCallback(token, chatId, userId);
         if (result.kind === "notice") {
@@ -676,7 +680,10 @@ export class TelegramGateway {
     this.bot.callbackQuery(/^send:/, async (ctx) => {
       const token = String(ctx.callbackQuery.data).slice(5);
       const chatId = ctx.chat?.id;
-      if (!chatId) return;
+      if (!chatId) {
+        await ctx.answerCallbackQuery({ text: "This thread picker is not attached to a supported chat.", show_alert: true });
+        return;
+      }
       try {
         const session = await this.routing.selectPicker(token, chatId, ctx.from.id);
         await ctx.answerCallbackQuery({ text: "Thread selected." });
@@ -750,6 +757,7 @@ export class TelegramGateway {
           await this.sendTranscript(ctx);
           return;
         }
+        await ctx.answerCallbackQuery({ text: "Unsupported panel action. Run /panel again.", show_alert: true });
       } catch (error) {
         await ctx.answerCallbackQuery({ text: error instanceof Error ? error.message : "Panel action failed.", show_alert: true });
       }
@@ -761,7 +769,9 @@ export class TelegramGateway {
         await this.sessions.kill(sessionId);
         await ctx.answerCallbackQuery({ text: "Interrupted." });
         await ctx.editMessageText(`Interrupted session:\n${sessionId}`);
+        return;
       }
+      await ctx.answerCallbackQuery({ text: "Invalid interrupt control. Run /kill again.", show_alert: true });
     });
 
     this.bot.callbackQuery(/^archive:/, async (ctx) => {
@@ -770,7 +780,9 @@ export class TelegramGateway {
         await this.sessions.archive(sessionId);
         await ctx.answerCallbackQuery({ text: "Archived." });
         await ctx.editMessageText(`Archived session:\n${sessionId}`);
+        return;
       }
+      await ctx.answerCallbackQuery({ text: "Invalid archive control. Run /archive again.", show_alert: true });
     });
 
     this.bot.callbackQuery(/^forget:/, async (ctx) => {
@@ -779,7 +791,9 @@ export class TelegramGateway {
         await this.sessions.forget(sessionId);
         await ctx.answerCallbackQuery({ text: "Local metadata forgotten." });
         await ctx.editMessageText(`Forgot local thread metadata:\n${sessionId}`);
+        return;
       }
+      await ctx.answerCallbackQuery({ text: "Invalid forget control. Run /forget again.", show_alert: true });
     });
 
     this.bot.callbackQuery(/^proj:/, async (ctx) => {
@@ -871,7 +885,9 @@ export class TelegramGateway {
           const keyboard = new InlineKeyboard().text("Confirm kill", `kill:${sessionId}:confirm`);
           await ctx.answerCallbackQuery({ text: "Confirm kill." });
           await ctx.reply(`Interrupt session?\n${sessionId}`, { reply_markup: keyboard });
+          return;
         }
+        await ctx.answerCallbackQuery({ text: "Unsupported session action. Run /sessions again.", show_alert: true });
       } catch (error) {
         await ctx.answerCallbackQuery({ text: error instanceof Error ? error.message : "Session action failed.", show_alert: true });
       }
@@ -880,7 +896,10 @@ export class TelegramGateway {
     this.bot.callbackQuery(/^legacy:/, async (ctx) => {
       const token = String(ctx.callbackQuery.data).slice(7);
       const chatId = ctx.chat?.id;
-      if (!chatId) return;
+      if (!chatId) {
+        await ctx.answerCallbackQuery({ text: "This legacy control is not attached to a supported chat.", show_alert: true });
+        return;
+      }
       let answered = false;
       try {
         await this.callbacks.execute(token, { chatId, userId: ctx.from.id }, ["legacy-tmux-attach", "legacy-tmux-probe"], async (callback) => {
@@ -948,9 +967,19 @@ export class TelegramGateway {
       }
     });
 
+    this.bot.on("callback_query:data", async (ctx) => {
+      await ctx.answerCallbackQuery({
+        text: "This control is unknown or no longer supported. Run the command again.",
+        show_alert: true
+      });
+    });
+
     this.bot.on("message:text", async (ctx) => {
       const text = ctx.message.text;
-      if (text.startsWith("/")) return;
+      if (text.startsWith("/")) {
+        await ctx.reply("Unknown command. Run /help to see supported commands.");
+        return;
+      }
       const interaction = this.interactions.handleText(ctx.chat.id, ctx.from.id, text);
       if (interaction) {
         if (interaction.kind === "submit") {

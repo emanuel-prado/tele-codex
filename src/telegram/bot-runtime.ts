@@ -9,8 +9,15 @@ export interface TelegramCommandDefinition {
   description: string;
 }
 
+export interface TelegramRuntime {
+  readonly bot: Bot;
+  start(commands: TelegramCommandDefinition[]): Promise<void>;
+  wait(): Promise<void>;
+  stop(): void;
+}
+
 /** Owns Telegram transport setup; feature controllers never start a polling loop. */
-export class TelegramBotRuntime {
+export class TelegramBotRuntime implements TelegramRuntime {
   readonly bot: Bot;
   private pollingPromise?: Promise<void>;
 
