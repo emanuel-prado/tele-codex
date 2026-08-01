@@ -1,8 +1,9 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { Store } from "../src/store/store.js";
 import type { PendingAction } from "../src/types/events.js";
 
 describe("Store reliability state", () => {
+  afterEach(() => vi.useRealTimers());
   it("allows exactly one claimant for a pending action", () => {
     const store = new Store(":memory:");
     store.putPendingAction(action(1));
@@ -22,6 +23,22 @@ describe("Store reliability state", () => {
     expect(due[0]?.payload.text).toBe("done");
     store.markOutboxSent(due[0]!.id);
     expect(store.dueOutbox()).toEqual([]);
+    store.close();
+  });
+
+  it("retries a failed delivery only after its persisted backoff", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-01T12:00:00Z"));
+    const store = new Store(":memory:");
+    store.enqueueOutbox("turn:retry", 10, { text: "important" });
+    const [message] = store.dueOutbox();
+    store.retryOutbox(message!.id, 1, "Telegram unavailable");
+
+    expect(store.dueOutbox()).toEqual([]);
+    vi.advanceTimersByTime(2_000);
+    expect(store.dueOutbox()).toMatchObject([{ id: message!.id, attempts: 1 }]);
+    store.markOutboxSent(message!.id);
+    expect(store.outboxCounts()).toEqual({ pending: 0, failed: 0 });
     store.close();
   });
 

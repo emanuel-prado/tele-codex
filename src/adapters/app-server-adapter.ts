@@ -1,5 +1,5 @@
 import type { Logger } from "pino";
-import { JsonRpcClient, type JsonRpcMessage } from "./json-rpc-client.js";
+import { JsonRpcClient, type AppServerRpcClient, type JsonRpcMessage } from "./json-rpc-client.js";
 import type { AppConfig } from "../config.js";
 import type { AppServerRuntime } from "../types/adapter.js";
 import type { AttachSession, CodexEvent, LogEntry, PendingAction, SessionRef, StartSession, UserDecision } from "../types/events.js";
@@ -27,7 +27,7 @@ import {
 } from "./app-server-protocol.js";
 
 export class AppServerAdapter implements AppServerRuntime {
-  private readonly rpc: JsonRpcClient;
+  private readonly rpc: AppServerRpcClient;
   private readonly queue = new AsyncQueue<CodexEvent>();
   private readonly sessionsByThread = new Map<string, { sessionId: string; generation: number }>();
   private readonly activeTurns = new Map<string, string>();
@@ -51,7 +51,8 @@ export class AppServerAdapter implements AppServerRuntime {
     private readonly config: AppConfig,
     private readonly store: Store,
     private readonly logger: Logger,
-    private readonly health: RuntimeHealthReporter = noopRuntimeHealth
+    private readonly health: RuntimeHealthReporter = noopRuntimeHealth,
+    rpc?: AppServerRpcClient
   ) {
     this.store.clearSessionAttachments();
     const startupOpenActions = this.store.listOpenActions();
@@ -61,7 +62,7 @@ export class AppServerAdapter implements AppServerRuntime {
       this.store.setRuntimeValue("startup_orphaned_action_ids", startupOpenActions.map((action) => action.id));
       this.logger.warn({ orphaned }, "orphaned pending actions from a previous app-server connection");
     }
-    this.rpc = new JsonRpcClient(logger, config.rpcTimeoutMs);
+    this.rpc = rpc ?? new JsonRpcClient(logger, config.rpcTimeoutMs);
     this.rpc.on("activity", (generation: number) => {
       if (generation === this.connectionGeneration) this.health.appServer({ lastMessageAt: Date.now() });
     });

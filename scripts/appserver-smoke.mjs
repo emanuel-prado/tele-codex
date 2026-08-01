@@ -1,5 +1,8 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const command = process.env.TELE_CODEX_CODEX_COMMAND || "codex";
 const child = spawn(command, ["app-server", "--listen", "stdio://"], {
@@ -13,6 +16,10 @@ let buffer = "";
 let stderr = "";
 let nextId = 1;
 const pending = new Map();
+let approvalResolve;
+const approval = new Promise((resolve) => {
+  approvalResolve = resolve;
+});
 
 child.stderr.on("data", (chunk) => {
   stderr += chunk;
@@ -26,6 +33,15 @@ child.stdout.on("data", (chunk) => {
     buffer = buffer.slice(newline + 1);
     if (!raw) continue;
     const message = JSON.parse(raw);
+    if (message.id !== undefined && message.method) {
+      if (message.method === "item/commandExecution/requestApproval") {
+        child.stdin.write(`${JSON.stringify({ id: message.id, result: { decision: "decline" } })}\n`);
+        approvalResolve(message);
+      } else {
+        child.stdin.write(`${JSON.stringify({ id: message.id, error: { code: -32601, message: `unsupported smoke request: ${message.method}` } })}\n`);
+      }
+      continue;
+    }
     if (message.id === undefined || message.method) continue;
     const waiter = pending.get(message.id);
     if (!waiter) continue;
@@ -79,6 +95,35 @@ try {
     throw new Error("account/rateLimits/read response has no primary usage");
   }
   if (!Array.isArray(modes?.data)) throw new Error("collaborationMode/list response has no data array");
+  if (process.env.TELE_CODEX_APPSERVER_APPROVAL_SMOKE === "1") {
+    const workspace = await mkdtemp(join(tmpdir(), "tele-codex-approval-smoke-"));
+    let threadId;
+    try {
+      const started = await request("thread/start", {
+        cwd: workspace,
+        approvalPolicy: "on-request",
+        approvalsReviewer: "user",
+        sandbox: "workspace-write",
+        model: null
+      });
+      threadId = started?.thread?.id;
+      if (!threadId) throw new Error("approval smoke thread/start response has no thread id");
+      await request("turn/start", {
+        threadId,
+        input: [{ type: "text", text: "Run exactly `printf tele-codex-approval-smoke` once, then stop.", text_elements: [] }]
+      });
+      await Promise.race([
+        approval,
+        new Promise((_, reject) => setTimeout(() => reject(new Error("approval smoke did not receive a command approval")), 60_000))
+      ]);
+      console.log("app-server live approval ok: request received and declined");
+    } finally {
+      if (threadId) await request("thread/archive", { threadId }).catch(() => undefined);
+      await rm(workspace, { recursive: true, force: true });
+    }
+  } else {
+    console.log("app-server live approval skipped (set TELE_CODEX_APPSERVER_APPROVAL_SMOKE=1 to enable)");
+  }
   console.log(`app-server contract ok: ${initialized.userAgent}`);
 } finally {
   child.stdin.end();
