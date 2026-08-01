@@ -54,12 +54,38 @@ async function databaseIntegrityCheck(path: string): Promise<HealthCheck> {
   try {
     const db = new Database(path);
     const rows = db.pragma("quick_check") as Array<{ quick_check: string }>;
+    const migrationTable = db.prepare("select name from sqlite_master where type = 'table' and name = 'schema_migrations'").get();
+    const version = migrationTable
+      ? Number((db.prepare("select coalesce(max(version), 0) as version from schema_migrations").get() as { version: number }).version)
+      : 0;
+    const pageCount = Number(db.pragma("page_count", { simple: true }));
+    const pageSize = Number(db.pragma("page_size", { simple: true }));
+    const databaseBytes = pageCount * pageSize;
+    const walBytes = await fileSize(`${path}-wal`);
     db.close();
     const ok = rows.every((row) => row.quick_check === "ok");
-    return { name: "Database integrity", status: ok ? "pass" : "fail", detail: ok ? "ok" : JSON.stringify(rows) };
+    const excessive = databaseBytes > 256 * 1024 * 1024 || walBytes > 64 * 1024 * 1024;
+    const detail = `schema v${version}, database ${mb(databaseBytes)}, WAL ${mb(walBytes)}`;
+    return {
+      name: "Database integrity",
+      status: ok ? (excessive ? "warn" : "pass") : "fail",
+      detail: ok ? `${detail}${excessive ? "; run maintenance/checkpoint" : ""}` : JSON.stringify(rows)
+    };
   } catch (error) {
     return { name: "Database integrity", status: "fail", detail: error instanceof Error ? error.message : "check failed" };
   }
+}
+
+async function fileSize(path: string): Promise<number> {
+  try {
+    return (await stat(path)).size;
+  } catch {
+    return 0;
+  }
+}
+
+function mb(bytes: number): string {
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
 }
 
 async function serviceCheck(readStatus: () => Promise<ServiceStatus>): Promise<HealthCheck> {
