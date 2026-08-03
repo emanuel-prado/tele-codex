@@ -2,10 +2,13 @@ import { Bot } from "grammy";
 import { access, mkdtemp, mkdir, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Writable } from "node:stream";
 import pino from "pino";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AppConfig } from "../src/config.js";
 import type { LegacyTmuxBridge } from "../src/legacy/legacy-tmux-bridge.js";
+import { RuntimeHealth } from "../src/runtime/health.js";
+import { createLogger } from "../src/runtime/logger.js";
 import type { SessionManager } from "../src/runtime/session-manager.js";
 import { PolicyEngine } from "../src/security/policy.js";
 import { Store } from "../src/store/store.js";
@@ -22,6 +25,9 @@ interface ApiCall {
 class FakeTelegramRuntime implements TelegramRuntime {
   readonly calls: ApiCall[] = [];
   failDocumentDelivery = false;
+  readonly messageFailures = new Map<number, { remaining: number; description: string }>();
+  readonly sentMessageIds = new Map<number, number>();
+  messageGate?: Promise<void>;
   readonly bot = new Bot("test-token", {
     botInfo: {
       id: 999,
@@ -46,12 +52,22 @@ class FakeTelegramRuntime implements TelegramRuntime {
         return { ok: false, error_code: 500, description: "document delivery failed" } as never;
       }
       if (method === "sendMessage" || method === "editMessageText") {
+        const chatId = Number((payload as { chat_id?: number }).chat_id ?? 100);
+        if (method === "sendMessage") {
+          await this.messageGate;
+          const failure = this.messageFailures.get(chatId);
+          if (failure && failure.remaining > 0) {
+            failure.remaining -= 1;
+            return { ok: false, error_code: 500, description: failure.description } as never;
+          }
+          this.sentMessageIds.set(chatId, this.calls.length + 100);
+        }
         return {
           ok: true,
           result: {
             message_id: this.calls.length + 100,
             date: 1,
-            chat: { id: Number((payload as { chat_id?: number }).chat_id ?? 100), type: "private" },
+            chat: { id: chatId, type: "private" },
             text: String((payload as { text?: string }).text ?? "")
           }
         } as never;
@@ -77,6 +93,7 @@ describe("TelegramGateway dispatch", () => {
   let launchedCwd: string | undefined;
   let activeDiff: string | undefined;
   let activeTranscript: string;
+  let sessions: SessionManager;
 
   beforeEach(() => {
     store = new Store(":memory:");
@@ -88,7 +105,7 @@ describe("TelegramGateway dispatch", () => {
     launchedCwd = undefined;
     activeDiff = undefined;
     activeTranscript = "";
-    const sessions = {
+    sessions = {
       getActiveSession: () => activeSession,
       attach: async ({ codexThreadId }: { codexThreadId: string }) => {
         attachedThread = codexThreadId;
@@ -121,6 +138,7 @@ describe("TelegramGateway dispatch", () => {
   });
 
   afterEach(() => {
+    vi.clearAllTimers();
     vi.useRealTimers();
     store.close();
   });
@@ -205,6 +223,101 @@ describe("TelegramGateway dispatch", () => {
 
     expect(store.getTranscript(activeSession.id)).toContain("private attributed output");
     expect(store.recentLogs(activeSession.id, 10)).toEqual([]);
+  });
+
+  it("isolates a partial streamed-message fan-out failure and retains only the failed chat buffer", async () => {
+    vi.useFakeTimers();
+    const health = new RuntimeHealth();
+    const streamingGateway = new TelegramGateway(
+      testConfig(), sessions, {} as LegacyTmuxBridge, store, new PolicyEngine(testConfig()),
+      pino({ level: "silent" }), health, runtime
+    );
+    activeSession = store.upsertSession({
+      id: "session_1", adapter: "appserver", label: "one", codexThreadId: "thread_1"
+    }, "active");
+    vi.setSystemTime(1_000);
+    store.rememberSessionChat(activeSession.id, 200);
+    vi.setSystemTime(2_000);
+    store.rememberSessionChat(activeSession.id, 100);
+    runtime.messageFailures.set(100, { remaining: 1, description: "private /home/controller/token.txt" });
+
+    await deliverAgentText(streamingGateway, activeSession.id, "fan-out text");
+    await flushAgentText(streamingGateway, activeSession.id);
+
+    expect(sentMessageChatIds(runtime)).toEqual([100, 200]);
+    expect(bufferedChatIds(streamingGateway, activeSession.id)).toEqual([100]);
+    expect(store.getMessageThread(200, sentMessageId(runtime, 200))).toBe(activeSession.id);
+    expect(store.outboxCounts()).toEqual({ pending: 0, failed: 0 });
+    expect(health.snapshot().delivery.lastFailure).not.toContain("/home/controller");
+  });
+
+  it("retries a failed streamed message, records recovery, and drops it at the retry limit", async () => {
+    vi.useFakeTimers();
+    let diagnostics = "";
+    const logger = createLogger("warn", new Writable({
+      write(chunk, _encoding, done) {
+        diagnostics += chunk.toString();
+        done();
+      }
+    }));
+    const health = new RuntimeHealth();
+    const streamingGateway = new TelegramGateway(
+      testConfig(), sessions, {} as LegacyTmuxBridge, store, new PolicyEngine(testConfig()),
+      logger, health, runtime
+    );
+    activeSession = store.upsertSession({
+      id: "session_1", adapter: "appserver", label: "one", codexThreadId: "thread_1"
+    }, "active");
+    store.rememberSessionChat(activeSession.id, 100);
+    runtime.messageFailures.set(100, { remaining: 2, description: "failed via https://api.telegram.org/bot123:secret/sendMessage" });
+
+    await deliverAgentText(streamingGateway, activeSession.id, "recoverable text");
+    await flushAgentText(streamingGateway, activeSession.id);
+    await vi.advanceTimersByTimeAsync(1_200);
+    expect(bufferedChatIds(streamingGateway, activeSession.id)).toEqual([100]);
+
+    await vi.advanceTimersByTimeAsync(2_400);
+    expect(bufferedChatIds(streamingGateway, activeSession.id)).toEqual([]);
+    expect(health.snapshot().delivery.lastSuccessAt).toBeDefined();
+    expect(store.getMessageThread(100, sentMessageId(runtime, 100))).toBe(activeSession.id);
+
+    await deliverAgentText(streamingGateway, activeSession.id, "terminal text");
+    runtime.messageFailures.set(100, { remaining: 3, description: "terminal /private/path" });
+    await flushAgentText(streamingGateway, activeSession.id);
+    await vi.advanceTimersByTimeAsync(1_200);
+    await vi.advanceTimersByTimeAsync(2_400);
+    expect(bufferedChatIds(streamingGateway, activeSession.id)).toEqual([]);
+    expect(diagnostics).toContain("retry limit");
+    expect(diagnostics).not.toMatch(/123:secret|\/private\/path/);
+  });
+
+  it("coalesces concurrent flushes without duplicating sends or losing newly buffered text", async () => {
+    vi.useFakeTimers();
+    const streamingGateway = new TelegramGateway(
+      testConfig(), sessions, {} as LegacyTmuxBridge, store, new PolicyEngine(testConfig()),
+      pino({ level: "silent" }), undefined, runtime
+    );
+    activeSession = store.upsertSession({
+      id: "session_1", adapter: "appserver", label: "one", codexThreadId: "thread_1"
+    }, "active");
+    store.rememberSessionChat(activeSession.id, 100);
+    let releaseSend!: () => void;
+    runtime.messageGate = new Promise<void>((resolve) => { releaseSend = resolve; });
+
+    await deliverAgentText(streamingGateway, activeSession.id, "first");
+    const firstFlush = flushAgentText(streamingGateway, activeSession.id);
+    const concurrentFlush = flushAgentText(streamingGateway, activeSession.id);
+    await deliverAgentText(streamingGateway, activeSession.id, " second");
+    releaseSend();
+    await Promise.all([firstFlush, concurrentFlush]);
+
+    expect(sentTexts(runtime)).toHaveLength(1);
+    expect(bufferedChatIds(streamingGateway, activeSession.id)).toEqual([100]);
+    delete runtime.messageGate;
+    await flushAgentText(streamingGateway, activeSession.id);
+    expect(sentTexts(runtime)).toHaveLength(2);
+    expect(sentTexts(runtime)[1]).toContain("second");
+    expect(bufferedChatIds(streamingGateway, activeSession.id)).toEqual([]);
   });
 
   it("responds to unknown slash commands", async () => {
@@ -365,6 +478,35 @@ function sentTexts(runtime: FakeTelegramRuntime): string[] {
   return runtime.calls
     .filter((call) => call.method === "sendMessage")
     .map((call) => String(call.payload.text));
+}
+
+function sentMessageChatIds(runtime: FakeTelegramRuntime): number[] {
+  return runtime.calls
+    .filter((call) => call.method === "sendMessage")
+    .map((call) => Number(call.payload.chat_id));
+}
+
+function sentMessageId(runtime: FakeTelegramRuntime, chatId: number): number {
+  const messageId = runtime.sentMessageIds.get(chatId);
+  if (!messageId) throw new Error(`Missing sent message for chat ${chatId}.`);
+  return messageId;
+}
+
+async function deliverAgentText(gateway: TelegramGateway, sessionId: string, text: string): Promise<void> {
+  await (gateway as unknown as { handleCodexEvent(event: CodexEvent): Promise<void> }).handleCodexEvent({
+    type: "agentMessage", sessionId, turnId: "turn_1", itemId: "item_1", text
+  });
+}
+
+async function flushAgentText(gateway: TelegramGateway, sessionId: string): Promise<void> {
+  await (gateway as unknown as { flushAgentMessage(id: string): Promise<void> }).flushAgentMessage(sessionId);
+}
+
+function bufferedChatIds(gateway: TelegramGateway, sessionId: string): number[] {
+  const buffers = (gateway as unknown as {
+    messageBuffers: Map<string, { deliveries?: Map<number, unknown> }>;
+  }).messageBuffers;
+  return [...(buffers.get(sessionId)?.deliveries?.keys() ?? [])].sort((left, right) => left - right);
 }
 
 function callbackAnswers(runtime: FakeTelegramRuntime): Record<string, unknown>[] {
