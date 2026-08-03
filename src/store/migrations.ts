@@ -1,6 +1,6 @@
 import type Database from "better-sqlite3";
 
-export const CURRENT_SCHEMA_VERSION = 6;
+export const CURRENT_SCHEMA_VERSION = 7;
 
 export interface Migration {
   version: number;
@@ -321,6 +321,38 @@ const MIGRATIONS: readonly Migration[] = [
         drop table pending_actions_v5;
         create index pending_actions_cleanup on pending_actions(status, resolved_at, expires_at);
       `);
+    }
+  },
+  {
+    version: 7,
+    name: "scrub-terminal-sensitive-data",
+    up(db) {
+      if (tableExists(db, "event_log")) db.exec("delete from event_log");
+      if (tableExists(db, "pending_actions")) {
+        db.exec(`
+          update pending_actions
+          set body = '', payload_json = '{}', failure_reason = null
+          where status not in ('pending', 'submitting', 'failed');
+        `);
+      }
+      if (tableExists(db, "callback_tokens") && tableExists(db, "pending_actions")) {
+        db.exec(`
+          update callback_tokens set payload_json = '{}'
+          where action_id in (select id from pending_actions where status not in ('pending', 'submitting', 'failed'));
+        `);
+      }
+      if (tableExists(db, "interaction_drafts") && tableExists(db, "pending_actions")) {
+        db.exec(`
+          update interaction_drafts set answers_json = '{}'
+          where action_id in (select id from pending_actions where status not in ('pending', 'submitting', 'failed'));
+        `);
+      }
+      if (tableExists(db, "notification_outbox")) {
+        db.exec(`
+          update notification_outbox set last_error = null;
+          update notification_outbox set payload_json = '{}' where status = 'sent';
+        `);
+      }
     }
   }
 ];

@@ -333,8 +333,10 @@ export class LegacyTmuxBridge {
     try {
       return await this.run("tmux", args, { timeoutMs: COMMAND_TIMEOUT_MS, maxBuffer: MAX_COMMAND_OUTPUT_BYTES });
     } catch (error) {
-      this.logger.warn({ error, args }, "legacy tmux command failed");
-      const detail = error instanceof Error ? error.message : String(error);
+      const detail = error instanceof Error && /ENOENT/.test(error.message)
+        ? "tmux executable was not found (ENOENT)."
+        : "tmux command failed.";
+      this.logger.warn({ operation: args[0], error: detail }, "legacy tmux command failed");
       throw new Error(`Legacy tmux fallback failed: ${detail}`);
     }
   }

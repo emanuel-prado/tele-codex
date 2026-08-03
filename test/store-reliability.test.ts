@@ -47,7 +47,7 @@ describe("Store reliability state", () => {
     store.putPendingAction(action(1));
     store.putPendingAction({ ...action(2), id: "action_2", requestId: 1 });
     expect(store.orphanOpenActions(1)).toBe(1);
-    expect(store.getPendingAction("action_1")?.status).toBe("orphaned");
+    expect(store.getPendingAction("action_1")).toMatchObject({ status: "orphaned", body: "", payload: {} });
     expect(store.getPendingAction("action_2")?.status).toBe("pending");
     store.close();
   });
@@ -77,6 +77,35 @@ describe("Store reliability state", () => {
     });
     expect(store.listPendingActions()).toHaveLength(1);
     expect(store.claimPendingAction("action_1")?.status).toBe("submitting");
+    store.close();
+  });
+
+  it("scrubs terminal action content while preserving retryable failures", () => {
+    const store = new Store(":memory:");
+    const sensitive = {
+      ...action(1),
+      body: "run with private approval context",
+      payload: { params: { command: "private command", answer: "private answer" } }
+    };
+    store.putPendingAction(sensitive);
+    store.putCallbackToken({
+      token: "sensitive-control", actionId: sensitive.id, resourceKind: "pending-action", chatId: 1, userId: 2,
+      operation: "decision", payload: { value: "private approval answer" }, expiresAt: Date.now() + 60_000
+    });
+    store.putInteractionDraft({
+      actionId: sensitive.id, chatId: 1, userId: 2, questionIndex: 0,
+      answers: { answer: { answers: ["private draft answer"] } }, awaitingText: false
+    });
+    store.claimPendingAction(sensitive.id);
+    store.failPendingAction(sensitive.id, "transport closed");
+    expect(store.getPendingAction(sensitive.id)).toMatchObject({ body: sensitive.body, payload: sensitive.payload });
+
+    store.claimPendingAction(sensitive.id);
+    store.resolvePendingAction(sensitive.id, "resolved");
+
+    expect(store.getPendingAction(sensitive.id)).toMatchObject({ status: "resolved", body: "", payload: {} });
+    expect(store.getInteractionDraft(sensitive.id, 1, 2)?.answers).toEqual({});
+    expect(store.claimCallbackToken("sensitive-control", 1, 2, "claim")?.payload).toEqual({});
     store.close();
   });
 

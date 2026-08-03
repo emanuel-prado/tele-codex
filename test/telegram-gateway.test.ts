@@ -1,5 +1,5 @@
 import { Bot } from "grammy";
-import { mkdtemp, mkdir, symlink } from "node:fs/promises";
+import { access, mkdtemp, mkdir, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import pino from "pino";
@@ -10,7 +10,7 @@ import type { SessionManager } from "../src/runtime/session-manager.js";
 import { PolicyEngine } from "../src/security/policy.js";
 import { Store } from "../src/store/store.js";
 import type { StoredSession } from "../src/store/store.js";
-import type { PendingAction } from "../src/types/events.js";
+import type { CodexEvent, PendingAction } from "../src/types/events.js";
 import type { TelegramCommandDefinition, TelegramRuntime } from "../src/telegram/bot-runtime.js";
 import { TelegramGateway } from "../src/telegram/gateway.js";
 
@@ -21,6 +21,7 @@ interface ApiCall {
 
 class FakeTelegramRuntime implements TelegramRuntime {
   readonly calls: ApiCall[] = [];
+  failDocumentDelivery = false;
   readonly bot = new Bot("test-token", {
     botInfo: {
       id: 999,
@@ -41,6 +42,9 @@ class FakeTelegramRuntime implements TelegramRuntime {
   constructor() {
     this.bot.api.config.use(async (_previous, method, payload) => {
       this.calls.push({ method, payload: payload as Record<string, unknown> });
+      if (method === "sendDocument" && this.failDocumentDelivery) {
+        return { ok: false, error_code: 500, description: "document delivery failed" } as never;
+      }
       if (method === "sendMessage" || method === "editMessageText") {
         return {
           ok: true,
@@ -71,6 +75,8 @@ describe("TelegramGateway dispatch", () => {
   let killError: Error | undefined;
   let forwardedText: string[];
   let launchedCwd: string | undefined;
+  let activeDiff: string | undefined;
+  let activeTranscript: string;
 
   beforeEach(() => {
     store = new Store(":memory:");
@@ -80,6 +86,8 @@ describe("TelegramGateway dispatch", () => {
     killError = undefined;
     forwardedText = [];
     launchedCwd = undefined;
+    activeDiff = undefined;
+    activeTranscript = "";
     const sessions = {
       getActiveSession: () => activeSession,
       attach: async ({ codexThreadId }: { codexThreadId: string }) => {
@@ -95,6 +103,8 @@ describe("TelegramGateway dispatch", () => {
         launchedCwd = cwd;
         return { id: "session_new" };
       },
+      diff: () => activeDiff,
+      transcript: () => activeTranscript,
       goal: async () => undefined
     } as unknown as SessionManager;
     const config = testConfig();
@@ -140,6 +150,43 @@ describe("TelegramGateway dispatch", () => {
 
     expect(launchedCwd).toBe(project);
     expect(sentTexts(runtime)).toContain("Started app-server session in project:\nsession_new");
+  });
+
+  it("deletes temporary diff exports after successful delivery", async () => {
+    activeDiff = "private diff\n".repeat(500);
+
+    await runtime.bot.handleUpdate(messageUpdate("/diff", nextUpdateId()));
+
+    await expect(access(exportedDocumentPath(runtime))).rejects.toThrow();
+  });
+
+  it("deletes temporary transcript exports when delivery fails", async () => {
+    activeSession = store.upsertSession({
+      id: "session_1", adapter: "appserver", label: "one", codexThreadId: "thread_1"
+    }, "idle");
+    activeTranscript = "private transcript";
+    runtime.failDocumentDelivery = true;
+
+    await expect(runtime.bot.handleUpdate(messageUpdate("/transcript", nextUpdateId()))).rejects.toThrow(/document delivery failed/);
+
+    await expect(access(exportedDocumentPath(runtime))).rejects.toThrow();
+  });
+
+  it("persists agent output only in the owning thread Transcript", async () => {
+    activeSession = store.upsertSession({
+      id: "session_1", adapter: "appserver", label: "one", codexThreadId: "thread_1"
+    }, "active");
+
+    await (gateway as unknown as { handleCodexEvent(event: CodexEvent): Promise<void> }).handleCodexEvent({
+      type: "agentMessage",
+      sessionId: activeSession.id,
+      turnId: "turn_1",
+      itemId: "item_1",
+      text: "private attributed output"
+    });
+
+    expect(store.getTranscript(activeSession.id)).toContain("private attributed output");
+    expect(store.recentLogs(activeSession.id, 10)).toEqual([]);
   });
 
   it("responds to unknown slash commands", async () => {
@@ -315,6 +362,13 @@ function callbackData(runtime: FakeTelegramRuntime, label: string): string {
     if (button?.callback_data) return button.callback_data;
   }
   throw new Error(`Missing callback button: ${label}`);
+}
+
+function exportedDocumentPath(runtime: FakeTelegramRuntime): string {
+  const document = runtime.calls.find((call) => call.method === "sendDocument")?.payload.document as
+    { fileData?: unknown } | undefined;
+  if (typeof document?.fileData !== "string") throw new Error("Missing exported document path.");
+  return document.fileData;
 }
 
 function testConfig(): AppConfig {

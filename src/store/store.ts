@@ -3,13 +3,15 @@ import { existsSync, statSync } from "node:fs";
 import type { RateLimitSummary, SessionProgress, SessionTokenUsage, ThreadGoalSummary } from "../types/control.js";
 import type { LogEntry, PendingAction, SessionRef, SessionStatus } from "../types/events.js";
 import type { LegacyTmuxAttachment, LegacyTmuxInputStatus, LegacyTmuxObservation, LegacyTmuxStatus } from "../types/legacy-tmux.js";
+import { sanitizeDiagnosticText } from "../runtime/diagnostics.js";
 import { migrateDatabase, schemaVersion } from "./migrations.js";
 import {
   InteractionRepository,
+  EventLogRepository,
   NotificationOutboxRepository,
   RuntimeStateRepository,
   ThreadAttachmentRepository,
-  TranscriptLogRepository
+  TranscriptRepository
 } from "./repositories.js";
 
 export type PendingActionStatus = "pending" | "submitting" | "resolved" | "expired" | "cancelled" | "orphaned" | "failed";
@@ -131,7 +133,8 @@ export class Store {
   readonly threads: ThreadAttachmentRepository;
   readonly interactions: InteractionRepository;
   readonly notifications: NotificationOutboxRepository;
-  readonly transcripts: TranscriptLogRepository;
+  readonly eventLogs: EventLogRepository;
+  readonly transcripts: TranscriptRepository;
   readonly runtimeState: RuntimeStateRepository;
 
   constructor(path: string) {
@@ -142,7 +145,8 @@ export class Store {
     this.threads = new ThreadAttachmentRepository(this.db);
     this.interactions = new InteractionRepository(this.db);
     this.notifications = new NotificationOutboxRepository(this.db);
-    this.transcripts = new TranscriptLogRepository(this.db);
+    this.eventLogs = new EventLogRepository(this.db);
+    this.transcripts = new TranscriptRepository(this.db);
     this.runtimeState = new RuntimeStateRepository(this.db);
     this.reconcilePersistedAppServerRuntime();
     this.releaseStaleCallbackClaims(Date.now() + 1);
@@ -476,18 +480,18 @@ export class Store {
   failPendingAction(actionId: string, reason: string): void {
     this.db
       .prepare("update pending_actions set status = 'failed', failure_reason = ? where id = ? and status = 'submitting'")
-      .run(reason, actionId);
+      .run(sanitizeDiagnosticText(reason), actionId);
   }
 
   orphanOpenActions(connectionGeneration?: number): number {
-    const result = connectionGeneration === undefined
-      ? this.db
-          .prepare("update pending_actions set status = 'orphaned', resolved_at = ? where status in ('pending', 'submitting', 'failed')")
-          .run(Date.now())
-      : this.db
-          .prepare("update pending_actions set status = 'orphaned', resolved_at = ? where connection_generation = ? and status in ('pending', 'submitting', 'failed')")
-          .run(Date.now(), connectionGeneration);
-    return result.changes;
+    const rows = connectionGeneration === undefined
+      ? this.db.prepare("select id from pending_actions where status in ('pending', 'submitting', 'failed')").all() as Array<{ id: string }>
+      : this.db.prepare("select id from pending_actions where connection_generation = ? and status in ('pending', 'submitting', 'failed')")
+        .all(connectionGeneration) as Array<{ id: string }>;
+    this.db.transaction(() => {
+      for (const row of rows) this.scrubTerminalAction(row.id, "orphaned");
+    })();
+    return rows.length;
   }
 
   listOpenActions(connectionGeneration?: number): StoredPendingAction[] {
@@ -616,9 +620,7 @@ export class Store {
   }
 
   resolvePendingAction(actionId: string, status: "resolved" | "expired" | "cancelled" | "orphaned"): void {
-    this.db
-      .prepare("update pending_actions set status = ?, resolved_at = ? where id = ?")
-      .run(status, Date.now(), actionId);
+    this.db.transaction(() => this.scrubTerminalAction(actionId, status))();
   }
 
   resolvePendingActionByRequestId(requestId: string | number, connectionGeneration: number, status: "resolved" | "expired" | "cancelled" = "resolved"): string | undefined {
@@ -627,7 +629,6 @@ export class Store {
       .get(String(requestId), connectionGeneration) as { id: string } | undefined;
     if (!row) return undefined;
     this.resolvePendingAction(row.id, status);
-    this.deleteInteractionDraft(row.id);
     return row.id;
   }
 
@@ -769,6 +770,10 @@ export class Store {
     this.db.prepare("delete from interaction_drafts where action_id = ?").run(actionId);
   }
 
+  scrubInteractionDraft(actionId: string): void {
+    this.db.prepare("update interaction_drafts set answers_json = '{}' where action_id = ?").run(actionId);
+  }
+
   enqueueOutbox(
     eventKey: string,
     chatId: number,
@@ -814,11 +819,11 @@ export class Store {
   }
 
   appendLog(entry: Omit<LogEntry, "id" | "timestamp"> & { timestamp?: number }): void {
-    this.transcripts.appendLog(entry);
+    this.eventLogs.appendLog(entry);
   }
 
   recentLogs(sessionId: string, limit: number): LogEntry[] {
-    return this.transcripts.recentLogs(sessionId, limit);
+    return this.eventLogs.recentLogs(sessionId, limit);
   }
 
   appendTranscript(sessionId: string, text: string, metadata?: unknown): void {
@@ -900,6 +905,14 @@ export class Store {
 
   private migrate(): void {
     migrateDatabase(this.db);
+  }
+
+  private scrubTerminalAction(actionId: string, status: "resolved" | "expired" | "cancelled" | "orphaned"): void {
+    this.db.prepare(
+      "update pending_actions set status = ?, body = '', payload_json = '{}', failure_reason = null, resolved_at = ? where id = ?"
+    ).run(status, Date.now(), actionId);
+    this.db.prepare("update callback_tokens set payload_json = '{}' where action_id = ?").run(actionId);
+    this.db.prepare("update interaction_drafts set answers_json = '{}' where action_id = ?").run(actionId);
   }
 
   private upsertCodexThread(session: SessionRef, status: SessionStatus): StoredSession {

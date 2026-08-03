@@ -1,7 +1,4 @@
 import { InlineKeyboard, InputFile, type Context } from "grammy";
-import { writeFile } from "node:fs/promises";
-import { join } from "node:path";
-import { tmpdir } from "node:os";
 import type { Logger } from "pino";
 import type { AppConfig } from "../config.js";
 import { PolicyEngine } from "../security/policy.js";
@@ -18,6 +15,7 @@ import type {
 } from "../types/control.js";
 import { SessionManager } from "../runtime/session-manager.js";
 import { listWorkspaceProjects, resolveWorkspacePath, type WorkspaceProject } from "../runtime/workspace.js";
+import { withTemporaryTextExport } from "../runtime/temporary-export.js";
 import {
   appendAgentMessageChunk,
   escapeMd,
@@ -568,9 +566,8 @@ export class TelegramGateway {
       if (diff.length < 3800) {
         await ctx.reply(diff);
       } else {
-        const path = join(tmpdir(), `tele-codex-diff-${Date.now()}.patch`);
-        await writeFile(path, diff);
-        await ctx.replyWithDocument(new InputFile(path, "codex-turn.patch"));
+        await withTemporaryTextExport("tele-codex-diff-", "codex-turn.patch", diff,
+          (path) => ctx.replyWithDocument(new InputFile(path, "codex-turn.patch")));
       }
     });
 
@@ -1297,11 +1294,10 @@ export class TelegramGateway {
     }
     const active = sessionId ? this.store.getSession(sessionId) : this.sessions.getActiveSession();
     const filename = `tele-codex-${active?.label.replace(/[^a-z0-9_.-]+/gi, "-") ?? "session"}-${Date.now()}.txt`;
-    const path = join(tmpdir(), filename);
-    await writeFile(path, transcript);
     const chatId = ctx.chat?.id;
     if (!chatId) return;
-    await this.bot.api.sendDocument(chatId, new InputFile(path, filename));
+    await withTemporaryTextExport("tele-codex-transcript-", filename, transcript,
+      (path) => this.bot.api.sendDocument(chatId, new InputFile(path, filename)));
   }
 
   private async forwardCodexEvents(signal: AbortSignal): Promise<void> {

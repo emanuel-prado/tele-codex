@@ -66,6 +66,41 @@ describe("AppServerAdapter connection generations", () => {
     store.close();
   });
 
+  it("keeps agent output out of Event Logs and attributes its event to the owning thread", async () => {
+    const store = new Store(":memory:");
+    const adapter = new AppServerAdapter(config(), store, logger());
+    const internals = adapter as unknown as AdapterInternals;
+    attach(internals, store, 2);
+
+    const eventPromise = adapter.events()[Symbol.asyncIterator]().next();
+    await internals.handleMessage({
+      method: "item/agentMessage/delta",
+      params: { threadId: "thread_1", turnId: "turn_1", itemId: "item_1", delta: "private agent output" }
+    }, 2);
+
+    await expect(eventPromise).resolves.toMatchObject({
+      value: { type: "agentMessage", sessionId: "session_1", text: "private agent output" }
+    });
+    expect(store.recentLogs("session_1", 10)).toEqual([]);
+    adapter.close();
+    store.close();
+  });
+
+  it("does not fan app-server stderr out to session Event Logs", () => {
+    const store = new Store(":memory:");
+    const server = new FakeAppServer();
+    const adapter = new AppServerAdapter(config(), store, logger(), undefined, server);
+    const internals = adapter as unknown as AdapterInternals;
+    attach(internals, store, 2);
+
+    expect(server.listenerCount("stderr")).toBe(0);
+    server.emit("stderr", "private stderr from /private/workspace", 2);
+
+    expect(store.recentLogs("session_1", 10)).toEqual([]);
+    adapter.close();
+    store.close();
+  });
+
   it("does not let an old close event tear down a newer attachment", () => {
     const store = new Store(":memory:");
     const adapter = new AppServerAdapter(config(), store, logger());

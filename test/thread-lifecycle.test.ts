@@ -44,7 +44,7 @@ describe("Codex thread persistence", () => {
     expect(store.getSession("session_old")).toBeUndefined();
     expect(store.getTranscript("session_new")).toContain("old transcript");
     expect(store.getTranscript("session_new")).toContain("new transcript");
-    expect(store.recentLogs("session_new", 10)).toHaveLength(2);
+    expect(store.recentLogs("session_new", 10)).toEqual([]);
     expect(store.getPendingAction("action_1")?.sessionId).toBe("session_new");
     expect(store.getTokenUsage("session_new")?.total.totalTokens).toBe(300);
     expect(store.getProgress("session_new")?.plan[0]?.step).toBe("new");

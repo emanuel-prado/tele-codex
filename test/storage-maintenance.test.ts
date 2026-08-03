@@ -1,7 +1,7 @@
 import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
 import { migrateDatabase, MigrationError } from "../src/store/migrations.js";
-import { NotificationOutboxRepository, TranscriptLogRepository } from "../src/store/repositories.js";
+import { EventLogRepository, NotificationOutboxRepository, TranscriptRepository } from "../src/store/repositories.js";
 import { Store } from "../src/store/store.js";
 import type { PendingAction } from "../src/types/events.js";
 
@@ -49,7 +49,7 @@ describe("versioned SQLite storage", () => {
       );
     `);
 
-    expect(migrateDatabase(db)).toBe(6);
+    expect(migrateDatabase(db)).toBe(7);
     expect(db.prepare("select token, action_id, resource_kind, expected_version, user_id from callback_tokens order by token").all()).toEqual([
       { token: "owned", action_id: "b", resource_kind: "legacy", expected_version: null, user_id: 20 },
       { token: "project", action_id: "/workspace/one", resource_kind: "workspace-project", expected_version: 42, user_id: 20 }
@@ -66,7 +66,7 @@ describe("versioned SQLite storage", () => {
     const db = new Database(":memory:");
     migrateDatabase(db);
     const notifications = new NotificationOutboxRepository(db);
-    const transcripts = new TranscriptLogRepository(db, 10);
+    const transcripts = new TranscriptRepository(db, 10);
     notifications.enqueue("done:1", 10, { text: "done" });
     transcripts.append("session", "hello", { turnId: "turn", itemId: "item" });
     transcripts.append("session", " world", { turnId: "turn", itemId: "item" });
@@ -74,6 +74,26 @@ describe("versioned SQLite storage", () => {
     expect(notifications.due()).toHaveLength(1);
     expect(transcripts.chunkCount("session")).toBe(2);
     expect(transcripts.text("session")).toContain("hello world");
+    db.close();
+  });
+
+  it("scrubs delivered outbox payloads but preserves retryable delivery content", () => {
+    const db = new Database(":memory:");
+    migrateDatabase(db);
+    const notifications = new NotificationOutboxRepository(db);
+    notifications.enqueue("retry", 10, { text: "private retry payload" });
+    notifications.enqueue("sent", 10, { text: "private delivered payload" });
+    const [retry, sent] = notifications.due();
+
+    notifications.retry(retry!.id, 1, "https://api.telegram.org/bot123:secret/sendMessage failed");
+    notifications.markSent(sent!.id);
+
+    expect(db.prepare("select payload_json from notification_outbox where id = ?").get(retry!.id))
+      .toEqual({ payload_json: JSON.stringify({ text: "private retry payload" }) });
+    expect(db.prepare("select payload_json from notification_outbox where id = ?").get(sent!.id))
+      .toEqual({ payload_json: "{}" });
+    expect(db.prepare("select last_error from notification_outbox where id = ?").get(retry!.id))
+      .not.toEqual(expect.objectContaining({ last_error: expect.stringContaining("123:secret") }));
     db.close();
   });
 
@@ -86,6 +106,25 @@ describe("versioned SQLite storage", () => {
     expect(store.getTranscript("session")).toContain("x".repeat(1_000));
     expect(store.finalizeTranscriptTurn("session", "turn")).toBe(1);
     store.close();
+  });
+
+  it("normalizes Event Logs without retaining payloads or sensitive paths", () => {
+    const db = new Database(":memory:");
+    migrateDatabase(db);
+    const logs = new EventLogRepository(db);
+
+    logs.appendLog({
+      sessionId: "session",
+      type: "connection.failure",
+      severity: "error",
+      text: "failed in /home/controller/private-workspace via https://api.telegram.org/bot123:secret/sendMessage",
+      payload: { params: { answer: "private approval answer" } }
+    });
+
+    const row = db.prepare("select text, payload_json from event_log").get() as { text: string; payload_json: string | null };
+    expect(row.text).not.toMatch(/private-workspace|123:secret/);
+    expect(row.payload_json).toBeNull();
+    db.close();
   });
 
   it("removes stale operational data without deleting unresolved interactions or undelivered notifications", () => {
@@ -117,7 +156,7 @@ describe("versioned SQLite storage", () => {
     expect(store.getPendingAction("delivering")).toBeDefined();
     expect(store.claimCallbackToken("active-control", 1, 2, "claim")).toBeUndefined();
     expect(store.dueOutbox()).toHaveLength(1);
-    expect(store.diagnostics()).toMatchObject({ schemaVersion: 6, walBytes: 0 });
+    expect(store.diagnostics()).toMatchObject({ schemaVersion: 7, walBytes: 0 });
     store.close();
   });
 });

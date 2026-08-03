@@ -159,6 +159,24 @@ describe("LegacyTmuxBridge", () => {
     expect(store.getLegacyTmuxAttachment(attachment.id)?.status).toBe("attached");
     store.close();
   });
+
+  it("does not log tmux input when a command fails", async () => {
+    const store = new Store(":memory:");
+    const tmux = fakeTmux("output");
+    const logs: unknown[] = [];
+    const bridge = new LegacyTmuxBridge(config(), store, { warn(fields: unknown) { logs.push(fields); } } as never,
+      async (file, args, options) => {
+        if (args[0] === "set-buffer") throw new Error(`tmux rejected ${args.join(" ")}`);
+        return tmux.run(file, args, options);
+      }, async () => {});
+    const attachment = await bridge.attach("work:1.0", 10);
+    bridge.markReady(attachment.id, 10);
+
+    await expect(bridge.send(attachment.id, 10, "private tmux input")).rejects.toThrow();
+
+    expect(JSON.stringify(logs)).not.toContain("private tmux input");
+    store.close();
+  });
 });
 
 describe("legacy tmux migration", () => {

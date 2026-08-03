@@ -75,12 +75,6 @@ export class AppServerAdapter implements AppServerRuntime {
     this.rpc.on("message", (message: JsonRpcMessage, generation: number) => {
       void this.handleMessage(message, generation).catch((error) => this.failRuntime(error));
     });
-    this.rpc.on("stderr", (chunk: string, generation: number) => {
-      if (generation !== this.connectionGeneration) return;
-      for (const session of this.store.listSessions()) {
-        this.store.appendLog({ sessionId: session.id, type: "appserver.stderr", severity: "debug", text: chunk });
-      }
-    });
     this.rpc.on("close", (_details: unknown, generation: number) => this.handleDisconnect(generation));
     this.rpc.on("failure", (failure: AppServerFailure, generation: number) => {
       if (generation === this.connectingGeneration) {
@@ -724,13 +718,6 @@ export class AppServerAdapter implements AppServerRuntime {
       return;
     }
     if (!sessionId) return;
-
-    this.store.appendLog({
-      sessionId,
-      type: message.method ?? "notification",
-      severity: message.method === "error" ? "error" : "info",
-      text: JSON.stringify(message.params)
-    });
 
     if (message.method === "turn/started") {
       const turn = asRecord(params.turn);
