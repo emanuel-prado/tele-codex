@@ -219,10 +219,6 @@ export class AppServerAdapter implements AppServerRuntime {
       const responseDecision = decision.protocolDecision ?? (decision.decision === "acceptForSession" ? "acceptForSession" : decision.decision);
       this.rpc.respond(action.requestId, { decision: responseDecision }, generation);
     }
-
-    if (decision.decision === "acceptForSession") {
-      this.store.grantSession(action.id, action.sessionId, action.payload, Date.now() + 24 * 60 * 60 * 1000);
-    }
   }
 
   async updateSettings(sessionId: string, options: SessionControlOptions): Promise<void> {
@@ -822,7 +818,6 @@ function makeActionFromServerRequest(
     title,
     body: body || JSON.stringify(params),
     payload: { method, params },
-    nonce: createNonce(),
     expiresAt: nowMs() + actionTimeout(params, timeoutMs)
   };
   if (typeof params.threadId === "string") action.threadId = params.threadId;

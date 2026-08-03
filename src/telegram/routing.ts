@@ -1,8 +1,7 @@
 import { SessionManager } from "../runtime/session-manager.js";
 import { Store, type StoredSession } from "../store/store.js";
 import type { CodexThreadSummary } from "../types/control.js";
-import { createId, createNonce } from "../utils/ids.js";
-import { TelegramCallbackController } from "./callback-controller.js";
+import { assertCallbackResource, TelegramCallbackController } from "./callback-controller.js";
 
 const PICKER_TTL_MS = 10 * 60_000;
 const COMPOSE_TTL_MS = 5 * 60_000;
@@ -30,22 +29,21 @@ export class TelegramRouting {
   }
 
   pickerToken(chatId: number, userId: number, thread: CodexThreadSummary, local?: StoredSession): string {
-    const token = createNonce(12);
     const payload: SendPickerPayload = {
       threadId: thread.id,
       expectedVersion: local ? this.resourceVersion(local.id) : thread.updatedAt ?? 0
     };
     if (local) payload.sessionId = local.id;
-    this.store.putCallbackToken({
-      token,
-      actionId: createId("send_picker"),
+    return this.callbacks.issue({
+      actionId: local?.id ?? thread.id,
+      resourceKind: local ? "session" : "codex-thread",
+      expectedVersion: payload.expectedVersion,
       chatId,
       userId,
       operation: "select-send-thread",
       payload,
       expiresAt: Date.now() + PICKER_TTL_MS
     });
-    return token;
   }
 
   async selectPicker(token: string, chatId: number, userId: number): Promise<StoredSession> {
@@ -54,6 +52,12 @@ export class TelegramRouting {
       if (typeof payload.threadId !== "string" || typeof payload.expectedVersion !== "number") {
         throw new Error("This thread picker is invalid. Run /send again.");
       }
+      assertCallbackResource(
+        callback,
+        payload.sessionId ? "session" : "codex-thread",
+        payload.sessionId ?? payload.threadId,
+        payload.expectedVersion
+      );
 
       let session = payload.sessionId ? this.store.getSession(payload.sessionId) : this.store.getSessionByCodexThreadId(payload.threadId);
       if (session) {

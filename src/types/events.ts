@@ -61,7 +61,6 @@ export interface PendingAction {
   title: string;
   body: string;
   payload: unknown;
-  nonce: string;
   expiresAt: number;
 }
 

@@ -6,6 +6,7 @@ import type { LegacyTmuxBridge } from "../src/legacy/legacy-tmux-bridge.js";
 import type { SessionManager } from "../src/runtime/session-manager.js";
 import { PolicyEngine } from "../src/security/policy.js";
 import { Store } from "../src/store/store.js";
+import type { StoredSession } from "../src/store/store.js";
 import type { TelegramCommandDefinition, TelegramRuntime } from "../src/telegram/bot-runtime.js";
 import { TelegramGateway } from "../src/telegram/gateway.js";
 
@@ -61,16 +62,21 @@ describe("TelegramGateway dispatch", () => {
   let runtime: FakeTelegramRuntime;
   let gateway: TelegramGateway;
   let attachedThread: string | undefined;
+  let activeSession: StoredSession | undefined;
+  let killCount: number;
 
   beforeEach(() => {
     store = new Store(":memory:");
     runtime = new FakeTelegramRuntime();
+    activeSession = undefined;
+    killCount = 0;
     const sessions = {
-      getActiveSession: () => undefined,
+      getActiveSession: () => activeSession,
       attach: async ({ codexThreadId }: { codexThreadId: string }) => {
         attachedThread = codexThreadId;
         return { id: "session_1" };
       },
+      kill: async () => { killCount += 1; },
       goal: async () => undefined
     } as unknown as SessionManager;
     const config = testConfig();
@@ -110,15 +116,22 @@ describe("TelegramGateway dispatch", () => {
     expect(sentTexts(runtime)).toContain("Unknown command. Run /help to see supported commands.");
   });
 
-  it("dispatches known panel callbacks and answers unsupported panel actions", async () => {
-    await runtime.bot.handleUpdate(callbackUpdate("panel:status", nextUpdateId()));
+  it("dispatches owned panel callbacks and rejects unsupported control actions", async () => {
+    await runtime.bot.handleUpdate(messageUpdate("/panel", nextUpdateId()));
+    const statusControl = callbackData(runtime, "Status");
+    runtime.calls.length = 0;
+    await runtime.bot.handleUpdate(callbackUpdate(statusControl, nextUpdateId()));
     expect(sentTexts(runtime)).toContain("No active session.");
     expect(callbackAnswers(runtime).length).toBe(1);
 
     runtime.calls.length = 0;
-    await runtime.bot.handleUpdate(callbackUpdate("panel:removed", nextUpdateId()));
+    store.putCallbackToken({
+      token: "unsupported", actionId: "main", resourceKind: "panel", chatId: 100, userId: 100,
+      operation: "panel:removed", payload: {}, expiresAt: Date.now() + 60_000
+    });
+    await runtime.bot.handleUpdate(callbackUpdate("ctl:unsupported", nextUpdateId()));
     expect(callbackAnswers(runtime)).toContainEqual(expect.objectContaining({
-      text: "Unsupported panel action. Run /panel again.",
+      text: "This control is not valid for that operation.",
       show_alert: true
     }));
   });
@@ -131,12 +144,42 @@ describe("TelegramGateway dispatch", () => {
     }));
   });
 
-  it("answers malformed callbacks whose prefixes are recognized", async () => {
+  it("rejects removed raw destructive callback payloads", async () => {
     await runtime.bot.handleUpdate(callbackUpdate("kill:missing", nextUpdateId()));
     expect(callbackAnswers(runtime)).toContainEqual(expect.objectContaining({
-      text: "Invalid interrupt control. Run /kill again.",
+      text: "This control is unknown or no longer supported. Run the command again.",
       show_alert: true
     }));
+  });
+
+  it("does not expose raw approval commands", async () => {
+    await runtime.bot.handleUpdate(messageUpdate("/approve action_1", nextUpdateId()));
+    expect(sentTexts(runtime)).toContain("Unknown command. Run /help to see supported commands.");
+  });
+
+  it("rejects stale destructive controls and applies a valid confirmation once", async () => {
+    activeSession = store.upsertSession({
+      id: "session_1", adapter: "appserver", label: "one", codexThreadId: "thread_1"
+    }, "active");
+    await runtime.bot.handleUpdate(messageUpdate("/kill", nextUpdateId()));
+    const staleControl = callbackData(runtime, "Confirm kill");
+    store.setPaused(activeSession.id, true);
+    activeSession = store.getSession(activeSession.id);
+    runtime.calls.length = 0;
+
+    await runtime.bot.handleUpdate(callbackUpdate(staleControl, nextUpdateId()));
+    expect(killCount).toBe(0);
+    expect(callbackAnswers(runtime)[0]?.text).toMatch(/session changed/i);
+
+    runtime.calls.length = 0;
+    await runtime.bot.handleUpdate(messageUpdate("/kill", nextUpdateId()));
+    const validControl = callbackData(runtime, "Confirm kill");
+    runtime.calls.length = 0;
+    await runtime.bot.handleUpdate(callbackUpdate(validControl, nextUpdateId()));
+    await runtime.bot.handleUpdate(callbackUpdate(validControl, nextUpdateId()));
+
+    expect(killCount).toBe(1);
+    expect(callbackAnswers(runtime).at(-1)?.text).toMatch(/already used/i);
   });
 });
 
@@ -190,6 +233,15 @@ function callbackAnswers(runtime: FakeTelegramRuntime): Record<string, unknown>[
   return runtime.calls
     .filter((call) => call.method === "answerCallbackQuery")
     .map((call) => call.payload);
+}
+
+function callbackData(runtime: FakeTelegramRuntime, label: string): string {
+  for (const call of runtime.calls) {
+    const markup = call.payload.reply_markup as { inline_keyboard?: Array<Array<{ text?: string; callback_data?: string }>> } | undefined;
+    const button = markup?.inline_keyboard?.flat().find((item) => item.text === label);
+    if (button?.callback_data) return button.callback_data;
+  }
+  throw new Error(`Missing callback button: ${label}`);
 }
 
 function testConfig(): AppConfig {

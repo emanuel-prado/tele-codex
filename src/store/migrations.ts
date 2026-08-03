@@ -1,6 +1,6 @@
 import type Database from "better-sqlite3";
 
-export const CURRENT_SCHEMA_VERSION = 5;
+export const CURRENT_SCHEMA_VERSION = 6;
 
 export interface Migration {
   version: number;
@@ -228,6 +228,100 @@ const MIGRATIONS: readonly Migration[] = [
           on legacy_tmux_observations(attachment_id, observed_at);
       `);
     }
+  },
+  {
+    version: 6,
+    name: "owned-interaction-controls",
+    up(db) {
+      db.exec(`
+        delete from callback_tokens where user_id is null;
+        alter table callback_tokens rename to callback_tokens_v5;
+        create table callback_tokens (
+          token text primary key,
+          action_id text not null,
+          resource_kind text not null,
+          expected_version integer,
+          chat_id integer not null,
+          user_id integer not null,
+          operation text not null,
+          payload_json text not null,
+          expires_at integer not null,
+          created_at integer not null,
+          consumed_at integer,
+          claim_id text,
+          claimed_at integer
+        );
+        insert into callback_tokens
+          (token, action_id, resource_kind, expected_version, chat_id, user_id, operation,
+           payload_json, expires_at, created_at, consumed_at, claim_id, claimed_at)
+        select token,
+          case
+            when operation = 'select-workspace-project' then json_extract(payload_json, '$.path')
+            when operation = 'resume-codex-thread' then json_extract(payload_json, '$.threadId')
+            when operation = 'select-session-model' then json_extract(payload_json, '$.sessionId')
+            when operation in ('select-background-process', 'confirm-background-process') then json_extract(payload_json, '$.processId')
+            when operation = 'select-send-thread' then coalesce(json_extract(payload_json, '$.sessionId'), json_extract(payload_json, '$.threadId'))
+            when operation in ('legacy-tmux-attach', 'legacy-tmux-probe') then coalesce(json_extract(payload_json, '$.attachmentId'), json_extract(payload_json, '$.target'))
+            else action_id
+          end,
+          case
+            when operation = 'select-workspace-project' then 'workspace-project'
+            when operation = 'resume-codex-thread' then 'codex-thread'
+            when operation = 'select-session-model' then 'session'
+            when operation in ('select-background-process', 'confirm-background-process') then 'background-process'
+            when operation = 'select-send-thread' and json_extract(payload_json, '$.sessionId') is not null then 'session'
+            when operation = 'select-send-thread' then 'codex-thread'
+            when operation = 'legacy-tmux-attach' then 'legacy-tmux-target'
+            when operation = 'legacy-tmux-probe' then 'legacy-tmux-attachment'
+            when operation in ('decision', 'start', 'custom', 'back', 'skip', 'answer') then 'pending-action'
+            else 'legacy'
+          end,
+          case
+            when json_type(payload_json, '$.expectedVersion') in ('integer', 'real')
+              then cast(json_extract(payload_json, '$.expectedVersion') as integer)
+            else null
+          end,
+          chat_id, user_id, operation,
+          payload_json, expires_at, created_at, consumed_at, claim_id, claimed_at
+        from callback_tokens_v5;
+        drop table callback_tokens_v5;
+        create index callback_tokens_cleanup on callback_tokens(expires_at, consumed_at);
+        drop table if exists session_grants;
+
+        alter table pending_actions rename to pending_actions_v5;
+        create table pending_actions (
+          id text primary key,
+          kind text not null,
+          session_id text not null,
+          request_id text,
+          request_id_type text,
+          connection_generation integer,
+          thread_id text,
+          turn_id text,
+          item_id text,
+          title text not null,
+          body text not null,
+          payload_json text not null,
+          status text not null,
+          expires_at integer not null,
+          created_at integer not null,
+          resolved_at integer,
+          telegram_chat_id integer,
+          telegram_message_id integer,
+          failure_reason text
+        );
+        insert into pending_actions
+          (id, kind, session_id, request_id, request_id_type, connection_generation, thread_id,
+           turn_id, item_id, title, body, payload_json, status, expires_at, created_at,
+           resolved_at, telegram_chat_id, telegram_message_id, failure_reason)
+        select id, kind, session_id, request_id, request_id_type, connection_generation, thread_id,
+          turn_id, item_id, title, body, payload_json, status, expires_at, created_at,
+          resolved_at, telegram_chat_id, telegram_message_id, failure_reason
+        from pending_actions_v5;
+        drop table pending_actions_v5;
+        create index pending_actions_cleanup on pending_actions(status, resolved_at, expires_at);
+      `);
+    }
   }
 ];
 
@@ -253,7 +347,7 @@ function migrateLegacySessions(db: Database.Database): void {
         Math.max(...rows.map((row) => Number(row.updated_at))));
     mergeTokenUsage(db, stateIds, canonicalId);
     mergeRuntime(db, stateIds, canonicalId);
-    for (const table of ["pending_actions", "event_log", "transcript_chunks", "session_grants"]) {
+    for (const table of ["pending_actions", "event_log", "transcript_chunks", "session_grants"].filter((name) => tableExists(db, name))) {
       db.prepare(`update ${table} set session_id = ? where session_id in (${marks})`).run(canonicalId, ...ids);
     }
     const active = runtimeValue<string>(db, "last_active_session_id");
@@ -298,6 +392,10 @@ function mergeRuntime(db: Database.Database, sessionIds: string[], canonicalId: 
 function addColumn(db: Database.Database, table: string, column: string, type: string): void {
   const columns = db.prepare(`pragma table_info(${table})`).all() as Array<{ name: string }>;
   if (!columns.some((item) => item.name === column)) db.exec(`alter table ${table} add column ${column} ${type}`);
+}
+
+function tableExists(db: Database.Database, table: string): boolean {
+  return Boolean(db.prepare("select 1 from sqlite_master where type = 'table' and name = ?").get(table));
 }
 
 function runtimeValue<T>(db: Database.Database, key: string): T | undefined {

@@ -229,7 +229,6 @@ function pendingAction() {
     title: "Approval",
     body: "run",
     payload: { method: "item/commandExecution/requestApproval", params: {} },
-    nonce: "nonce",
     expiresAt: Date.now() + 60_000
   };
 }

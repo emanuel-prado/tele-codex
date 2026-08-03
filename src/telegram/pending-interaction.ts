@@ -1,7 +1,7 @@
 import type { PendingAction, UserDecision } from "../types/events.js";
 import { requestUserInputQuestions, type UserInputQuestion } from "../adapters/app-server-protocol.js";
 import { Store, type CallbackToken, type InteractionDraft, type StoredPendingAction } from "../store/store.js";
-import { createNonce } from "../utils/ids.js";
+import { TelegramCallbackController, type CallbackScope } from "./callback-controller.js";
 
 export interface InteractionButton {
   label: string;
@@ -34,10 +34,11 @@ interface WizardQuestion extends UserInputQuestion {
 export class PendingInteractionManager {
   constructor(
     private readonly store: Store,
-    private readonly allowSessionGrants: boolean
+    private readonly allowSessionGrants: boolean,
+    private readonly callbacks = new TelegramCallbackController(store)
   ) {}
 
-  actionView(action: StoredPendingAction | PendingAction, chatId: number): InteractionView {
+  actionView(action: StoredPendingAction | PendingAction, chatId: number, userId: number): InteractionView {
     const retryPrefix = "status" in action && action.status === "failed"
       ? `Previous submission failed${action.failureReason ? `: ${action.failureReason}` : ""}. You can retry this control.\n\n`
       : "";
@@ -51,7 +52,7 @@ export class PendingInteractionManager {
       }
       return {
         text: `${retryPrefix}${questions.length} question${questions.length === 1 ? "" : "s"}. Answers are collected step by step and submitted together.`,
-        rows: [[this.callbackButton("Answer", action, chatId, "start")]]
+        rows: [[this.callbackButton("Answer", action, chatId, userId, "start")]]
       };
     }
 
@@ -63,8 +64,8 @@ export class PendingInteractionManager {
           rows: [
             [{ label: "Open URL", url: params.url }],
             [
-              this.callbackButton("Completed", action, chatId, "decision", { value: "accept" }),
-              this.callbackButton("Cancel", action, chatId, "decision", { value: "cancel" })
+              this.callbackButton("Completed", action, chatId, userId, "decision", { value: "accept" }),
+              this.callbackButton("Cancel", action, chatId, userId, "decision", { value: "cancel" })
             ]
           ]
         };
@@ -72,8 +73,8 @@ export class PendingInteractionManager {
       return {
         text: `${retryPrefix}MCP form request. Values are validated and submitted together.`,
         rows: [
-          [this.callbackButton("Fill form", action, chatId, "start")],
-          [this.callbackButton("Decline", action, chatId, "decision", { value: "decline" })]
+          [this.callbackButton("Fill form", action, chatId, userId, "start")],
+          [this.callbackButton("Decline", action, chatId, userId, "decision", { value: "decline" })]
         ]
       };
     }
@@ -81,21 +82,33 @@ export class PendingInteractionManager {
     const decisions = approvalDecisions(action, this.allowSessionGrants);
     return {
       text: `${retryPrefix}Choose a decision. Duplicate submissions are blocked while Codex processes the response.`,
-      rows: decisions.map((item) => [this.callbackButton(item.label, action, chatId, "decision", { value: item.value })])
+      rows: decisions.map((item) => [this.callbackButton(item.label, action, chatId, userId, "decision", { value: item.value })])
     };
   }
 
-  handleCallback(token: string, chatId: number, userId: number): InteractionResult {
-    const claimId = createNonce(12);
-    const callback = this.store.claimCallbackToken(token, chatId, userId, claimId);
-    if (!callback) return { kind: "notice", text: "This control expired or was already used." };
+  async handleCallback(
+    token: string,
+    scope: CallbackScope,
+    submit: (decision: UserDecision) => Promise<void>
+  ): Promise<InteractionResult> {
     try {
-      const result = this.handleClaimedCallback(callback, chatId, userId);
-      if (result.kind === "submit") this.store.releaseCallbackToken(token, claimId);
-      else this.store.commitCallbackToken(token, claimId);
-      return result;
+      return await this.callbacks.execute(
+        token,
+        scope,
+        ["decision", "start", "custom", "back", "skip", "answer"],
+        async (callback) => {
+          if (callback.resourceKind !== "pending-action") {
+            return { kind: "notice", text: "This interaction control is invalid." };
+          }
+          const result = this.handleClaimedCallback(callback, scope.chatId, scope.userId);
+          if (result.kind === "submit") await submit(result.decision);
+          return result;
+        }
+      );
     } catch (error) {
-      this.store.releaseCallbackToken(token, claimId);
+      if (error instanceof Error && /expired|already used|another chat or user/i.test(error.message)) {
+        return { kind: "notice", text: "This control expired, was already used, or belongs to another chat or user." };
+      }
       throw error;
     }
   }
@@ -210,17 +223,17 @@ export class PendingInteractionManager {
     const question = questions[draft.questionIndex];
     if (!question) return { kind: "notice", text: "Question state is invalid." };
     const rows = question.options.map((option) => [
-      this.callbackButton(option.label.slice(0, 48), action, draft.chatId, "answer", { value: option.label })
+      this.callbackButton(option.label.slice(0, 48), action, draft.chatId, draft.userId, "answer", { value: option.label })
     ]);
     if (question.isOther || question.options.length === 0) {
-      rows.push([this.callbackButton("Custom answer", action, draft.chatId, "custom")]);
+      rows.push([this.callbackButton("Custom answer", action, draft.chatId, draft.userId, "custom")]);
     }
     if (question.optional || question.defaultValue !== undefined) {
       rows.push([
-        this.callbackButton(question.defaultValue !== undefined ? `Use default: ${question.defaultValue}`.slice(0, 48) : "Skip", action, draft.chatId, "skip")
+        this.callbackButton(question.defaultValue !== undefined ? `Use default: ${question.defaultValue}`.slice(0, 48) : "Skip", action, draft.chatId, draft.userId, "skip")
       ]);
     }
-    if (draft.questionIndex > 0) rows.push([this.callbackButton("Back", action, draft.chatId, "back")]);
+    if (draft.questionIndex > 0) rows.push([this.callbackButton("Back", action, draft.chatId, draft.userId, "back")]);
     return {
       kind: "view",
       view: {
@@ -241,11 +254,19 @@ export class PendingInteractionManager {
     label: string,
     action: StoredPendingAction | PendingAction,
     chatId: number,
+    userId: number,
     operation: string,
     payload: unknown = {}
   ): InteractionButton {
-    const token = createNonce(9);
-    this.store.putCallbackToken({ token, actionId: action.id, chatId, operation, payload, expiresAt: action.expiresAt });
+    const token = this.callbacks.issue({
+      actionId: action.id,
+      resourceKind: "pending-action",
+      chatId,
+      userId,
+      operation,
+      payload,
+      expiresAt: Math.min(action.expiresAt, Date.now() + 10 * 60_000)
+    });
     return { label, callbackData: `cb:${token}` };
   }
 }
