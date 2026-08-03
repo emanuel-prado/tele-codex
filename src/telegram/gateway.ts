@@ -1,5 +1,5 @@
 import { InlineKeyboard, InputFile, type Context } from "grammy";
-import { stat, writeFile } from "node:fs/promises";
+import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { Logger } from "pino";
@@ -307,8 +307,7 @@ export class TelegramGateway {
         await this.showWorkspacePicker(ctx);
         return;
       }
-      const project = resolveWorkspacePath(this.config.workspaceRoot, rest || String(ctx.match ?? "").trim());
-      await this.ensureDirectory(project.path);
+      const project = await resolveWorkspacePath(this.config.workspaceRoot, rest || String(ctx.match ?? "").trim());
       await this.startProjectSession(ctx, project);
     });
 
@@ -1260,16 +1259,16 @@ export class TelegramGateway {
   }
 
   private async startProjectSession(ctx: Context, project: WorkspaceProject): Promise<void> {
+    const canonicalProject = await resolveWorkspacePath(this.config.workspaceRoot, project.path);
     try {
-      await this.ensureDirectory(project.path);
-      const session = await this.sessions.newSession({ cwd: project.path, label: project.name });
-      await ctx.reply(`Started app-server session in ${project.name}:\n${session.id}`);
+      const session = await this.sessions.newSession({ cwd: canonicalProject.path, label: canonicalProject.name });
+      await ctx.reply(`Started app-server session in ${canonicalProject.name}:\n${session.id}`);
     } catch (error) {
       const detail = error instanceof Error ? error.message : "Unknown startup error.";
-      this.logger.error({ err: error, project }, "failed to start Codex app-server session from Telegram");
+      this.logger.error({ err: error, projectName: canonicalProject.name }, "failed to start Codex app-server session from Telegram");
       await ctx.reply(
         [
-          `Could not start Codex in ${project.name}.`,
+          `Could not start Codex in ${canonicalProject.name}.`,
           "",
           detail,
           "",
@@ -1491,11 +1490,6 @@ export class TelegramGateway {
       const sent = await this.bot.api.sendMessage(chatId, text);
       this.store.setMessageThread(chatId, sent.message_id, sessionId);
     }
-  }
-
-  private async ensureDirectory(path: string): Promise<void> {
-    const info = await stat(path);
-    if (!info.isDirectory()) throw new Error(`Not a directory: ${path}`);
   }
 
   private allowedDeliveryChats(): number[] {
