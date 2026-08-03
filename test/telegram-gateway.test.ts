@@ -7,6 +7,7 @@ import type { SessionManager } from "../src/runtime/session-manager.js";
 import { PolicyEngine } from "../src/security/policy.js";
 import { Store } from "../src/store/store.js";
 import type { StoredSession } from "../src/store/store.js";
+import type { PendingAction } from "../src/types/events.js";
 import type { TelegramCommandDefinition, TelegramRuntime } from "../src/telegram/bot-runtime.js";
 import { TelegramGateway } from "../src/telegram/gateway.js";
 
@@ -64,12 +65,14 @@ describe("TelegramGateway dispatch", () => {
   let attachedThread: string | undefined;
   let activeSession: StoredSession | undefined;
   let killCount: number;
+  let forwardedText: string[];
 
   beforeEach(() => {
     store = new Store(":memory:");
     runtime = new FakeTelegramRuntime();
     activeSession = undefined;
     killCount = 0;
+    forwardedText = [];
     const sessions = {
       getActiveSession: () => activeSession,
       attach: async ({ codexThreadId }: { codexThreadId: string }) => {
@@ -77,6 +80,7 @@ describe("TelegramGateway dispatch", () => {
         return { id: "session_1" };
       },
       kill: async () => { killCount += 1; },
+      sendToSession: async (_sessionId: string, text: string) => { forwardedText.push(text); },
       goal: async () => undefined
     } as unknown as SessionManager;
     const config = testConfig();
@@ -180,6 +184,27 @@ describe("TelegramGateway dispatch", () => {
 
     expect(killCount).toBe(1);
     expect(callbackAnswers(runtime).at(-1)?.text).toMatch(/already used/i);
+  });
+
+  it("consumes text for a non-pending interaction instead of forwarding it to Codex", async () => {
+    activeSession = store.upsertSession({
+      id: "session_1", adapter: "appserver", label: "one", codexThreadId: "thread_1"
+    }, "active");
+    const action: PendingAction = {
+      id: "elicitation_1", kind: "mcpElicitation", sessionId: activeSession.id, requestId: 4,
+      title: "MCP form", body: "form", expiresAt: Date.now() + 60_000,
+      payload: { params: { requestedSchema: { type: "object", properties: { note: { type: "string" } } } } }
+    };
+    store.putPendingAction(action);
+    store.putInteractionDraft({
+      actionId: action.id, chatId: 100, userId: 100, questionIndex: 0, answers: {}, awaitingText: true
+    });
+    store.claimPendingAction(action.id);
+
+    await runtime.bot.handleUpdate(messageUpdate("duplicate answer", nextUpdateId()));
+
+    expect(forwardedText).toEqual([]);
+    expect(sentTexts(runtime)).toContainEqual(expect.stringMatching(/already being submitted/i));
   });
 });
 

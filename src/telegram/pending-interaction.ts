@@ -1,5 +1,5 @@
 import type { PendingAction, UserDecision } from "../types/events.js";
-import { requestUserInputQuestions, type UserInputQuestion } from "../adapters/app-server-protocol.js";
+import { requestUserInputQuestions } from "../adapters/app-server-protocol.js";
 import { Store, type CallbackToken, type InteractionDraft, type StoredPendingAction } from "../store/store.js";
 import { TelegramCallbackController, type CallbackScope } from "./callback-controller.js";
 
@@ -23,9 +23,22 @@ interface TokenPayload {
   value?: unknown;
 }
 
-interface WizardQuestion extends UserInputQuestion {
-  optional?: boolean;
-  defaultValue?: string;
+interface WizardOption {
+  label: string;
+  value: unknown;
+  description?: string;
+}
+
+interface WizardQuestion {
+  id: string;
+  header: string;
+  question: string;
+  isOther: boolean;
+  isSecret: boolean;
+  options: WizardOption[];
+  optional: boolean;
+  hasDefault: boolean;
+  defaultValue?: unknown;
   valueType?: string;
   minimum?: number;
   maximum?: number;
@@ -165,20 +178,20 @@ export class PendingInteractionManager {
     }
     if (callback.operation === "skip") {
       const question = interactionQuestions(action)[draft.questionIndex];
-      if (!question || (!question.optional && question.defaultValue === undefined)) {
+      if (!question || (!question.optional && !question.hasDefault)) {
         return { kind: "notice", text: "This field is required." };
       }
-      if (question.defaultValue !== undefined) draft.answers[question.id] = { answers: [question.defaultValue] };
+      if (question.hasDefault) draft.answers[question.id] = storedAnswer(question.defaultValue);
       else delete draft.answers[question.id];
       draft.questionIndex += 1;
-      draft.awaitingText = false;
+      draft.awaitingText = draft.questionIndex >= interactionQuestions(action).length;
       this.store.putInteractionDraft(draft);
       if (draft.questionIndex < interactionQuestions(action).length) return this.renderDraft(action, draft);
       const decision: UserDecision = { actionId: action.id, decision: "accept", content: mcpContent(action, draft.answers) };
       return { kind: "submit", decision, text: "Answers submitted; waiting for Codex confirmation." };
     }
-    if (callback.operation === "answer" && typeof payload.value === "string") {
-      const result = this.recordAnswer(action, draft, payload.value);
+    if (callback.operation === "answer" && Object.prototype.hasOwnProperty.call(payload, "value")) {
+      const result = this.recordAnswer(action, draft, payload.value, true);
       return result;
     }
     return { kind: "notice", text: "Unsupported interaction control." };
@@ -188,32 +201,46 @@ export class PendingInteractionManager {
     const draft = this.store.getAwaitingInteractionDraft(chatId, userId);
     if (!draft) return undefined;
     const action = this.store.getPendingAction(draft.actionId);
-    if (!action || !isRetryableStatus(action.status)) {
+    if (!action) {
       this.store.deleteInteractionDraft(draft.actionId);
-      return { kind: "notice", text: "That request is no longer pending." };
+      return { kind: "notice", text: "That request no longer exists. Start again from /pending." };
     }
-    return this.recordAnswer(action, draft, text);
+    if (action.expiresAt <= Date.now() || action.status === "expired") {
+      return { kind: "notice", text: "That request expired. Run /pending to review current requests." };
+    }
+    if (action.status === "failed") {
+      return { kind: "notice", text: "The previous submission failed. Run /pending to retry it explicitly." };
+    }
+    if (action.status === "submitting") {
+      return { kind: "notice", text: "That answer is already being submitted. Wait for Codex confirmation." };
+    }
+    if (action.status !== "pending") {
+      return { kind: "notice", text: "That request is no longer pending. Run /pending to review current requests." };
+    }
+    return this.recordAnswer(action, draft, text, false);
   }
 
-  private recordAnswer(action: StoredPendingAction, draft: InteractionDraft, rawValue: string): InteractionResult {
+  private recordAnswer(action: StoredPendingAction, draft: InteractionDraft, rawValue: unknown, fromOption: boolean): InteractionResult {
     const questions = interactionQuestions(action);
     const question = questions[draft.questionIndex];
-    if (!question) return { kind: "notice", text: "Question state is invalid. Start again from /pending." };
-    const value = rawValue.trim();
-    const validation = validateAnswer(question, value);
-    if (validation) {
+    if (!question) {
+      this.store.deleteInteractionDraft(draft.actionId);
+      return { kind: "notice", text: "That answer draft is stale. Start again from /pending." };
+    }
+    const converted = convertAnswer(question, rawValue, fromOption);
+    if ("error" in converted) {
       draft.awaitingText = true;
       this.store.putInteractionDraft(draft);
-      return { kind: "view", view: { text: validation, rows: [] } };
+      return { kind: "view", view: { text: converted.error, rows: [] } };
     }
-    draft.answers[question.id] = { answers: [value] };
+    draft.answers[question.id] = storedAnswer(converted.value);
     draft.questionIndex += 1;
-    draft.awaitingText = false;
+    draft.awaitingText = draft.questionIndex >= questions.length;
     this.store.putInteractionDraft(draft);
     if (draft.questionIndex < questions.length) return this.renderDraft(action, draft);
 
     const decision: UserDecision = { actionId: action.id, decision: "accept" };
-    if (action.kind === "question") decision.answers = draft.answers;
+    if (action.kind === "question") decision.answers = questionAnswers(draft.answers);
     else decision.content = mcpContent(action, draft.answers);
     return { kind: "submit", decision, text: "Answers submitted to Codex." };
   }
@@ -223,14 +250,14 @@ export class PendingInteractionManager {
     const question = questions[draft.questionIndex];
     if (!question) return { kind: "notice", text: "Question state is invalid." };
     const rows = question.options.map((option) => [
-      this.callbackButton(option.label.slice(0, 48), action, draft.chatId, draft.userId, "answer", { value: option.label })
+      this.callbackButton(option.label.slice(0, 48), action, draft.chatId, draft.userId, "answer", { value: option.value })
     ]);
     if (question.isOther || question.options.length === 0) {
       rows.push([this.callbackButton("Custom answer", action, draft.chatId, draft.userId, "custom")]);
     }
-    if (question.optional || question.defaultValue !== undefined) {
+    if (question.optional || question.hasDefault) {
       rows.push([
-        this.callbackButton(question.defaultValue !== undefined ? `Use default: ${question.defaultValue}`.slice(0, 48) : "Skip", action, draft.chatId, draft.userId, "skip")
+        this.callbackButton(question.hasDefault ? `Use default: ${displayValue(question.defaultValue)}`.slice(0, 48) : "Skip", action, draft.chatId, draft.userId, "skip")
       ]);
     }
     if (draft.questionIndex > 0) rows.push([this.callbackButton("Back", action, draft.chatId, draft.userId, "back")]);
@@ -276,7 +303,18 @@ function isRetryableStatus(status: StoredPendingAction["status"]): boolean {
 }
 
 function interactionQuestions(action: StoredPendingAction): WizardQuestion[] {
-  if (action.kind === "question") return requestUserInputQuestions(action.payload).map((question) => ({ ...question, optional: false }));
+  if (action.kind === "question") {
+    return requestUserInputQuestions(action.payload).map((question) => ({
+      id: question.id,
+      header: question.header ?? question.id,
+      question: question.question,
+      isOther: question.isOther ?? false,
+      isSecret: question.isSecret ?? false,
+      options: question.options.map((option) => ({ ...option, value: option.label })),
+      optional: false,
+      hasDefault: false
+    }));
+  }
   if (action.kind !== "mcpElicitation") return [];
   const params = actionParams(action);
   const schema = asRecord(params.requestedSchema);
@@ -292,58 +330,108 @@ function interactionQuestions(action: StoredPendingAction): WizardQuestion[] {
       isOther: options.length === 0 || field.type === "array",
       isSecret: false,
       options,
-      optional: !required.has(id)
+      optional: !required.has(id),
+      hasDefault: Object.prototype.hasOwnProperty.call(field, "default")
     };
     if (typeof field.type === "string") question.valueType = field.type;
-    if (field.default !== undefined) question.defaultValue = String(field.default);
+    if (question.hasDefault) question.defaultValue = field.default;
     if (typeof field.minimum === "number") question.minimum = field.minimum;
     if (typeof field.maximum === "number") question.maximum = field.maximum;
     return question;
   });
 }
 
-function enumOptions(field: Record<string, unknown>): Array<{ label: string; description?: string }> {
+function enumOptions(field: Record<string, unknown>): WizardOption[] {
   const source = field.type === "array" ? asRecord(field.items) : field;
   if (Array.isArray(source.oneOf)) {
     return source.oneOf.flatMap((item) => {
       const option = asRecord(item);
-      return typeof option.const === "string" ? [{ label: typeof option.title === "string" ? option.title : option.const }] : [];
+      return Object.prototype.hasOwnProperty.call(option, "const")
+        ? [{ label: typeof option.title === "string" ? option.title : displayValue(option.const), value: option.const }]
+        : [];
     });
   }
-  if (Array.isArray(source.enum)) return source.enum.map((item) => ({ label: String(item) }));
-  if (field.type === "boolean") return [{ label: "true" }, { label: "false" }];
+  if (Array.isArray(source.enum)) return source.enum.map((item) => ({ label: displayValue(item), value: item }));
+  if (field.type === "boolean") return [{ label: "true", value: true }, { label: "false", value: false }];
   return [];
 }
 
-function validateAnswer(question: WizardQuestion, value: string): string | undefined {
-  if (!value) return "Answer cannot be empty. Send a value.";
-  if (question.options.length > 0 && !question.isOther && !question.options.some((option) => option.label === value)) {
-    return "Choose one of the listed options.";
+function convertAnswer(
+  question: WizardQuestion,
+  rawValue: unknown,
+  fromOption: boolean
+): { value: unknown } | { error: string } {
+  if (fromOption) {
+    return { value: question.valueType === "array" ? [rawValue] : rawValue };
+  }
+  const value = typeof rawValue === "string" ? rawValue.trim() : displayValue(rawValue);
+  if (!value) return { error: "Answer cannot be empty. Send a value." };
+  if (question.valueType === "array") {
+    const values = value.split(",").map((item) => item.trim()).filter(Boolean);
+    if (values.length === 0) return { error: "Send at least one comma-separated value." };
+    const converted = values.map((item) => optionValue(question.options, item));
+    if (question.options.length > 0 && converted.some((item) => item === NO_OPTION)) {
+      return { error: "Use only the listed values, separated by commas." };
+    }
+    return { value: converted.map((item, index) => item === NO_OPTION ? values[index] : item) };
+  }
+  if (question.options.length > 0) {
+    const option = optionValue(question.options, value);
+    if (option === NO_OPTION) return { error: "Choose one of the listed options." };
+    return { value: option };
   }
   if (question.valueType === "number" || question.valueType === "integer") {
     const parsed = Number(value);
-    if (!Number.isFinite(parsed) || (question.valueType === "integer" && !Number.isInteger(parsed))) return "Send a valid number.";
-    if (question.minimum !== undefined && parsed < question.minimum) return `Value must be at least ${question.minimum}.`;
-    if (question.maximum !== undefined && parsed > question.maximum) return `Value must be at most ${question.maximum}.`;
+    if (!Number.isFinite(parsed) || (question.valueType === "integer" && !Number.isInteger(parsed))) return { error: "Send a valid number." };
+    if (question.minimum !== undefined && parsed < question.minimum) return { error: `Value must be at least ${question.minimum}.` };
+    if (question.maximum !== undefined && parsed > question.maximum) return { error: `Value must be at most ${question.maximum}.` };
+    return { value: parsed };
   }
-  if (question.valueType === "boolean" && value !== "true" && value !== "false") return "Choose true or false.";
-  return undefined;
+  if (question.valueType === "boolean") {
+    if (value !== "true" && value !== "false") return { error: "Choose true or false." };
+    return { value: value === "true" };
+  }
+  return { value };
 }
 
-function mcpContent(action: StoredPendingAction, answers: Record<string, { answers: string[] }>): Record<string, unknown> {
+const NO_OPTION = Symbol("no-option");
+
+function optionValue(options: WizardOption[], input: string): unknown | typeof NO_OPTION {
+  const option = options.find((candidate) => candidate.label === input || displayValue(candidate.value) === input);
+  return option ? option.value : NO_OPTION;
+}
+
+function storedAnswer(value: unknown): { answers: string[]; value?: unknown } {
+  return { answers: [displayValue(value)], value };
+}
+
+function questionAnswers(answers: InteractionDraft["answers"]): Record<string, { answers: string[] }> {
+  return Object.fromEntries(Object.entries(answers).map(([id, answer]) => [id, { answers: answer.answers }]));
+}
+
+function displayValue(value: unknown): string {
+  return Array.isArray(value) ? value.map(displayValue).join(", ") : String(value ?? "");
+}
+
+function mcpContent(action: StoredPendingAction, answers: InteractionDraft["answers"]): Record<string, unknown> {
   const schema = asRecord(actionParams(action).requestedSchema);
   const properties = asRecord(schema.properties);
   return Object.fromEntries(
     Object.entries(answers).map(([id, answer]) => {
       const field = asRecord(properties[id]);
+      if (Object.prototype.hasOwnProperty.call(answer, "value")) return [id, answer.value];
       const value = answer.answers[0] ?? "";
       if (field.type === "number" || field.type === "integer") return [id, Number(value)];
       if (field.type === "boolean") return [id, value === "true"];
-      if (field.type === "array") return [id, value.split(",").map((item) => item.trim()).filter(Boolean)];
-      const titled = Array.isArray(field.oneOf)
-        ? field.oneOf.map(asRecord).find((option) => option.title === value)
-        : undefined;
-      return [id, typeof titled?.const === "string" ? titled.const : value];
+      if (field.type === "array") {
+        const options = enumOptions(field);
+        return [id, value.split(",").map((item) => item.trim()).filter(Boolean).map((item) => {
+          const option = optionValue(options, item);
+          return option === NO_OPTION ? item : option;
+        })];
+      }
+      const option = optionValue(enumOptions(field), value);
+      return [id, option === NO_OPTION ? value : option];
     })
   );
 }
