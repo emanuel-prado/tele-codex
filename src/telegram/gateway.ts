@@ -16,6 +16,7 @@ import type {
 import { SessionManager } from "../runtime/session-manager.js";
 import { listWorkspaceProjects, resolveWorkspacePath, type WorkspaceProject } from "../runtime/workspace.js";
 import { withTemporaryTextExport } from "../runtime/temporary-export.js";
+import { sanitizeDiagnosticText } from "../runtime/diagnostics.js";
 import {
   appendAgentMessageChunk,
   escapeMd,
@@ -50,11 +51,25 @@ const INTERACTION_CONTROL_OPERATIONS = [
   "session:confirm-forget"
 ] as const;
 
+const AGENT_MESSAGE_FLUSH_DELAY_MS = 1_200;
+const AGENT_MESSAGE_MAX_ATTEMPTS = 3;
+
+interface AgentMessageDelivery {
+  text: string;
+  attempts: number;
+}
+
+interface AgentMessageBuffer {
+  deliveries: Map<number, AgentMessageDelivery>;
+  timer?: NodeJS.Timeout;
+  flushPromise?: Promise<void>;
+}
+
 export class TelegramGateway {
   private readonly runtime: TelegramRuntime;
   private readonly bot: TelegramRuntime["bot"];
   private readonly runtimeId = createId("runtime");
-  private readonly messageBuffers = new Map<string, { text: string; timer: NodeJS.Timeout }>();
+  private readonly messageBuffers = new Map<string, AgentMessageBuffer>();
   private readonly interactions: PendingInteractionManager;
   private readonly routing: TelegramRouting;
   private readonly callbacks: TelegramCallbackController;
@@ -202,6 +217,14 @@ export class TelegramGateway {
           this.logger.warn({ error, sessionId }, "could not flush buffered agent message during shutdown");
         }
       }
+      for (const [sessionId, buffer] of this.messageBuffers) {
+        if (buffer.timer) clearTimeout(buffer.timer);
+        this.logger.warn(
+          { sessionId, chatCount: buffer.deliveries.size },
+          "dropping buffered Telegram agent messages during shutdown"
+        );
+      }
+      this.messageBuffers.clear();
       try {
         await this.drainOutbox();
       } catch (error) {
@@ -1465,35 +1488,107 @@ export class TelegramGateway {
   private bufferAgentMessage(sessionId: string, text: string, session?: StoredSession): void {
     if (!text.trim()) return;
 
-    const existing = this.messageBuffers.get(sessionId);
-    if (existing) {
-      existing.text = appendAgentMessageChunk(existing.text, text, session);
-      clearTimeout(existing.timer);
-      existing.timer = setTimeout(() => void this.flushAgentMessage(sessionId).catch((error) => {
-        this.health.deliveryFailure(error);
-        this.logger.warn({ error, sessionId }, "buffered Telegram delivery failed");
-      }), 1200);
-      return;
+    let buffer = this.messageBuffers.get(sessionId);
+    if (!buffer) {
+      buffer = { deliveries: new Map() };
+      this.messageBuffers.set(sessionId, buffer);
     }
-
-    const timer = setTimeout(() => void this.flushAgentMessage(sessionId).catch((error) => {
-      this.health.deliveryFailure(error);
-      this.logger.warn({ error, sessionId }, "buffered Telegram delivery failed");
-    }), 1200);
-    this.messageBuffers.set(sessionId, { text: appendAgentMessageChunk("", text, session), timer });
+    for (const chatId of this.store.listSessionChats(sessionId)) {
+      const delivery = buffer.deliveries.get(chatId);
+      if (delivery) {
+        delivery.text = appendAgentMessageChunk(delivery.text, text, session);
+      } else {
+        buffer.deliveries.set(chatId, { text: appendAgentMessageChunk("", text, session), attempts: 0 });
+      }
+    }
+    this.scheduleAgentMessageFlush(sessionId, AGENT_MESSAGE_FLUSH_DELAY_MS);
   }
 
   private async flushAgentMessage(sessionId: string): Promise<void> {
-    const buffered = this.messageBuffers.get(sessionId);
-    if (!buffered) return;
-    this.messageBuffers.delete(sessionId);
-
-    const session = this.store.getSession(sessionId);
-    const text = formatAgentMessage(session, buffered.text);
-    for (const chatId of this.store.listSessionChats(sessionId)) {
-      const sent = await this.bot.api.sendMessage(chatId, text);
-      this.store.setMessageThread(chatId, sent.message_id, sessionId);
+    const buffer = this.messageBuffers.get(sessionId);
+    if (!buffer) return;
+    if (buffer.flushPromise) return buffer.flushPromise;
+    if (buffer.timer) {
+      clearTimeout(buffer.timer);
+      delete buffer.timer;
     }
+
+    const flushPromise = this.deliverAgentMessageBuffer(sessionId, buffer);
+    buffer.flushPromise = flushPromise;
+    try {
+      await flushPromise;
+    } finally {
+      delete buffer.flushPromise;
+      if (buffer.deliveries.size === 0 && this.messageBuffers.get(sessionId) === buffer) {
+        this.messageBuffers.delete(sessionId);
+      }
+    }
+  }
+
+  private async deliverAgentMessageBuffer(sessionId: string, buffer: AgentMessageBuffer): Promise<void> {
+    const session = this.store.getSession(sessionId);
+    const snapshots = [...buffer.deliveries].map(([chatId, delivery]) => ({
+      chatId,
+      text: delivery.text,
+      attempt: delivery.attempts + 1
+    }));
+    let failureCount = 0;
+
+    await Promise.all(snapshots.map(async ({ chatId, text, attempt }) => {
+      try {
+        const sent = await this.bot.api.sendMessage(chatId, formatAgentMessage(session, text));
+        this.store.setMessageThread(chatId, sent.message_id, sessionId);
+        const current = buffer.deliveries.get(chatId);
+        if (!current) return;
+        if (current.text === text) {
+          buffer.deliveries.delete(chatId);
+        } else if (current.text.startsWith(text)) {
+          current.text = current.text.slice(text.length);
+          current.attempts = 0;
+        }
+      } catch (error) {
+        failureCount += 1;
+        const diagnostic = sanitizedDeliveryError(error);
+        const current = buffer.deliveries.get(chatId);
+        if (current) current.attempts = attempt;
+        this.health.deliveryFailure(diagnostic);
+        if (attempt >= AGENT_MESSAGE_MAX_ATTEMPTS) {
+          buffer.deliveries.delete(chatId);
+          this.logger.warn(
+            { error: diagnostic, sessionId, chatId, attempt },
+            "buffered Telegram delivery dropped at retry limit"
+          );
+        } else {
+          this.logger.warn(
+            { error: diagnostic, sessionId, chatId, attempt },
+            "buffered Telegram delivery failed; retry scheduled"
+          );
+        }
+      }
+    }));
+
+    if (failureCount === 0 && snapshots.length > 0) this.health.deliverySuccess();
+    const retryAttempts = [...buffer.deliveries.values()]
+      .filter((delivery) => delivery.attempts > 0)
+      .map((delivery) => delivery.attempts);
+    if (retryAttempts.length > 0 && !buffer.timer) {
+      const attempt = Math.min(...retryAttempts);
+      this.scheduleAgentMessageFlush(sessionId, AGENT_MESSAGE_FLUSH_DELAY_MS * 2 ** (attempt - 1));
+    }
+  }
+
+  private scheduleAgentMessageFlush(sessionId: string, delayMs: number): void {
+    const buffer = this.messageBuffers.get(sessionId);
+    if (!buffer) return;
+    if (buffer.timer) clearTimeout(buffer.timer);
+    buffer.timer = setTimeout(() => {
+      delete buffer.timer;
+      void this.flushAgentMessage(sessionId).catch((error) => {
+        const diagnostic = sanitizedDeliveryError(error);
+        this.health.deliveryFailure(diagnostic);
+        this.logger.warn({ error: diagnostic, sessionId }, "buffered Telegram delivery failed unexpectedly");
+      });
+    }, delayMs);
   }
 
   private allowedDeliveryChats(): number[] {
@@ -1505,6 +1600,11 @@ export class TelegramGateway {
     const routed = this.store.listSessionChats(sessionId);
     return routed.length > 0 ? routed : this.allowedDeliveryChats();
   }
+}
+
+function sanitizedDeliveryError(error: unknown): Error {
+  const detail = error instanceof Error ? error.message : String(error);
+  return new Error(sanitizeDiagnosticText(detail));
 }
 
 function formatRuntimeHealth(

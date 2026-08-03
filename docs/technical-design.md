@@ -57,7 +57,7 @@ High-signal events for all sessions are committed to the SQLite outbox before de
 - errors
 - blocked states
 
-Transient delivery failures use capped exponential backoff; repeated failures are visible through `/health` and can be requeued. Once a Telegram chat routes input to a thread, subsequent agent output and interactions for that thread are scoped to its associated chat set instead of broadcast as process-global active-session output. Streamed agent messages retain their Telegram message-to-thread association so a reply returns to the originating thread. Transcript streaming remains best-effort, but its buffer is flushed before a durable completion notification. Full output is persisted for `/transcript`.
+Transient durable-delivery failures use capped exponential backoff; repeated failures are visible through `/health` and can be requeued. Once a Telegram chat routes input to a thread, subsequent agent output and interactions for that thread are scoped to its associated chat set instead of broadcast as process-global active-session output. Streamed agent messages retain independent in-memory buffers per chat, fan out concurrently, and retry each failed chat up to three times with exponential delay before an explicit drop; successful chats are never replayed because another chat failed. Streamed messages retain their Telegram message-to-thread association so a reply returns to the originating thread. Transcript streaming remains best-effort and never enters the durable outbox, but its buffer is flushed before a durable completion notification. Full output is persisted for `/transcript`.
 
 ## Approval Strategy
 
