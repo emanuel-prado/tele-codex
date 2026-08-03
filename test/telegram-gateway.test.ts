@@ -65,6 +65,7 @@ describe("TelegramGateway dispatch", () => {
   let attachedThread: string | undefined;
   let activeSession: StoredSession | undefined;
   let killCount: number;
+  let killError: Error | undefined;
   let forwardedText: string[];
 
   beforeEach(() => {
@@ -72,6 +73,7 @@ describe("TelegramGateway dispatch", () => {
     runtime = new FakeTelegramRuntime();
     activeSession = undefined;
     killCount = 0;
+    killError = undefined;
     forwardedText = [];
     const sessions = {
       getActiveSession: () => activeSession,
@@ -79,7 +81,10 @@ describe("TelegramGateway dispatch", () => {
         attachedThread = codexThreadId;
         return { id: "session_1" };
       },
-      kill: async () => { killCount += 1; },
+      kill: async () => {
+        if (killError) throw killError;
+        killCount += 1;
+      },
       sendToSession: async (_sessionId: string, text: string) => { forwardedText.push(text); },
       goal: async () => undefined
     } as unknown as SessionManager;
@@ -205,6 +210,27 @@ describe("TelegramGateway dispatch", () => {
 
     expect(forwardedText).toEqual([]);
     expect(sentTexts(runtime)).toContainEqual(expect.stringMatching(/already being submitted/i));
+  });
+
+  it("shows an actionable /kill failure instead of claiming the turn was interrupted", async () => {
+    activeSession = store.upsertSession({
+      id: "session_1", adapter: "appserver", label: "one", codexThreadId: "thread_1", connectionGeneration: 1
+    }, "active");
+    store.setActiveTurn(activeSession.id, "turn_1");
+    activeSession = store.getSession(activeSession.id);
+    killError = new Error("No active Codex turn is attached. Wait for work to start or resume the thread.");
+
+    await runtime.bot.handleUpdate(messageUpdate("/kill", nextUpdateId()));
+    const control = callbackData(runtime, "Confirm kill");
+    runtime.calls.length = 0;
+    await runtime.bot.handleUpdate(callbackUpdate(control, nextUpdateId()));
+
+    expect(killCount).toBe(0);
+    expect(callbackAnswers(runtime)).toContainEqual(expect.objectContaining({
+      text: expect.stringMatching(/no active Codex turn.*resume/i),
+      show_alert: true
+    }));
+    expect(sentTexts(runtime)).not.toContainEqual(expect.stringMatching(/Interrupted session/i));
   });
 });
 

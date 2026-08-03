@@ -85,6 +85,90 @@ describe("app-server lifecycle scenarios", () => {
     scenario.close();
   });
 
+  it("interrupts only a proven active turn on the current attachment and transitions it to idle", async () => {
+    const scenario = createScenario();
+    scenario.server.respondTo("thread/start", { thread: { id: "thread-a" } });
+    scenario.server.respondTo("turn/start", { turn: { id: "turn-a" } });
+    scenario.server.respondTo("turn/interrupt", {});
+    const session = await scenario.adapter.start({ cwd: "/tmp", prompt: "work" });
+
+    expect(scenario.store.getSession(session.id)).toMatchObject({
+      status: "active",
+      activeTurnId: "turn-a",
+      connectionGeneration: 1
+    });
+    await scenario.adapter.interrupt(session.id);
+
+    expect(scenario.server.messages("turn/interrupt")[0]?.message).toMatchObject({
+      params: { threadId: "thread-a", turnId: "turn-a" }
+    });
+    expect(scenario.store.getSession(session.id)?.status).toBe("idle");
+    expect(scenario.store.getSession(session.id)?.activeTurnId).toBeUndefined();
+    scenario.close();
+  });
+
+  it("rejects interrupt while disconnected and after reconnect until the thread and a new turn are proven", async () => {
+    vi.useFakeTimers();
+    const scenario = createScenario();
+    scenario.server.respondTo("thread/start", { thread: { id: "thread-a" } });
+    scenario.server.respondTo("thread/resume", { thread: { id: "thread-a" } });
+    scenario.server.respondTo("turn/start", { turn: { id: "turn-new" } });
+    scenario.server.respondTo("turn/interrupt", {});
+    const session = await scenario.adapter.start({ cwd: "/tmp", prompt: "work" });
+
+    scenario.server.disconnect(1);
+    expect(scenario.store.getSession(session.id)?.status).toBe("detached");
+    expect(scenario.store.getSession(session.id)?.activeTurnId).toBeUndefined();
+    await expect(scenario.adapter.interrupt(session.id)).rejects.toThrow(/disconnected.*resume/i);
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    await expect(scenario.adapter.interrupt(session.id)).rejects.toThrow(/current.*attachment.*resume/i);
+    await scenario.adapter.resume(scenario.store.getSession(session.id)!);
+    await expect(scenario.adapter.interrupt(session.id)).rejects.toThrow(/no active.*turn/i);
+
+    await scenario.adapter.sendUserText(session.id, "new work");
+    await expect(scenario.adapter.interrupt(session.id)).resolves.toBeUndefined();
+    scenario.close();
+  });
+
+  it("rejects stale attachment generations and interrupt timeouts without clearing the active turn", async () => {
+    const scenario = createScenario();
+    scenario.server.respondTo("thread/start", { thread: { id: "thread-a" } });
+    scenario.server.respondTo("turn/start", { turn: { id: "turn-a" } });
+    scenario.server.respondTo("turn/interrupt", () => {
+      throw new Error("Codex app-server request timed out after 100ms: turn/interrupt");
+    });
+    const session = await scenario.adapter.start({ cwd: "/tmp", prompt: "work" });
+    const stored = scenario.store.getSession(session.id)!;
+    scenario.store.upsertSession({ ...stored, connectionGeneration: 99 }, "active");
+
+    await expect(scenario.adapter.interrupt(session.id)).rejects.toThrow(/stale.*attachment.*resume/i);
+    expect(scenario.server.messages("turn/interrupt")).toHaveLength(0);
+
+    scenario.store.upsertSession({ ...stored, connectionGeneration: 1 }, "active");
+    await expect(scenario.adapter.interrupt(session.id)).rejects.toThrow(/timed out/i);
+    expect(scenario.store.getSession(session.id)).toMatchObject({ status: "active", activeTurnId: "turn-a" });
+    scenario.close();
+  });
+
+  it("maps an interrupted turn to idle and an actual failed turn to error", async () => {
+    const interrupted = createScenario();
+    interrupted.server.respondTo("thread/start", { thread: { id: "thread-a" } });
+    interrupted.server.respondTo("turn/start", { turn: { id: "turn-a" } });
+    const interruptedSession = await interrupted.adapter.start({ cwd: "/tmp", prompt: "work" });
+    interrupted.server.notification("turn/completed", { threadId: "thread-a", turn: { id: "turn-a", status: "interrupted" } });
+    expect(interrupted.store.getSession(interruptedSession.id)?.status).toBe("idle");
+    interrupted.close();
+
+    const failed = createScenario();
+    failed.server.respondTo("thread/start", { thread: { id: "thread-b" } });
+    failed.server.respondTo("turn/start", { turn: { id: "turn-b" } });
+    const failedSession = await failed.adapter.start({ cwd: "/tmp", prompt: "work" });
+    failed.server.notification("turn/completed", { threadId: "thread-b", turn: { id: "turn-b", status: "failed" } });
+    expect(failed.store.getSession(failedSession.id)?.status).toBe("error");
+    failed.close();
+  });
+
   it("resumes the same Codex thread repeatedly without duplicating its durable session", async () => {
     const scenario = createScenario();
     scenario.server.respondTo("thread/resume", { thread: { id: "thread-a", name: "one" }, model: "gpt-test" });
