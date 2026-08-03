@@ -15,6 +15,7 @@ export class FakeAppServer extends EventEmitter implements AppServerRpcClient {
   private sequence = 0;
   private activeGeneration: number | undefined;
   private readonly handlers = new Map<string, RequestHandler>();
+  private readonly notificationFailures = new Map<string, Error>();
   readonly trace: TraceEntry[] = [];
 
   constructor() {
@@ -24,6 +25,14 @@ export class FakeAppServer extends EventEmitter implements AppServerRpcClient {
 
   respondTo(method: string, handler: RequestHandler | unknown): void {
     this.handlers.set(method, typeof handler === "function" ? handler as RequestHandler : () => handler);
+  }
+
+  failNotification(method: string, error: Error): void {
+    this.notificationFailures.set(method, error);
+  }
+
+  clearNotificationFailure(method: string): void {
+    this.notificationFailures.delete(method);
   }
 
   async connectStdio(_command: string, generation?: number): Promise<number> {
@@ -44,6 +53,8 @@ export class FakeAppServer extends EventEmitter implements AppServerRpcClient {
 
   notify(method: string, params?: unknown, generation = this.requireGeneration()): void {
     this.assertGeneration(generation);
+    const failure = this.notificationFailures.get(method);
+    if (failure) throw failure;
     this.record("client", generation, { method, params });
   }
 
@@ -76,6 +87,9 @@ export class FakeAppServer extends EventEmitter implements AppServerRpcClient {
   }
 
   close(): void {
+    if (this.activeGeneration !== undefined) {
+      this.record("close", this.activeGeneration, { transport: "closed" });
+    }
     this.activeGeneration = undefined;
   }
 

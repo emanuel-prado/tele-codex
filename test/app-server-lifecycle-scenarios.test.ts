@@ -124,7 +124,12 @@ describe("app-server lifecycle scenarios", () => {
     await vi.advanceTimersByTimeAsync(1_000);
     await expect(scenario.adapter.interrupt(session.id)).rejects.toThrow(/current.*attachment.*resume/i);
     await scenario.adapter.resume(scenario.store.getSession(session.id)!);
-    await expect(scenario.adapter.interrupt(session.id)).rejects.toThrow(/no active.*turn/i);
+    await expect(scenario.adapter.interrupt(session.id)).rejects.toMatchObject({
+      name: "AppServerFailure",
+      kind: "invalid_state",
+      method: "turn/interrupt",
+      message: expect.stringMatching(/no active.*turn/i)
+    });
 
     await scenario.adapter.sendUserText(session.id, "new work");
     await expect(scenario.adapter.interrupt(session.id)).resolves.toBeUndefined();

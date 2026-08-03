@@ -2,6 +2,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { EventEmitter } from "node:events";
 import WebSocket from "ws";
 import type { Logger } from "pino";
+import { appServerFailure, AppServerFailure, normalizeAppServerFailure } from "./app-server-failure.js";
 
 export interface JsonRpcMessage {
   id?: string | number;
@@ -24,6 +25,7 @@ export interface AppServerRpcClient {
   on(event: "message", listener: (message: JsonRpcMessage, generation: number) => void): this;
   on(event: "stderr", listener: (chunk: string, generation: number) => void): this;
   on(event: "close", listener: (details: unknown, generation: number) => void): this;
+  on(event: "failure", listener: (failure: AppServerFailure, generation: number) => void): this;
 }
 
 interface PendingRequest {
@@ -31,6 +33,7 @@ interface PendingRequest {
   reject: (error: Error) => void;
   timer: NodeJS.Timeout;
   generation: number;
+  method: string;
 }
 
 export class JsonRpcClient extends EventEmitter implements AppServerRpcClient {
@@ -66,15 +69,15 @@ export class JsonRpcClient extends EventEmitter implements AppServerRpcClient {
       this.emit("stderr", chunk, activeGeneration);
     });
     child.stdin.on("error", (error) => {
-      this.rejectPending(new Error(`Codex app-server stdin failed: ${error.message}`), activeGeneration);
+      this.rejectPending(error, activeGeneration, "App-server transport was lost while writing a request.");
     });
     child.on("error", (error) => {
-      this.rejectPending(new Error(`Codex app-server failed to start: ${error.message}`), activeGeneration);
+      this.rejectPending(error, activeGeneration, "App-server transport failed to start.");
       if (this.child === child) this.clearActiveTransport(activeGeneration);
       this.emit("close", { error }, activeGeneration);
     });
     child.on("exit", (code, signal) => {
-      this.rejectPending(new Error(`Codex app-server exited before responding: code=${code ?? "unknown"} signal=${signal ?? "none"}`), activeGeneration);
+      this.rejectPending({ code, signal }, activeGeneration, "App-server transport exited before responding.");
       if (this.child === child) this.clearActiveTransport(activeGeneration);
       this.emit("close", { code, signal }, activeGeneration);
     });
@@ -90,12 +93,12 @@ export class JsonRpcClient extends EventEmitter implements AppServerRpcClient {
       this.socket = socket;
       socket.on("open", () => resolve());
       socket.on("error", (error) => {
-        this.rejectPending(error, activeGeneration);
+        this.rejectPending(error, activeGeneration, "App-server WebSocket connection failed.");
         reject(error);
       });
       socket.on("message", (data) => this.consume(data.toString(), activeGeneration));
       socket.on("close", (code, reason) => {
-        this.rejectPending(new Error(`Codex app-server websocket closed: ${code} ${reason.toString()}`), activeGeneration);
+        this.rejectPending({ code, reason: reason.toString() }, activeGeneration, "App-server WebSocket closed before responding.");
         if (this.socket === socket) this.clearActiveTransport(activeGeneration);
         this.emit("close", { code, reason: reason.toString() }, activeGeneration);
       });
@@ -104,7 +107,7 @@ export class JsonRpcClient extends EventEmitter implements AppServerRpcClient {
   }
 
   request(method: string, params?: unknown): Promise<unknown> {
-    const generation = this.requireActiveGeneration();
+    const generation = this.requireActiveGeneration(method);
     const id = this.nextId++;
     const message: JsonRpcMessage = { id, method };
     if (params !== undefined) message.params = params;
@@ -112,11 +115,11 @@ export class JsonRpcClient extends EventEmitter implements AppServerRpcClient {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
-        reject(new Error(`Codex app-server request timed out after ${this.requestTimeoutMs}ms: ${method}`));
+        reject(appServerFailure("timeout", `App-server request timed out after ${this.requestTimeoutMs}ms: ${method}.`, { method }));
       }, this.requestTimeoutMs);
-      this.pending.set(id, { resolve, reject, timer, generation });
+      this.pending.set(id, { resolve, reject, timer, generation, method });
       try {
-        this.send(message, generation);
+        this.send(message, generation, method);
       } catch (error) {
         clearTimeout(timer);
         this.pending.delete(id);
@@ -128,19 +131,19 @@ export class JsonRpcClient extends EventEmitter implements AppServerRpcClient {
   notify(method: string, params?: unknown, generation?: number): void {
     const message: JsonRpcMessage = { method };
     if (params !== undefined) message.params = params;
-    this.send(message, generation);
+    this.send(message, generation, method);
   }
 
   respond(id: string | number, result: unknown, generation?: number): void {
-    this.send({ id, result }, generation);
+    this.send({ id, result }, generation, "response");
   }
 
   fail(id: string | number, code: number, message: string, generation?: number): void {
-    this.send({ id, error: { code, message } }, generation);
+    this.send({ id, error: { code, message } }, generation, "response");
   }
 
   close(): void {
-    this.rejectPending(new Error("JSON-RPC client closed."));
+    this.rejectPending(undefined, undefined, "App-server transport closed before responding.");
     this.socket?.close();
     this.child?.kill();
     this.socket = undefined;
@@ -154,10 +157,14 @@ export class JsonRpcClient extends EventEmitter implements AppServerRpcClient {
     return {};
   }
 
-  private send(message: JsonRpcMessage, expectedGeneration?: number): void {
-    const generation = this.requireActiveGeneration();
+  private send(message: JsonRpcMessage, expectedGeneration: number | undefined, method: string): void {
+    const generation = this.requireActiveGeneration(method);
     if (expectedGeneration !== undefined && expectedGeneration !== generation) {
-      throw new Error(`App-server connection changed (expected generation ${expectedGeneration}, current generation ${generation}).`);
+      throw appServerFailure(
+        "generation_changed",
+        `App-server connection changed before ${method} could be sent.`,
+        { method }
+      );
     }
     const serialized = `${JSON.stringify(message)}\n`;
     if (this.socket && this.socket.readyState === WebSocket.OPEN) {
@@ -165,22 +172,24 @@ export class JsonRpcClient extends EventEmitter implements AppServerRpcClient {
       return;
     }
     if (this.child) {
-      if (this.child.killed || this.child.stdin.destroyed) throw new Error("JSON-RPC stdio transport is closed.");
+      if (this.child.killed || this.child.stdin.destroyed) {
+        throw appServerFailure("transport_loss", `App-server transport was lost before ${method} could be sent.`, { method });
+      }
       const ok = this.child.stdin.write(serialized);
       if (!ok) {
         this.child.stdin.once("drain", () => undefined);
       }
       return;
     }
-    throw new Error("JSON-RPC client is not connected.");
+    throw appServerFailure("missing_connection", `App-server connection is not available for ${method}.`, { method });
   }
 
-  private rejectPending(error: Error, generation?: number): void {
+  private rejectPending(error: unknown, generation: number | undefined, message: string): void {
     for (const [id, pending] of this.pending.entries()) {
       if (generation !== undefined && pending.generation !== generation) continue;
       this.pending.delete(id);
       clearTimeout(pending.timer);
-      pending.reject(error);
+      pending.reject(normalizeAppServerFailure(error, "transport_loss", message, { method: pending.method }));
     }
   }
 
@@ -202,7 +211,9 @@ export class JsonRpcClient extends EventEmitter implements AppServerRpcClient {
     try {
       message = JSON.parse(raw) as JsonRpcMessage;
     } catch (error) {
-      this.logger.warn({ raw, error }, "invalid JSON-RPC message");
+      const failure = normalizeAppServerFailure(error, "protocol_defect", "App-server returned malformed JSON.");
+      this.logger.warn({ error: failure.message }, "invalid JSON-RPC message");
+      this.emit("failure", failure, generation);
       return;
     }
     this.emit("activity", generation);
@@ -212,7 +223,13 @@ export class JsonRpcClient extends EventEmitter implements AppServerRpcClient {
       if (!pending || pending.generation !== generation) return;
       this.pending.delete(message.id);
       clearTimeout(pending.timer);
-      if (message.error) pending.reject(new Error(message.error.message));
+      if (message.error) {
+        pending.reject(appServerFailure(
+          "remote_rejection",
+          `App-server rejected ${pending.method} (code ${message.error.code}).`,
+          { method: pending.method, code: message.error.code, data: message.error.data }
+        ));
+      }
       else pending.resolve(message.result);
       return;
     }
@@ -222,15 +239,19 @@ export class JsonRpcClient extends EventEmitter implements AppServerRpcClient {
 
   private beginConnection(generation?: number): number {
     const next = generation ?? this.generation + 1;
-    if (next <= this.generation) throw new Error(`App-server connection generation must increase (received ${next}, current ${this.generation}).`);
+    if (next <= this.generation) {
+      throw appServerFailure("generation_changed", "App-server connection generation did not advance.", { method: "connect" });
+    }
     this.generation = next;
     this.activeGeneration = next;
     this.buffer = "";
     return next;
   }
 
-  private requireActiveGeneration(): number {
-    if (this.activeGeneration === undefined) throw new Error("JSON-RPC client is not connected.");
+  private requireActiveGeneration(method: string): number {
+    if (this.activeGeneration === undefined) {
+      throw appServerFailure("missing_connection", `App-server connection is not available for ${method}.`, { method });
+    }
     return this.activeGeneration;
   }
 
