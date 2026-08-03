@@ -4,7 +4,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { CURRENT_SCHEMA_VERSION, migrateDatabase, MigrationError } from "../src/store/migrations.js";
-import { EventLogRepository, NotificationOutboxRepository, TranscriptRepository } from "../src/store/repositories.js";
+import {
+  EventLogRepository,
+  NotificationOutboxRepository,
+  RuntimeStateRepository,
+  ThreadRuntimeRepository,
+  TranscriptRepository
+} from "../src/store/repositories.js";
 import { Store } from "../src/store/store.js";
 import type { PendingAction } from "../src/types/events.js";
 
@@ -115,6 +121,50 @@ describe("versioned SQLite storage", () => {
     expect(transcripts.chunkCount("session")).toBe(2);
     expect(transcripts.text("session")).toContain("hello world");
     db.close();
+  });
+
+  it("owns typed and generic runtime state behind one repository interface", () => {
+    const db = new Database(":memory:");
+    migrateDatabase(db);
+    const runtime = new RuntimeStateRepository(db);
+    const threadRuntime = new ThreadRuntimeRepository(db);
+    const usage = {
+      total: { totalTokens: 30, inputTokens: 20, cachedInputTokens: 5, outputTokens: 10, reasoningOutputTokens: 2 },
+      last: { totalTokens: 3, inputTokens: 2, cachedInputTokens: 1, outputTokens: 1, reasoningOutputTokens: 0 },
+      modelContextWindow: 200_000,
+      updatedAt: 100
+    };
+    const limits = { usedPercent: 75, resetsAt: 200, updatedAt: 100 };
+    const progress = { plan: [{ step: "Extract repository", status: "inProgress" as const }], updatedAt: 101 };
+    const goal = { objective: "Deepen persistence", status: "active" as const, tokensUsed: 4, timeUsedSeconds: 2, updatedAt: 102 };
+
+    threadRuntime.setTokenUsage("session", usage);
+    threadRuntime.setProgress("session", progress);
+    threadRuntime.setDiff("session", "diff");
+    threadRuntime.setGoal("session", goal);
+    runtime.setRateLimits(limits);
+
+    expect(threadRuntime.getTokenUsage("session")).toEqual(usage);
+    expect(threadRuntime.getProgress("session")).toEqual(progress);
+    expect(threadRuntime.getDiff("session")).toBe("diff");
+    expect(threadRuntime.getGoal("session")).toEqual(goal);
+    expect(runtime.get("rate_limits")).toEqual(limits);
+    expect(runtime.getRateLimits()).toEqual(limits);
+
+    runtime.set("rate_limits", { ...limits, usedPercent: 90 });
+    expect(runtime.getRateLimits()?.usedPercent).toBe(90);
+    db.close();
+  });
+
+  it("keeps Store runtime methods as compatibility delegates", () => {
+    const store = new Store(":memory:");
+    const limits = { usedPercent: 50, updatedAt: 100 };
+    store.setRateLimits(limits);
+    expect(store.runtimeState.getRateLimits()).toEqual(limits);
+
+    store.threadRuntime.setProgress("session", { plan: [], updatedAt: 101 });
+    expect(store.getProgress("session")).toEqual({ plan: [], updatedAt: 101 });
+    store.close();
   });
 
   it("scrubs delivered outbox payloads but preserves retryable delivery content", () => {

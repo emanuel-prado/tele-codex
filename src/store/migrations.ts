@@ -1,4 +1,5 @@
 import type Database from "better-sqlite3";
+import { RuntimeStateRepository, ThreadRuntimeRepository } from "./repositories.js";
 
 export const CURRENT_SCHEMA_VERSION = 7;
 
@@ -377,6 +378,8 @@ const MIGRATIONS: readonly Migration[] = [
 
 function migrateLegacySessions(db: Database.Database): void {
   const sessions = db.prepare("select * from sessions order by updated_at desc, id desc").all() as Array<Record<string, unknown>>;
+  const runtimeState = new RuntimeStateRepository(db);
+  const threadRuntime = new ThreadRuntimeRepository(db);
   const appserver = sessions.filter((row) => row.adapter === "appserver" && row.codex_thread_id != null);
   const groups = new Map<string, Array<Record<string, unknown>>>();
   for (const row of appserver) groups.set(String(row.codex_thread_id), [...(groups.get(String(row.codex_thread_id)) ?? []), row]);
@@ -395,13 +398,12 @@ function migrateLegacySessions(db: Database.Database): void {
         Number(canonical.paused) === 1 ? 1 : 0,
         Math.min(...rows.map((row) => Number(row.created_at))),
         Math.max(...rows.map((row) => Number(row.updated_at))));
-    mergeTokenUsage(db, stateIds, canonicalId);
-    mergeRuntime(db, stateIds, canonicalId);
+    threadRuntime.reparentLegacySessions(stateIds, canonicalId);
     for (const table of ["pending_actions", "event_log", "transcript_chunks", "session_grants"].filter((name) => tableExists(db, name))) {
       db.prepare(`update ${table} set session_id = ? where session_id in (${marks})`).run(canonicalId, ...ids);
     }
-    const active = runtimeValue<string>(db, "last_active_session_id");
-    if (active && ids.includes(active)) setRuntimeValue(db, "last_active_session_id", canonicalId);
+    const active = runtimeState.get<string>("last_active_session_id");
+    if (active && ids.includes(active)) runtimeState.set("last_active_session_id", canonicalId);
   }
 
   for (const row of sessions.filter((item) => item.adapter === "pty" && item.tmux_target)) {
@@ -415,30 +417,6 @@ function migrateLegacySessions(db: Database.Database): void {
   }
 }
 
-function mergeTokenUsage(db: Database.Database, sessionIds: string[], canonicalId: string): void {
-  const marks = sessionIds.map(() => "?").join(", ");
-  const rows = db.prepare(`select * from token_usage where session_id in (${marks}) order by updated_at desc, session_id desc`)
-    .all(...sessionIds) as Array<Record<string, unknown>>;
-  if (rows.length === 0) return;
-  const row = rows[0]!;
-  db.prepare(`delete from token_usage where session_id in (${marks})`).run(...sessionIds);
-  db.prepare(`insert into token_usage values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-    .run(canonicalId, row.updated_at, row.total_tokens, row.input_tokens, row.cached_input_tokens,
-      row.output_tokens, row.reasoning_output_tokens, row.last_total_tokens, row.last_input_tokens,
-      row.last_cached_input_tokens, row.last_output_tokens, row.last_reasoning_output_tokens, row.model_context_window ?? null);
-}
-
-function mergeRuntime(db: Database.Database, sessionIds: string[], canonicalId: string): void {
-  const marks = sessionIds.map(() => "?").join(", ");
-  const rows = db.prepare(`select * from session_runtime where session_id in (${marks}) order by updated_at desc, session_id desc`)
-    .all(...sessionIds) as Array<Record<string, unknown>>;
-  if (rows.length === 0) return;
-  const newest = (column: string) => rows.find((row) => row[column] != null)?.[column] ?? null;
-  db.prepare(`delete from session_runtime where session_id in (${marks})`).run(...sessionIds);
-  db.prepare("insert into session_runtime (session_id, progress_json, diff_text, goal_json, updated_at) values (?, ?, ?, ?, ?)")
-    .run(canonicalId, newest("progress_json"), newest("diff_text"), newest("goal_json"), Math.max(...rows.map((row) => Number(row.updated_at))));
-}
-
 function addColumn(db: Database.Database, table: string, column: string, type: string): void {
   const columns = db.prepare(`pragma table_info(${table})`).all() as Array<{ name: string }>;
   if (!columns.some((item) => item.name === column)) db.exec(`alter table ${table} add column ${column} ${type}`);
@@ -446,17 +424,6 @@ function addColumn(db: Database.Database, table: string, column: string, type: s
 
 function tableExists(db: Database.Database, table: string): boolean {
   return Boolean(db.prepare("select 1 from sqlite_master where type = 'table' and name = ?").get(table));
-}
-
-function runtimeValue<T>(db: Database.Database, key: string): T | undefined {
-  const row = db.prepare("select value_json from global_runtime where key = ?").get(key) as { value_json: string } | undefined;
-  return row ? JSON.parse(row.value_json) as T : undefined;
-}
-
-function setRuntimeValue(db: Database.Database, key: string, value: unknown): void {
-  db.prepare(`insert into global_runtime (key, value_json, updated_at) values (?, ?, ?)
-    on conflict(key) do update set value_json=excluded.value_json, updated_at=excluded.updated_at`)
-    .run(key, JSON.stringify(value), Date.now());
 }
 
 function message(error: unknown): string {

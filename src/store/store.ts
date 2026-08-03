@@ -10,6 +10,7 @@ import {
   EventLogRepository,
   NotificationOutboxRepository,
   RuntimeStateRepository,
+  ThreadRuntimeRepository,
   ThreadAttachmentRepository,
   TranscriptRepository
 } from "./repositories.js";
@@ -136,6 +137,7 @@ export class Store {
   readonly eventLogs: EventLogRepository;
   readonly transcripts: TranscriptRepository;
   readonly runtimeState: RuntimeStateRepository;
+  readonly threadRuntime: ThreadRuntimeRepository;
 
   constructor(path: string) {
     this.path = path;
@@ -153,6 +155,7 @@ export class Store {
     this.eventLogs = new EventLogRepository(this.db);
     this.transcripts = new TranscriptRepository(this.db);
     this.runtimeState = new RuntimeStateRepository(this.db);
+    this.threadRuntime = new ThreadRuntimeRepository(this.db);
     this.reconcilePersistedAppServerRuntime();
     this.releaseStaleCallbackClaims(Date.now() + 1);
   }
@@ -395,9 +398,10 @@ export class Store {
         this.db.prepare("delete from notification_outbox where action_id = ?").run(actionId);
       }
       this.db.prepare("delete from pending_actions where session_id = ?").run(sessionId);
-      for (const table of ["event_log", "transcript_chunks", "token_usage", "session_runtime"]) {
+      for (const table of ["event_log", "transcript_chunks"]) {
         this.db.prepare(`delete from ${table} where session_id = ?`).run(sessionId);
       }
+      this.threadRuntime.deleteSession(sessionId);
       for (const table of ["routing_composes", "sticky_routes", "session_chats", "telegram_thread_messages"]) {
         this.db.prepare(`delete from ${table} where session_id = ?`).run(sessionId);
       }
@@ -534,89 +538,43 @@ export class Store {
   }
 
   setTokenUsage(sessionId: string, usage: Omit<SessionTokenUsage, "updatedAt"> & { updatedAt?: number }): void {
-    this.db
-      .prepare(
-        `insert into token_usage
-          (session_id, updated_at, total_tokens, input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens,
-           last_total_tokens, last_input_tokens, last_cached_input_tokens, last_output_tokens, last_reasoning_output_tokens,
-           model_context_window)
-         values
-          (@sessionId, @updatedAt, @totalTokens, @inputTokens, @cachedInputTokens, @outputTokens, @reasoningOutputTokens,
-           @lastTotalTokens, @lastInputTokens, @lastCachedInputTokens, @lastOutputTokens, @lastReasoningOutputTokens,
-           @modelContextWindow)
-         on conflict(session_id) do update set
-           updated_at=excluded.updated_at,
-           total_tokens=excluded.total_tokens,
-           input_tokens=excluded.input_tokens,
-           cached_input_tokens=excluded.cached_input_tokens,
-           output_tokens=excluded.output_tokens,
-           reasoning_output_tokens=excluded.reasoning_output_tokens,
-           last_total_tokens=excluded.last_total_tokens,
-           last_input_tokens=excluded.last_input_tokens,
-           last_cached_input_tokens=excluded.last_cached_input_tokens,
-           last_output_tokens=excluded.last_output_tokens,
-           last_reasoning_output_tokens=excluded.last_reasoning_output_tokens,
-           model_context_window=excluded.model_context_window`
-      )
-      .run({
-        sessionId,
-        updatedAt: usage.updatedAt ?? Date.now(),
-        totalTokens: usage.total.totalTokens,
-        inputTokens: usage.total.inputTokens,
-        cachedInputTokens: usage.total.cachedInputTokens,
-        outputTokens: usage.total.outputTokens,
-        reasoningOutputTokens: usage.total.reasoningOutputTokens,
-        lastTotalTokens: usage.last.totalTokens,
-        lastInputTokens: usage.last.inputTokens,
-        lastCachedInputTokens: usage.last.cachedInputTokens,
-        lastOutputTokens: usage.last.outputTokens,
-        lastReasoningOutputTokens: usage.last.reasoningOutputTokens,
-        modelContextWindow: usage.modelContextWindow ?? null
-      });
+    this.threadRuntime.setTokenUsage(sessionId, usage);
   }
 
   getTokenUsage(sessionId: string): SessionTokenUsage | undefined {
-    const row = this.db.prepare("select * from token_usage where session_id = ?").get(sessionId) as Row | undefined;
-    return row ? mapTokenUsage(row) : undefined;
+    return this.threadRuntime.getTokenUsage(sessionId);
   }
 
   setProgress(sessionId: string, progress: SessionProgress): void {
-    this.upsertRuntimeState(sessionId, "progress_json", JSON.stringify(progress));
+    this.threadRuntime.setProgress(sessionId, progress);
   }
 
   getProgress(sessionId: string): SessionProgress | undefined {
-    const row = this.db.prepare("select progress_json from session_runtime where session_id = ?").get(sessionId) as Row | undefined;
-    return row?.progress_json ? (JSON.parse(String(row.progress_json)) as SessionProgress) : undefined;
+    return this.threadRuntime.getProgress(sessionId);
   }
 
   setDiff(sessionId: string, diff: string): void {
-    this.upsertRuntimeState(sessionId, "diff_text", diff);
+    this.threadRuntime.setDiff(sessionId, diff);
   }
 
   getDiff(sessionId: string): string | undefined {
-    const row = this.db.prepare("select diff_text from session_runtime where session_id = ?").get(sessionId) as Row | undefined;
-    return row?.diff_text ? String(row.diff_text) : undefined;
+    return this.threadRuntime.getDiff(sessionId);
   }
 
   setGoal(sessionId: string, goal: ThreadGoalSummary | undefined): void {
-    this.upsertRuntimeState(sessionId, "goal_json", goal ? JSON.stringify(goal) : null);
+    this.threadRuntime.setGoal(sessionId, goal);
   }
 
   getGoal(sessionId: string): ThreadGoalSummary | undefined {
-    const row = this.db.prepare("select goal_json from session_runtime where session_id = ?").get(sessionId) as Row | undefined;
-    return row?.goal_json ? (JSON.parse(String(row.goal_json)) as ThreadGoalSummary) : undefined;
+    return this.threadRuntime.getGoal(sessionId);
   }
 
   setRateLimits(limits: RateLimitSummary): void {
-    this.db.prepare(
-      `insert into global_runtime (key, value_json, updated_at) values ('rate_limits', ?, ?)
-       on conflict(key) do update set value_json=excluded.value_json, updated_at=excluded.updated_at`
-    ).run(JSON.stringify(limits), Date.now());
+    this.runtimeState.setRateLimits(limits);
   }
 
   getRateLimits(): RateLimitSummary | undefined {
-    const row = this.db.prepare("select value_json from global_runtime where key = 'rate_limits'").get() as Row | undefined;
-    return row ? (JSON.parse(String(row.value_json)) as RateLimitSummary) : undefined;
+    return this.runtimeState.getRateLimits();
   }
 
   setRuntimeValue(key: string, value: unknown): void {
@@ -987,12 +945,6 @@ export class Store {
     })();
   }
 
-  private upsertRuntimeState(sessionId: string, column: "progress_json" | "diff_text" | "goal_json", value: string | null): void {
-    this.db.prepare(
-      `insert into session_runtime (session_id, ${column}, updated_at) values (?, ?, ?)
-       on conflict(session_id) do update set ${column}=excluded.${column}, updated_at=excluded.updated_at`
-    ).run(sessionId, value, Date.now());
-  }
 }
 
 function mapCodexThread(row: Row): StoredSession {
@@ -1123,26 +1075,4 @@ function mapInteractionDraft(row: Row): InteractionDraft {
     answers: JSON.parse(String(row.answers_json)) as Record<string, { answers: string[] }>,
     awaitingText: Number(row.awaiting_text) === 1
   };
-}
-
-function mapTokenUsage(row: Row): SessionTokenUsage {
-  const usage: SessionTokenUsage = {
-    total: {
-      totalTokens: Number(row.total_tokens),
-      inputTokens: Number(row.input_tokens),
-      cachedInputTokens: Number(row.cached_input_tokens),
-      outputTokens: Number(row.output_tokens),
-      reasoningOutputTokens: Number(row.reasoning_output_tokens)
-    },
-    last: {
-      totalTokens: Number(row.last_total_tokens),
-      inputTokens: Number(row.last_input_tokens),
-      cachedInputTokens: Number(row.last_cached_input_tokens),
-      outputTokens: Number(row.last_output_tokens),
-      reasoningOutputTokens: Number(row.last_reasoning_output_tokens)
-    },
-    updatedAt: Number(row.updated_at)
-  };
-  if (row.model_context_window) usage.modelContextWindow = Number(row.model_context_window);
-  return usage;
 }
