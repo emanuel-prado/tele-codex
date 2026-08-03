@@ -4,20 +4,21 @@ import { Store } from "../src/store/store.js";
 import type { PendingAction } from "../src/types/events.js";
 
 describe("PendingInteractionManager", () => {
-  it("collects several questions and submits one answer map", () => {
+  it("collects several questions and submits one answer map", async () => {
     const store = new Store(":memory:");
     const action = questionAction();
     store.putPendingAction(action);
     const manager = new PendingInteractionManager(store, true);
 
-    const start = callback(manager.actionView(action, 10));
-    const first = manager.handleCallback(start, 10, 20);
+    const submit = async () => {};
+    const start = callback(manager.actionView(action, 10, 20));
+    const first = await manager.handleCallback(start, { chatId: 10, userId: 20 }, submit);
     expect(first.kind).toBe("view");
     const firstChoice = callback(first.kind === "view" ? first.view : undefined);
-    const second = manager.handleCallback(firstChoice, 10, 20);
+    const second = await manager.handleCallback(firstChoice, { chatId: 10, userId: 20 }, submit);
     expect(second.kind).toBe("view");
     const secondChoice = callback(second.kind === "view" ? second.view : undefined);
-    const result = manager.handleCallback(secondChoice, 10, 20);
+    const result = await manager.handleCallback(secondChoice, { chatId: 10, userId: 20 }, submit);
 
     expect(result).toEqual({
       kind: "submit",
@@ -34,17 +35,19 @@ describe("PendingInteractionManager", () => {
     store.close();
   });
 
-  it("uses short, chat-bound, one-shot callback tokens", () => {
+  it("uses short, controller/chat-bound, one-shot callback tokens", async () => {
     const store = new Store(":memory:");
     const action = questionAction();
     store.putPendingAction(action);
     const manager = new PendingInteractionManager(store, true);
-    const token = callback(manager.actionView(action, 10));
+    const token = callback(manager.actionView(action, 10, 20));
+    const submit = async () => {};
 
     expect(`cb:${token}`.length).toBeLessThanOrEqual(64);
-    expect(manager.handleCallback(token, 11, 20).kind).toBe("notice");
-    expect(manager.handleCallback(token, 10, 20).kind).toBe("view");
-    expect(manager.handleCallback(token, 10, 20).kind).toBe("notice");
+    expect((await manager.handleCallback(token, { chatId: 10, userId: 21 }, submit)).kind).toBe("notice");
+    expect((await manager.handleCallback(token, { chatId: 11, userId: 20 }, submit)).kind).toBe("notice");
+    expect((await manager.handleCallback(token, { chatId: 10, userId: 20 }, submit)).kind).toBe("view");
+    expect((await manager.handleCallback(token, { chatId: 10, userId: 20 }, submit)).kind).toBe("notice");
     store.close();
   });
 
@@ -52,36 +55,35 @@ describe("PendingInteractionManager", () => {
     const store = new Store(":memory:");
     const action = questionAction(true);
     store.putPendingAction(action);
-    const view = new PendingInteractionManager(store, true).actionView(action, 10);
+    const view = new PendingInteractionManager(store, true).actionView(action, 10, 20);
     expect(view.rows).toEqual([]);
     expect(view.text).toContain("not end-to-end encrypted");
     store.close();
   });
 
-  it("does not consume a decision control until submission succeeds", () => {
+  it("does not consume a decision control until submission succeeds", async () => {
     const store = new Store(":memory:");
     const action = approvalAction();
     store.putPendingAction(action);
     const manager = new PendingInteractionManager(store, true);
-    const token = callback(manager.actionView(action, 10));
+    const token = callback(manager.actionView(action, 10, 20));
 
-    expect(manager.handleCallback(token, 10, 20).kind).toBe("submit");
-    store.claimPendingAction(action.id);
-    store.failPendingAction(action.id, "transport closed");
-    expect(manager.actionView(store.getPendingAction(action.id)!, 10).text).toContain("transport closed");
-    expect(manager.handleCallback(token, 10, 20).kind).toBe("submit");
+    await expect(manager.handleCallback(token, { chatId: 10, userId: 20 }, async () => {
+      throw new Error("transport closed");
+    })).rejects.toThrow("transport closed");
+    expect((await manager.handleCallback(token, { chatId: 10, userId: 20 }, async () => {})).kind).toBe("submit");
     store.close();
   });
 
-  it("rejects a callback after its connection is orphaned", () => {
+  it("rejects a callback after its connection is orphaned", async () => {
     const store = new Store(":memory:");
     const action = approvalAction();
     store.putPendingAction(action);
     const manager = new PendingInteractionManager(store, true);
-    const token = callback(manager.actionView(action, 10));
+    const token = callback(manager.actionView(action, 10, 20));
     store.orphanOpenActions(action.connectionGeneration);
 
-    expect(manager.handleCallback(token, 10, 20)).toEqual({
+    expect(await manager.handleCallback(token, { chatId: 10, userId: 20 }, async () => {})).toEqual({
       kind: "notice",
       text: "This request is no longer pending."
     });
@@ -105,7 +107,6 @@ function approvalAction(): PendingAction {
     title: "Approval",
     body: "run",
     payload: { method: "item/commandExecution/requestApproval", params: {} },
-    nonce: "nonce",
     expiresAt: Date.now() + 60_000
   };
 }
@@ -127,7 +128,6 @@ function questionAction(secret = false): PendingAction {
         ]
       }
     },
-    nonce: "nonce",
     expiresAt: Date.now() + 60_000
   };
 }

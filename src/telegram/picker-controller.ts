@@ -1,9 +1,8 @@
 import { listWorkspaceProjects, type WorkspaceProject } from "../runtime/workspace.js";
-import type { Store, StoredSession } from "../store/store.js";
+import type { CallbackToken, Store, StoredSession } from "../store/store.js";
 import type { BackgroundTerminalSummary, CodexModelSummary, CodexThreadSummary } from "../types/control.js";
 import type { SessionRef } from "../types/events.js";
-import { createId } from "../utils/ids.js";
-import { TelegramCallbackController, type CallbackScope } from "./callback-controller.js";
+import { assertCallbackResource, TelegramCallbackController, type CallbackScope } from "./callback-controller.js";
 
 const PROJECT_OPERATION = "select-workspace-project";
 const THREAD_OPERATION = "resume-codex-thread";
@@ -61,7 +60,9 @@ export class TelegramPickerController {
   projectToken(scope: CallbackScope, project: WorkspaceProject): string {
     return this.callbacks.issue({
       ...scope,
-      actionId: createId("project_picker"),
+      actionId: project.path,
+      resourceKind: "workspace-project",
+      expectedVersion: project.updatedAt,
       operation: PROJECT_OPERATION,
       payload: { name: project.name, path: project.path, expectedVersion: project.updatedAt } satisfies ProjectPayload
     });
@@ -70,6 +71,10 @@ export class TelegramPickerController {
   selectProject(token: string, scope: CallbackScope): Promise<WorkspaceProject> {
     return this.callbacks.execute(token, scope, PROJECT_OPERATION, async (callback) => {
       const payload = callback.payload as Partial<ProjectPayload>;
+      if (typeof payload.path !== "string" || typeof payload.expectedVersion !== "number") {
+        throw new Error("This project control is invalid. Run /new again.");
+      }
+      assertCallbackResource(callback, "workspace-project", payload.path, payload.expectedVersion);
       const current = (await this.projects(this.workspaceRoot, 100)).find((project) => project.path === payload.path);
       if (!current || current.name !== payload.name || current.updatedAt !== payload.expectedVersion) {
         throw new Error("This project changed or is no longer available. Run /new again.");
@@ -81,7 +86,9 @@ export class TelegramPickerController {
   threadToken(scope: CallbackScope, thread: CodexThreadSummary): string {
     return this.callbacks.issue({
       ...scope,
-      actionId: createId("thread_picker"),
+      actionId: thread.id,
+      resourceKind: "codex-thread",
+      expectedVersion: thread.updatedAt ?? 0,
       operation: THREAD_OPERATION,
       payload: { threadId: thread.id, expectedVersion: thread.updatedAt ?? 0 } satisfies ThreadPayload
     });
@@ -93,6 +100,7 @@ export class TelegramPickerController {
       if (typeof payload.threadId !== "string" || typeof payload.expectedVersion !== "number") {
         throw new Error("This thread control is invalid. Run /resume again.");
       }
+      assertCallbackResource(callback, "codex-thread", payload.threadId, payload.expectedVersion);
       const current = (await this.sessions.listRemoteThreads(25)).find((thread) => thread.id === payload.threadId);
       if (!current || (current.updatedAt ?? 0) !== payload.expectedVersion) {
         throw new Error("This thread changed or is no longer available. Run /resume again.");
@@ -104,7 +112,9 @@ export class TelegramPickerController {
   modelToken(scope: CallbackScope, model: CodexModelSummary, session: StoredSession): string {
     return this.callbacks.issue({
       ...scope,
-      actionId: createId("model_picker"),
+      actionId: session.id,
+      resourceKind: "session",
+      expectedVersion: this.resourceVersion(session.id),
       operation: MODEL_OPERATION,
       payload: {
         modelId: model.id,
@@ -120,6 +130,7 @@ export class TelegramPickerController {
       if (typeof payload.modelId !== "string" || typeof payload.sessionId !== "string" || typeof payload.expectedVersion !== "number") {
         throw new Error("This model control is invalid. Run /model again.");
       }
+      assertCallbackResource(callback, "session", payload.sessionId, payload.expectedVersion);
       const active = this.sessions.getActiveSession();
       if (!active || active.id !== payload.sessionId || this.resourceVersion(active.id) !== payload.expectedVersion) {
         throw new Error("The active session changed after this picker opened. Run /model again.");
@@ -141,19 +152,26 @@ export class TelegramPickerController {
   }
 
   async selectProcess(token: string, scope: CallbackScope): Promise<{ selection: ProcessSelection; confirmationToken: string }> {
-    const selection = await this.callbacks.execute(token, scope, PROCESS_OPERATION, (callback) => this.validateProcess(callback.payload));
+    const selection = await this.callbacks.execute(token, scope, PROCESS_OPERATION, (callback) => this.validateProcessControl(callback));
     return { selection, confirmationToken: this.issueProcess(scope, CONFIRM_PROCESS_OPERATION, selection) };
   }
 
   terminateProcess(token: string, scope: CallbackScope): Promise<boolean> {
     return this.callbacks.execute(token, scope, CONFIRM_PROCESS_OPERATION, async (callback) => {
-      const selection = await this.validateProcess(callback.payload);
+      const selection = await this.validateProcessControl(callback);
       return this.sessions.terminateBackgroundTerminal(selection.processId, selection.sessionId);
     });
   }
 
   private issueProcess(scope: CallbackScope, operation: string, payload: ProcessSelection): string {
-    return this.callbacks.issue({ ...scope, actionId: createId("process_picker"), operation, payload });
+    return this.callbacks.issue({
+      ...scope,
+      actionId: payload.processId,
+      resourceKind: "background-process",
+      expectedVersion: payload.expectedVersion,
+      operation,
+      payload
+    });
   }
 
   private async validateProcess(raw: unknown): Promise<ProcessSelection> {
@@ -171,6 +189,12 @@ export class TelegramPickerController {
       .find((process) => process.processId === payload.processId && process.command === payload.command);
     if (!current) throw new Error("This background process is no longer running.");
     return payload as ProcessSelection;
+  }
+
+  private async validateProcessControl(callback: CallbackToken): Promise<ProcessSelection> {
+    const selection = await this.validateProcess(callback.payload);
+    assertCallbackResource(callback, "background-process", selection.processId, selection.expectedVersion);
+    return selection;
   }
 
   private resourceVersion(sessionId: string): number {

@@ -112,7 +112,6 @@ function action(sessionId: string): PendingAction {
     title: "Approval",
     body: "run",
     payload: {},
-    nonce: "nonce",
     expiresAt: Date.now() + 60_000
   };
 }

@@ -178,7 +178,6 @@ function questionAction(questions: unknown[]): PendingAction {
       method: "tool/requestUserInput",
       params: { questions }
     },
-    nonce: "nonce",
     expiresAt: Date.now() + 1000
   };
 }

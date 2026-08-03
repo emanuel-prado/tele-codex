@@ -24,8 +24,10 @@ export interface StoredPendingAction extends PendingAction {
 export interface CallbackToken {
   token: string;
   actionId: string;
+  resourceKind: string;
+  expectedVersion?: number;
   chatId: number;
-  userId?: number;
+  userId: number;
   operation: string;
   payload: unknown;
   expiresAt: number;
@@ -183,7 +185,8 @@ export class Store {
 
   setPaused(sessionId: string, paused: boolean): void {
     if (this.getCodexThreadRow(sessionId)) {
-      this.db.prepare("update codex_threads set paused = ?, updated_at = ? where id = ?").run(paused ? 1 : 0, Date.now(), sessionId);
+      this.db.prepare("update codex_threads set paused = ?, updated_at = ? where id = ?")
+        .run(paused ? 1 : 0, this.nextSessionVersion(sessionId), sessionId);
       return;
     }
   }
@@ -199,6 +202,8 @@ export class Store {
         this.upsertAttachment(sessionId, "active");
       } else {
         this.db.prepare("delete from active_turns where thread_id = ?").run(sessionId);
+        this.db.prepare("update codex_threads set updated_at = ? where id = ?")
+          .run(this.nextSessionVersion(sessionId), sessionId);
       }
       return;
     }
@@ -232,7 +237,7 @@ export class Store {
     inputStatus?: LegacyTmuxInputStatus;
     submitStrategy: string;
   }): LegacyTmuxAttachment {
-    const now = Date.now();
+    const now = this.nextLegacyVersion(input.id);
     this.db.prepare(
       `insert into legacy_tmux_attachments
         (id, target, label, cwd, chat_id, status, input_status, submit_strategy, created_at, updated_at)
@@ -284,7 +289,7 @@ export class Store {
       state.submitStrategy ?? attachment.submitStrategy,
       state.lastProbe === undefined ? attachment.lastProbe ?? null : state.lastProbe,
       state.lastProbeAt === undefined ? attachment.lastProbeAt ?? null : state.lastProbeAt,
-      Date.now(),
+      this.nextLegacyVersion(id),
       id
     );
   }
@@ -303,7 +308,7 @@ export class Store {
       capture.captureHash ?? null,
       capture.captureTail ?? null,
       capture.lastCaptureAt ?? null,
-      Date.now(),
+      this.nextLegacyVersion(id),
       id
     );
   }
@@ -346,7 +351,7 @@ export class Store {
   }
 
   markThreadDetached(sessionId: string): void {
-    const now = Date.now();
+    const now = this.nextSessionVersion(sessionId);
     this.db.prepare("delete from active_turns where thread_id = ?").run(sessionId);
     this.db.prepare(
       `insert into appserver_attachments (thread_id, status, connection_generation, attached_at, updated_at)
@@ -358,7 +363,8 @@ export class Store {
 
   markThreadArchived(sessionId: string): void {
     this.markThreadDetached(sessionId);
-    this.db.prepare("update codex_threads set lifecycle_status = 'archived', updated_at = ? where id = ?").run(Date.now(), sessionId);
+    this.db.prepare("update codex_threads set lifecycle_status = 'archived', updated_at = ? where id = ?")
+      .run(this.nextSessionVersion(sessionId), sessionId);
   }
 
   forgetThread(sessionId: string): boolean {
@@ -373,7 +379,7 @@ export class Store {
         this.db.prepare("delete from notification_outbox where action_id = ?").run(actionId);
       }
       this.db.prepare("delete from pending_actions where session_id = ?").run(sessionId);
-      for (const table of ["event_log", "transcript_chunks", "session_grants", "token_usage", "session_runtime"]) {
+      for (const table of ["event_log", "transcript_chunks", "token_usage", "session_runtime"]) {
         this.db.prepare(`delete from ${table} where session_id = ?`).run(sessionId);
       }
       for (const table of ["routing_composes", "sticky_routes", "session_chats", "telegram_thread_messages"]) {
@@ -394,13 +400,12 @@ export class Store {
     this.db
       .prepare(
         `insert into pending_actions
-          (id, kind, session_id, request_id, request_id_type, connection_generation, thread_id, turn_id, item_id, title, body, payload_json, nonce, status, expires_at, created_at, failure_reason)
+          (id, kind, session_id, request_id, request_id_type, connection_generation, thread_id, turn_id, item_id, title, body, payload_json, status, expires_at, created_at, failure_reason)
          values
-          (@id, @kind, @sessionId, @requestId, @requestIdType, @connectionGeneration, @threadId, @turnId, @itemId, @title, @body, @payloadJson, @nonce, 'pending', @expiresAt, @createdAt, null)
+          (@id, @kind, @sessionId, @requestId, @requestIdType, @connectionGeneration, @threadId, @turnId, @itemId, @title, @body, @payloadJson, 'pending', @expiresAt, @createdAt, null)
          on conflict(id) do update set
           body=excluded.body,
           payload_json=excluded.payload_json,
-          nonce=excluded.nonce,
           status='pending',
           connection_generation=excluded.connection_generation,
           failure_reason=null,
@@ -420,7 +425,6 @@ export class Store {
         title: action.title,
         body: action.body,
         payloadJson: JSON.stringify(action.payload),
-        nonce: action.nonce,
         expiresAt: action.expiresAt,
         createdAt: Date.now()
       });
@@ -629,16 +633,18 @@ export class Store {
 
   putCallbackToken(token: CallbackToken): void {
     this.db.prepare(
-      `insert into callback_tokens (token, action_id, chat_id, user_id, operation, payload_json, expires_at, created_at)
-       values (?, ?, ?, ?, ?, ?, ?, ?)`
-    ).run(token.token, token.actionId, token.chatId, token.userId ?? null, token.operation, JSON.stringify(token.payload), token.expiresAt, Date.now());
+      `insert into callback_tokens
+        (token, action_id, resource_kind, expected_version, chat_id, user_id, operation, payload_json, expires_at, created_at)
+       values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(token.token, token.actionId, token.resourceKind, token.expectedVersion ?? null, token.chatId, token.userId,
+      token.operation, JSON.stringify(token.payload), token.expiresAt, Date.now());
   }
 
-  claimCallbackToken(token: string, chatId: number, userId: number | undefined, claimId: string): ClaimedCallbackToken | undefined {
+  claimCallbackToken(token: string, chatId: number, userId: number, claimId: string): ClaimedCallbackToken | undefined {
     const transaction = this.db.transaction(() => {
       const row = this.db
-        .prepare("select * from callback_tokens where token = ? and chat_id = ? and (user_id is null or user_id = ?) and claim_id is null and consumed_at is null and expires_at > ?")
-        .get(token, chatId, userId ?? null, Date.now()) as Row | undefined;
+        .prepare("select * from callback_tokens where token = ? and chat_id = ? and user_id = ? and claim_id is null and consumed_at is null and expires_at > ?")
+        .get(token, chatId, userId, Date.now()) as Row | undefined;
       if (!row) return undefined;
       this.db.prepare("update callback_tokens set claim_id = ?, claimed_at = ? where token = ?").run(claimId, Date.now(), token);
       return { ...mapCallbackToken(row), claimId };
@@ -893,15 +899,6 @@ export class Store {
     })();
   }
 
-  grantSession(actionId: string, sessionId: string, payload: unknown, expiresAt: number): void {
-    this.db
-      .prepare(
-        `insert into session_grants (action_id, session_id, payload_json, expires_at, created_at, revoked)
-         values (?, ?, ?, ?, ?, 0)`
-      )
-      .run(actionId, sessionId, JSON.stringify(payload), expiresAt, Date.now());
-  }
-
   private migrate(): void {
     migrateDatabase(this.db);
   }
@@ -909,7 +906,7 @@ export class Store {
   private upsertCodexThread(session: SessionRef, status: SessionStatus): StoredSession {
     const existing = this.getSessionByCodexThreadId(session.codexThreadId);
     const id = existing?.id ?? session.id;
-    const now = Date.now();
+    const now = existing ? this.nextSessionVersion(existing.id) : Date.now();
     this.db.prepare(
       `insert into codex_threads (id, codex_thread_id, label, cwd, lifecycle_status, paused, created_at, updated_at)
        values (?, ?, ?, ?, 'available', 0, ?, ?)
@@ -924,7 +921,7 @@ export class Store {
   }
 
   private upsertAttachment(sessionId: string, status: SessionStatus, connectionGeneration?: number): void {
-    const now = Date.now();
+    const now = this.nextSessionVersion(sessionId);
     const attachmentStatus = status === "starting" || status === "attached" || status === "idle" || status === "active" || status === "blocked" || status === "error"
       ? status
       : "attached";
@@ -937,6 +934,17 @@ export class Store {
          updated_at=excluded.updated_at`
     ).run(sessionId, attachmentStatus, connectionGeneration ?? null, now, now);
     this.db.prepare("update codex_threads set updated_at = ? where id = ?").run(now, sessionId);
+  }
+
+  private nextSessionVersion(sessionId: string): number {
+    const current = this.threads.resourceVersion(sessionId) ?? 0;
+    return Math.max(Date.now(), current + 1);
+  }
+
+  private nextLegacyVersion(attachmentId: string): number {
+    const row = this.db.prepare("select updated_at from legacy_tmux_attachments where id = ?")
+      .get(attachmentId) as { updated_at: number } | undefined;
+    return Math.max(Date.now(), Number(row?.updated_at ?? 0) + 1);
   }
 
   private getCodexThreadRow(sessionId: string): Row | undefined {
@@ -1049,7 +1057,6 @@ function mapPendingAction(row: Row): StoredPendingAction {
     title: String(row.title),
     body: String(row.body),
     payload: JSON.parse(String(row.payload_json)),
-    nonce: String(row.nonce),
     expiresAt: Number(row.expires_at),
     status: String(row.status) as PendingActionStatus,
     createdAt: Number(row.created_at)
@@ -1068,12 +1075,14 @@ function mapCallbackToken(row: Row): CallbackToken {
   const token: CallbackToken = {
     token: String(row.token),
     actionId: String(row.action_id),
+    resourceKind: String(row.resource_kind),
     chatId: Number(row.chat_id),
+    userId: Number(row.user_id),
     operation: String(row.operation),
     payload: JSON.parse(String(row.payload_json)),
     expiresAt: Number(row.expires_at)
   };
-  if (row.user_id != null) token.userId = Number(row.user_id);
+  if (row.expected_version != null) token.expectedVersion = Number(row.expected_version);
   return token;
 }
 

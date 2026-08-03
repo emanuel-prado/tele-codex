@@ -10,12 +10,28 @@ export interface CallbackScope {
 
 export interface CallbackTokenInput extends CallbackScope {
   actionId: string;
+  resourceKind: string;
+  expectedVersion?: number;
   operation: string;
   payload: unknown;
   expiresAt?: number;
 }
 
 export class CallbackControlError extends Error {}
+
+export function assertCallbackResource(
+  callback: CallbackToken,
+  resourceKind: string,
+  resourceId: string,
+  expectedVersion?: number
+): void {
+  if (
+    callback.resourceKind !== resourceKind || callback.actionId !== resourceId ||
+    (expectedVersion !== undefined && callback.expectedVersion !== expectedVersion)
+  ) {
+    throw new CallbackControlError("This control does not match its target resource. Run the command again.");
+  }
+}
 
 /** Owns the one transaction boundary shared by restart-safe Telegram controls. */
 export class TelegramCallbackController {
@@ -26,6 +42,8 @@ export class TelegramCallbackController {
     this.store.putCallbackToken({
       token,
       actionId: input.actionId,
+      resourceKind: input.resourceKind,
+      ...(input.expectedVersion === undefined ? {} : { expectedVersion: input.expectedVersion }),
       chatId: input.chatId,
       userId: input.userId,
       operation: input.operation,

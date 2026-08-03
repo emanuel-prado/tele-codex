@@ -15,6 +15,7 @@ describe("TelegramCallbackController", () => {
       chatId: 10,
       userId: 20,
       actionId: "action_1",
+      resourceKind: "test-resource",
       operation: "test",
       payload: { value: 1 }
     });
@@ -32,7 +33,9 @@ describe("TelegramCallbackController", () => {
     const path = join(dir, "state.sqlite");
     const before = new Store(path);
     const controller = new TelegramCallbackController(before);
-    const token = controller.issue({ chatId: 10, userId: 20, actionId: "action_1", operation: "test", payload: {} });
+    const token = controller.issue({
+      chatId: 10, userId: 20, actionId: "action_1", resourceKind: "test-resource", operation: "test", payload: {}
+    });
     expect(before.claimCallbackToken(token, 10, 20, "abandoned_claim")).toBeDefined();
     expect(before.claimCallbackToken(token, 10, 20, "duplicate_claim")).toBeUndefined();
     before.close();
@@ -45,6 +48,27 @@ describe("TelegramCallbackController", () => {
       () => "recovered"
     )).resolves.toBe("recovered");
     after.close();
+  });
+
+  it("rejects expired controls before invoking their action", async () => {
+    const store = new Store(":memory:");
+    const controller = new TelegramCallbackController(store);
+    const token = controller.issue({
+      chatId: 10,
+      userId: 20,
+      actionId: "action_1",
+      resourceKind: "test-resource",
+      operation: "test",
+      payload: {},
+      expiresAt: Date.now() - 1
+    });
+    let invoked = false;
+
+    await expect(controller.execute(token, { chatId: 10, userId: 20 }, "test", () => {
+      invoked = true;
+    })).rejects.toThrow(/expired/i);
+    expect(invoked).toBe(false);
+    store.close();
   });
 });
 

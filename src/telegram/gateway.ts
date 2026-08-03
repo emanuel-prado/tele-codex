@@ -6,8 +6,8 @@ import type { Logger } from "pino";
 import type { AppConfig } from "../config.js";
 import { PolicyEngine } from "../security/policy.js";
 import { Store } from "../store/store.js";
-import type { StoredSession } from "../store/store.js";
-import type { CodexEvent, ApprovalDecision, SessionRef } from "../types/events.js";
+import type { CallbackToken, StoredSession } from "../store/store.js";
+import type { CodexEvent, SessionRef } from "../types/events.js";
 import type {
   CodexModelSummary,
   CodexThreadSummary,
@@ -37,12 +37,20 @@ import { parseResumeCommand } from "./resume-command.js";
 import { PendingInteractionManager, type InteractionView } from "./pending-interaction.js";
 import { createId } from "../utils/ids.js";
 import { TelegramRouting } from "./routing.js";
-import { TelegramCallbackController } from "./callback-controller.js";
+import { assertCallbackResource, TelegramCallbackController } from "./callback-controller.js";
 import { TelegramPickerController } from "./picker-controller.js";
 import type { RuntimeHealth, RuntimeHealthReporter } from "../runtime/health.js";
 import { noopRuntimeHealth } from "../runtime/health.js";
 import type { SupervisedSubsystem } from "../runtime/supervisor.js";
 import { TelegramBotRuntime, type TelegramCommandDefinition, type TelegramRuntime } from "./bot-runtime.js";
+
+const INTERACTION_CONTROL_OPERATIONS = [
+  "panel:refresh", "panel:status", "panel:usage", "panel:new", "panel:resume", "panel:models",
+  "panel:plan", "panel:default", "panel:pause", "panel:unpause", "panel:transcript",
+  "session:use", "session:resume", "session:transcript", "session:detach", "session:archive",
+  "session:forget", "session:kill", "session:confirm-kill", "session:confirm-archive",
+  "session:confirm-forget"
+] as const;
 
 export class TelegramGateway {
   private readonly runtime: TelegramRuntime;
@@ -115,8 +123,6 @@ export class TelegramGateway {
       { command: "processes", description: "Show background processes" },
       { command: "doctor", description: "Run local health checks" },
       { command: "transcript", description: "Export active session transcript" },
-      { command: "approve", description: "Approve a pending request by id" },
-      { command: "deny", description: "Deny a pending request by id" },
       { command: "pause", description: "Pause Telegram input forwarding" },
       { command: "unpause", description: "Resume Telegram input forwarding" },
       { command: "kill", description: "Interrupt active turn" },
@@ -292,7 +298,7 @@ export class TelegramGateway {
     this.bot.command("sessions", async (ctx) => {
       const includeAll = String(ctx.match ?? "").trim().toLowerCase() === "all";
       const sessions = this.sessions.listSessions(includeAll);
-      await ctx.reply(formatSessions(sessions), { reply_markup: sessionsKeyboard(sessions) });
+      await ctx.reply(formatSessions(sessions), { reply_markup: this.sessionsKeyboard(ctx.chat.id, ctx.from!.id, sessions) });
     });
 
     this.bot.command("new", async (ctx) => {
@@ -370,7 +376,7 @@ export class TelegramGateway {
         await ctx.reply("No active session.");
         return;
       }
-      const keyboard = new InlineKeyboard().text("Confirm archive", `archive:${active.id}:confirm`);
+      const keyboard = this.confirmationKeyboard(ctx.chat.id, ctx.from!.id, "session:confirm-archive", active, "Confirm archive");
       await ctx.reply(`Archive active app-server thread?\n${active.id}`, { reply_markup: keyboard });
     });
 
@@ -391,7 +397,7 @@ export class TelegramGateway {
         await ctx.reply("Usage: /forget <sessionId>. Use /sessions all to find diagnostic records.");
         return;
       }
-      const keyboard = new InlineKeyboard().text("Confirm forget", `forget:${sessionId}:confirm`);
+      const keyboard = this.confirmationKeyboard(ctx.chat.id, ctx.from!.id, "session:confirm-forget", this.store.getSession(sessionId)!, "Confirm forget");
       await ctx.reply(`Forget local tele-codex metadata for this thread? Codex history is not deleted.\n${sessionId}`, { reply_markup: keyboard });
     });
 
@@ -502,7 +508,7 @@ export class TelegramGateway {
         return;
       }
       for (const action of actions) {
-        const view = this.interactions.actionView(action, ctx.chat.id);
+        const view = this.interactions.actionView(action, ctx.chat.id, ctx.from!.id);
         await ctx.reply(`${formatAction(action)}\n\n${escapeMd(view.text)}`, {
           parse_mode: "MarkdownV2",
           reply_markup: interactionKeyboard(view)
@@ -642,12 +648,9 @@ export class TelegramGateway {
         await ctx.reply("No active session.");
         return;
       }
-      const keyboard = new InlineKeyboard().text("Confirm kill", `kill:${active.id}:confirm`);
+      const keyboard = this.confirmationKeyboard(ctx.chat.id, ctx.from!.id, "session:confirm-kill", active, "Confirm kill");
       await ctx.reply(`Interrupt active session?\n${active.id}`, { reply_markup: keyboard });
     });
-
-    this.bot.command("approve", async (ctx) => this.manualDecision(ctx, "accept"));
-    this.bot.command("deny", async (ctx) => this.manualDecision(ctx, "decline"));
 
     this.bot.callbackQuery(/^cb:/, async (ctx) => {
       const token = String(ctx.callbackQuery.data).slice(3);
@@ -658,13 +661,14 @@ export class TelegramGateway {
         return;
       }
       try {
-        const result = this.interactions.handleCallback(token, chatId, userId);
+        const result = await this.interactions.handleCallback(token, { chatId, userId }, async (decision) => {
+          await this.sessions.respondAction(decision);
+        });
         if (result.kind === "notice") {
           await ctx.answerCallbackQuery({ text: result.text, show_alert: true });
           return;
         }
         if (result.kind === "submit") {
-          await this.sessions.respondAction(result.decision);
           await this.clearActionKeyboards(result.decision.actionId);
           await ctx.answerCallbackQuery({ text: result.text });
           await ctx.editMessageText(result.text);
@@ -693,107 +697,18 @@ export class TelegramGateway {
       }
     });
 
-    this.bot.callbackQuery(/^panel:/, async (ctx) => {
-      const [, action] = String(ctx.callbackQuery.data).split(":");
+    this.bot.callbackQuery(/^ctl:/, async (ctx) => {
+      const token = String(ctx.callbackQuery.data).slice(4);
       try {
-        if (action === "refresh") {
-          await ctx.answerCallbackQuery({ text: "Refreshed." });
-          await this.editOrReplyPanel(ctx);
-          return;
-        }
-        if (action === "status") {
-          const active = this.sessions.getActiveSession();
-          await ctx.answerCallbackQuery();
-          await ctx.reply(active ? this.statusText(active) : "No active session.");
-          return;
-        }
-        if (action === "usage") {
-          const active = this.sessions.getActiveSession();
-          await ctx.answerCallbackQuery();
-          await ctx.reply(active ? formatUsage(this.store.getTokenUsage(active.id)) : "No active session.");
-          return;
-        }
-        if (action === "new") {
-          await ctx.answerCallbackQuery({ text: "Choose a project." });
-          await this.showWorkspacePicker(ctx);
-          return;
-        }
-        if (action === "resume") {
-          await ctx.answerCallbackQuery({ text: "Choose a thread." });
-          await this.showThreadPicker(ctx);
-          return;
-        }
-        if (action === "models") {
-          await ctx.answerCallbackQuery({ text: "Choose a model." });
-          await this.showModelPicker(ctx);
-          return;
-        }
-        if (action === "plan") {
-          await this.sessions.setMode("plan");
-          await ctx.answerCallbackQuery({ text: "Plan mode enabled." });
-          await this.editOrReplyPanel(ctx);
-          return;
-        }
-        if (action === "default") {
-          await this.sessions.setMode("default");
-          await ctx.answerCallbackQuery({ text: "Default mode enabled." });
-          await this.editOrReplyPanel(ctx);
-          return;
-        }
-        if (action === "pause") {
-          this.sessions.pause();
-          await ctx.answerCallbackQuery({ text: "Paused." });
-          await this.editOrReplyPanel(ctx);
-          return;
-        }
-        if (action === "unpause") {
-          this.sessions.resume();
-          await ctx.answerCallbackQuery({ text: "Input resumed." });
-          await this.editOrReplyPanel(ctx);
-          return;
-        }
-        if (action === "transcript") {
-          await ctx.answerCallbackQuery({ text: "Exporting transcript." });
-          await this.sendTranscript(ctx);
-          return;
-        }
-        await ctx.answerCallbackQuery({ text: "Unsupported panel action. Run /panel again.", show_alert: true });
+        await this.callbacks.execute(
+          token,
+          { chatId: ctx.chat!.id, userId: ctx.from.id },
+          INTERACTION_CONTROL_OPERATIONS,
+          (callback) => this.applyInteractionControl(ctx, callback)
+        );
       } catch (error) {
-        await ctx.answerCallbackQuery({ text: error instanceof Error ? error.message : "Panel action failed.", show_alert: true });
+        await ctx.answerCallbackQuery({ text: callbackError(error, "Control failed. Run the command again."), show_alert: true });
       }
-    });
-
-    this.bot.callbackQuery(/^kill:/, async (ctx) => {
-      const [, sessionId, confirm] = String(ctx.callbackQuery.data).split(":");
-      if (sessionId && confirm === "confirm") {
-        await this.sessions.kill(sessionId);
-        await ctx.answerCallbackQuery({ text: "Interrupted." });
-        await ctx.editMessageText(`Interrupted session:\n${sessionId}`);
-        return;
-      }
-      await ctx.answerCallbackQuery({ text: "Invalid interrupt control. Run /kill again.", show_alert: true });
-    });
-
-    this.bot.callbackQuery(/^archive:/, async (ctx) => {
-      const [, sessionId, confirm] = String(ctx.callbackQuery.data).split(":");
-      if (sessionId && confirm === "confirm") {
-        await this.sessions.archive(sessionId);
-        await ctx.answerCallbackQuery({ text: "Archived." });
-        await ctx.editMessageText(`Archived session:\n${sessionId}`);
-        return;
-      }
-      await ctx.answerCallbackQuery({ text: "Invalid archive control. Run /archive again.", show_alert: true });
-    });
-
-    this.bot.callbackQuery(/^forget:/, async (ctx) => {
-      const [, sessionId, confirm] = String(ctx.callbackQuery.data).split(":");
-      if (sessionId && confirm === "confirm") {
-        await this.sessions.forget(sessionId);
-        await ctx.answerCallbackQuery({ text: "Local metadata forgotten." });
-        await ctx.editMessageText(`Forgot local thread metadata:\n${sessionId}`);
-        return;
-      }
-      await ctx.answerCallbackQuery({ text: "Invalid forget control. Run /forget again.", show_alert: true });
     });
 
     this.bot.callbackQuery(/^proj:/, async (ctx) => {
@@ -829,70 +744,6 @@ export class TelegramGateway {
       }
     });
 
-    this.bot.callbackQuery(/^sess:/, async (ctx) => {
-      const [, action, sessionId] = String(ctx.callbackQuery.data).split(":");
-      if (!sessionId) {
-        await ctx.answerCallbackQuery({ text: "Missing session.", show_alert: true });
-        return;
-      }
-      try {
-        if (action === "use") {
-          const session = await this.routing.setSticky(ctx.chat!.id, ctx.from.id, sessionId);
-          await ctx.answerCallbackQuery({ text: "Sticky route updated." });
-          await ctx.reply(`Sticky route for this chat and user:\n${session.label}\n${session.id}`);
-          return;
-        }
-        if (action === "resume") {
-          const session = await this.sessions.resumeSession(sessionId);
-          await ctx.answerCallbackQuery({ text: "Session resumed." });
-          await ctx.reply(`Resumed session:\n${session.label}\n${session.id}`);
-          return;
-        }
-        if (action === "pause") {
-          this.sessions.pause(sessionId);
-          await ctx.answerCallbackQuery({ text: "Paused." });
-          return;
-        }
-        if (action === "unpause") {
-          this.sessions.resume(sessionId);
-          await ctx.answerCallbackQuery({ text: "Resumed forwarding." });
-          return;
-        }
-        if (action === "transcript") {
-          await ctx.answerCallbackQuery({ text: "Exporting transcript." });
-          await this.sendTranscript(ctx, sessionId);
-          return;
-        }
-        if (action === "detach") {
-          await this.sessions.detach(sessionId);
-          await ctx.answerCallbackQuery({ text: "Detached." });
-          await ctx.editMessageText(`Detached thread:\n${sessionId}\nUse /sessions to resume it.`);
-          return;
-        }
-        if (action === "archive") {
-          const keyboard = new InlineKeyboard().text("Confirm archive", `archive:${sessionId}:confirm`);
-          await ctx.answerCallbackQuery({ text: "Confirm archive." });
-          await ctx.reply(`Archive thread?\n${sessionId}`, { reply_markup: keyboard });
-          return;
-        }
-        if (action === "forget") {
-          const keyboard = new InlineKeyboard().text("Confirm forget", `forget:${sessionId}:confirm`);
-          await ctx.answerCallbackQuery({ text: "Confirm forget." });
-          await ctx.reply(`Forget local metadata? Codex history is not deleted.\n${sessionId}`, { reply_markup: keyboard });
-          return;
-        }
-        if (action === "kill") {
-          const keyboard = new InlineKeyboard().text("Confirm kill", `kill:${sessionId}:confirm`);
-          await ctx.answerCallbackQuery({ text: "Confirm kill." });
-          await ctx.reply(`Interrupt session?\n${sessionId}`, { reply_markup: keyboard });
-          return;
-        }
-        await ctx.answerCallbackQuery({ text: "Unsupported session action. Run /sessions again.", show_alert: true });
-      } catch (error) {
-        await ctx.answerCallbackQuery({ text: error instanceof Error ? error.message : "Session action failed.", show_alert: true });
-      }
-    });
-
     this.bot.callbackQuery(/^legacy:/, async (ctx) => {
       const token = String(ctx.callbackQuery.data).slice(7);
       const chatId = ctx.chat?.id;
@@ -905,6 +756,7 @@ export class TelegramGateway {
         await this.callbacks.execute(token, { chatId, userId: ctx.from.id }, ["legacy-tmux-attach", "legacy-tmux-probe"], async (callback) => {
           const payload = callback.payload as { target?: string; attachmentId?: string; action?: string; strategy?: string; expectedVersion?: number };
           if (callback.operation === "legacy-tmux-attach" && payload.target) {
+            assertCallbackResource(callback, "legacy-tmux-target", payload.target);
             await ctx.answerCallbackQuery({ text: "Attaching legacy tmux fallback..." });
             answered = true;
             const attachment = await this.legacyTmux.attach(payload.target, chatId, `tmux ${payload.target}`);
@@ -915,6 +767,8 @@ export class TelegramGateway {
           if (callback.operation !== "legacy-tmux-probe" || !payload.attachmentId || !payload.action) {
             throw new Error("Invalid legacy tmux control.");
           }
+          if (typeof payload.expectedVersion !== "number") throw new Error("Invalid legacy tmux control version.");
+          assertCallbackResource(callback, "legacy-tmux-attachment", payload.attachmentId, payload.expectedVersion);
           const attachment = this.store.getLegacyTmuxAttachment(payload.attachmentId);
           if (!attachment || attachment.chatId !== chatId || attachment.updatedAt !== payload.expectedVersion) {
             throw new Error("This legacy tmux attachment changed or belongs to another chat. Run /tmux again.");
@@ -1001,6 +855,185 @@ export class TelegramGateway {
     });
   }
 
+  private async applyInteractionControl(ctx: Context, callback: CallbackToken): Promise<void> {
+    const operation = callback.operation;
+    if (operation.startsWith("panel:")) {
+      if (callback.resourceKind !== "panel" && callback.resourceKind !== "session") {
+        throw new Error("This panel control has an invalid target. Run /panel again.");
+      }
+      if (callback.resourceKind === "panel" && callback.actionId !== "main") {
+        throw new Error("This panel control has an invalid target. Run /panel again.");
+      }
+    } else if (callback.resourceKind !== "session") {
+      throw new Error("This session control has an invalid target. Run /sessions again.");
+    }
+    const session = callback.resourceKind === "session" ? this.sessionForControl(callback) : undefined;
+
+    if (operation === "panel:refresh") {
+      await ctx.answerCallbackQuery({ text: "Refreshed." });
+      await this.editOrReplyPanel(ctx);
+    } else if (operation === "panel:status") {
+      const active = this.sessions.getActiveSession();
+      await ctx.answerCallbackQuery();
+      await ctx.reply(active ? this.statusText(active) : "No active session.");
+    } else if (operation === "panel:usage") {
+      await ctx.answerCallbackQuery();
+      await ctx.reply(session ? formatUsage(this.store.getTokenUsage(session.id)) : "No active session.");
+    } else if (operation === "panel:new") {
+      await ctx.answerCallbackQuery({ text: "Choose a project." });
+      await this.showWorkspacePicker(ctx);
+    } else if (operation === "panel:resume") {
+      await ctx.answerCallbackQuery({ text: "Choose a thread." });
+      await this.showThreadPicker(ctx);
+    } else if (operation === "panel:models") {
+      await ctx.answerCallbackQuery({ text: "Choose a model." });
+      await this.showModelPicker(ctx);
+    } else if (operation === "panel:plan" || operation === "panel:default") {
+      await this.sessions.setMode(operation === "panel:plan" ? "plan" : "default");
+      await ctx.answerCallbackQuery({ text: operation === "panel:plan" ? "Plan mode enabled." : "Default mode enabled." });
+      await this.editOrReplyPanel(ctx);
+    } else if (operation === "panel:pause" || operation === "panel:unpause") {
+      if (!session) throw new Error("The panel session no longer exists. Run /panel again.");
+      if (operation === "panel:pause") this.sessions.pause(session.id);
+      else this.sessions.resume(session.id);
+      await ctx.answerCallbackQuery({ text: operation === "panel:pause" ? "Paused." : "Input resumed." });
+      await this.editOrReplyPanel(ctx);
+    } else if (operation === "panel:transcript") {
+      await ctx.answerCallbackQuery({ text: "Exporting transcript." });
+      await this.sendTranscript(ctx, session?.id);
+    } else if (operation === "session:use") {
+      const selected = await this.routing.setSticky(ctx.chat!.id, ctx.from!.id, session!.id);
+      await ctx.answerCallbackQuery({ text: "Sticky route updated." });
+      await ctx.reply(`Sticky route for this chat and user:\n${selected.label}\n${selected.id}`);
+    } else if (operation === "session:resume") {
+      const resumed = await this.sessions.resumeSession(session!.id);
+      await ctx.answerCallbackQuery({ text: "Session resumed." });
+      await ctx.reply(`Resumed session:\n${resumed.label}\n${resumed.id}`);
+    } else if (operation === "session:transcript") {
+      await ctx.answerCallbackQuery({ text: "Exporting transcript." });
+      await this.sendTranscript(ctx, session!.id);
+    } else if (operation === "session:detach") {
+      await this.sessions.detach(session!.id);
+      await ctx.answerCallbackQuery({ text: "Detached." });
+      await ctx.editMessageText(`Detached thread:\n${session!.id}\nUse /sessions to resume it.`);
+    } else if (["session:archive", "session:forget", "session:kill"].includes(operation)) {
+      const action = operation.slice("session:".length);
+      const label = action === "archive" ? "archive" : action === "forget" ? "forget" : "kill";
+      const keyboard = this.confirmationKeyboard(
+        ctx.chat!.id,
+        ctx.from!.id,
+        `session:confirm-${label}`,
+        session!,
+        `Confirm ${label}`
+      );
+      await ctx.answerCallbackQuery({ text: `Confirm ${label}.` });
+      const detail = label === "forget" ? "Forget local metadata? Codex history is not deleted." : label === "archive" ? "Archive thread?" : "Interrupt session?";
+      await ctx.reply(`${detail}\n${session!.id}`, { reply_markup: keyboard });
+    } else if (operation === "session:confirm-kill") {
+      await this.sessions.kill(session!.id);
+      await ctx.answerCallbackQuery({ text: "Interrupted." });
+      await ctx.editMessageText(`Interrupted session:\n${session!.id}`);
+    } else if (operation === "session:confirm-archive") {
+      await this.sessions.archive(session!.id);
+      await ctx.answerCallbackQuery({ text: "Archived." });
+      await ctx.editMessageText(`Archived session:\n${session!.id}`);
+    } else if (operation === "session:confirm-forget") {
+      await this.sessions.forget(session!.id);
+      await ctx.answerCallbackQuery({ text: "Local metadata forgotten." });
+      await ctx.editMessageText(`Forgot local thread metadata:\n${session!.id}`);
+    } else {
+      throw new Error("This interaction action is no longer supported. Run the command again.");
+    }
+  }
+
+  private sessionForControl(callback: CallbackToken): StoredSession {
+    const session = this.store.getSession(callback.actionId);
+    const currentVersion = session ? this.store.getSessionResourceVersion(session.id) : undefined;
+    if (!session || callback.expectedVersion === undefined || currentVersion !== callback.expectedVersion) {
+      throw new Error("This session changed or no longer exists. Run the command again.");
+    }
+    return session;
+  }
+
+  private confirmationKeyboard(
+    chatId: number,
+    userId: number,
+    operation: string,
+    session: StoredSession,
+    label: string
+  ): InlineKeyboard {
+    return new InlineKeyboard().text(label, this.sessionControl(chatId, userId, operation, session));
+  }
+
+  private sessionControl(chatId: number, userId: number, operation: string, session: StoredSession): string {
+    const expectedVersion = this.store.getSessionResourceVersion(session.id);
+    if (expectedVersion === undefined) throw new Error("The selected session no longer exists.");
+    const token = this.callbacks.issue({
+      chatId,
+      userId,
+      actionId: session.id,
+      resourceKind: "session",
+      expectedVersion,
+      operation,
+      payload: {}
+    });
+    return `ctl:${token}`;
+  }
+
+  private panelControl(chatId: number, userId: number, operation: string, session?: StoredSession): string {
+    if (session) return this.sessionControl(chatId, userId, operation, session);
+    const token = this.callbacks.issue({
+      chatId,
+      userId,
+      actionId: "main",
+      resourceKind: "panel",
+      operation,
+      payload: {}
+    });
+    return `ctl:${token}`;
+  }
+
+  private panelKeyboard(chatId: number, userId: number, session?: StoredSession): InlineKeyboard {
+    const keyboard = new InlineKeyboard()
+      .text("Refresh", this.panelControl(chatId, userId, "panel:refresh"))
+      .text("Status", this.panelControl(chatId, userId, "panel:status"))
+      .text("Usage", this.panelControl(chatId, userId, "panel:usage", session))
+      .row()
+      .text("New", this.panelControl(chatId, userId, "panel:new"))
+      .text("Resume", this.panelControl(chatId, userId, "panel:resume"))
+      .text("Model", this.panelControl(chatId, userId, "panel:models", session))
+      .row()
+      .text("Plan", this.panelControl(chatId, userId, "panel:plan", session))
+      .text("Default", this.panelControl(chatId, userId, "panel:default", session))
+      .row();
+    if (session) {
+      keyboard
+        .text(session.paused ? "Resume input" : "Pause input", this.panelControl(chatId, userId, `panel:${session.paused ? "unpause" : "pause"}`, session))
+        .text("Transcript", this.panelControl(chatId, userId, "panel:transcript", session))
+        .row();
+    }
+    return keyboard;
+  }
+
+  private sessionsKeyboard(chatId: number, userId: number, sessions: StoredSession[]): InlineKeyboard {
+    const keyboard = new InlineKeyboard();
+    sessions.slice(0, 10).forEach((session, index) => {
+      const resumable = session.status !== "archived";
+      const usable = !session.paused && ["attached", "idle", "active", "blocked"].includes(session.status);
+      const action = usable ? "use" : resumable ? "resume" : undefined;
+      if (action) keyboard.text(`${index + 1}. ${action === "resume" ? "Resume thread" : "Use"}`, this.sessionControl(chatId, userId, `session:${action}`, session));
+      keyboard.text("Transcript", this.sessionControl(chatId, userId, "session:transcript", session)).row();
+      if (usable) {
+        keyboard
+          .text("Detach", this.sessionControl(chatId, userId, "session:detach", session))
+          .text("Archive", this.sessionControl(chatId, userId, "session:archive", session))
+          .row();
+      }
+      keyboard.text("Forget local", this.sessionControl(chatId, userId, "session:forget", session)).row();
+    });
+    return keyboard;
+  }
+
   private async showWorkspacePicker(ctx: Context): Promise<void> {
     const [text, options] = await this.workspacePickerMessage(ctx.chat!.id, ctx.from!.id);
     await ctx.reply(text, options);
@@ -1008,16 +1041,18 @@ export class TelegramGateway {
 
   private async showPanel(ctx: Context): Promise<void> {
     const active = this.sessions.getActiveSession();
-    await ctx.reply(active ? this.panelText(active) : "No active Codex session.", { reply_markup: panelKeyboard(active) });
+    await ctx.reply(active ? this.panelText(active) : "No active Codex session.", {
+      reply_markup: this.panelKeyboard(ctx.chat!.id, ctx.from!.id, active)
+    });
   }
 
   private async editOrReplyPanel(ctx: Context): Promise<void> {
     const active = this.sessions.getActiveSession();
     const text = active ? this.panelText(active) : "No active Codex session.";
     try {
-      await ctx.editMessageText(text, { reply_markup: panelKeyboard(active) });
+      await ctx.editMessageText(text, { reply_markup: this.panelKeyboard(ctx.chat!.id, ctx.from!.id, active) });
     } catch {
-      await ctx.reply(text, { reply_markup: panelKeyboard(active) });
+      await ctx.reply(text, { reply_markup: this.panelKeyboard(ctx.chat!.id, ctx.from!.id, active) });
     }
   }
 
@@ -1059,7 +1094,7 @@ export class TelegramGateway {
     for (const chatId of this.allowedDeliveryChats()) {
       try {
         if (sessions.length > 0) {
-          const keyboard = sessionsKeyboard(sessions) as unknown as { inline_keyboard: unknown[][] };
+          const keyboard = this.sessionsKeyboard(chatId, this.config.controllerUserId, sessions) as unknown as { inline_keyboard: unknown[][] };
           this.store.enqueueOutbox(`startup-recovery:${this.runtimeId}`, chatId, {
             text: `tele-codex restarted. Threads are not resumed automatically.\n${lastActiveId ? `Last active: ${lastActiveId}\n` : ""}${orphaned ? `${orphaned} previous pending request(s) were marked orphaned.\n` : ""}\nRecoverable sessions:\n\n${formatSessions(sessions)}`,
             keyboard: keyboard.inline_keyboard
@@ -1211,8 +1246,11 @@ export class TelegramGateway {
   }
 
   private legacyCallbackToken(chatId: number, userId: number, operation: string, payload: unknown): string {
+    const target = payload as { attachmentId?: string; target?: string; expectedVersion?: number };
     return this.callbacks.issue({
-      actionId: createId("legacy_tmux"),
+      actionId: target.attachmentId ?? target.target ?? createId("legacy_tmux"),
+      resourceKind: target.attachmentId ? "legacy-tmux-attachment" : "legacy-tmux-target",
+      ...(target.expectedVersion === undefined ? {} : { expectedVersion: target.expectedVersion }),
       chatId,
       userId,
       operation,
@@ -1267,17 +1305,6 @@ export class TelegramGateway {
     await this.bot.api.sendDocument(chatId, new InputFile(path, filename));
   }
 
-  private async manualDecision(ctx: Context, decision: ApprovalDecision): Promise<void> {
-    const actionId = String(ctx.match ?? "").trim();
-    if (!actionId) {
-      await ctx.reply(`Usage: /${decision === "accept" ? "approve" : "deny"} <actionId>`);
-      return;
-    }
-    await this.sessions.respondAction({ actionId, decision });
-    await this.clearActionKeyboards(actionId);
-    await ctx.reply("Decision submitted; waiting for Codex confirmation.");
-  }
-
   private async forwardCodexEvents(signal: AbortSignal): Promise<void> {
     for await (const event of this.sessions.events()) {
       if (signal.aborted) return;
@@ -1311,7 +1338,7 @@ export class TelegramGateway {
 
     if (event.type === "approvalRequested" || event.type === "questionAsked") {
       for (const chatId of this.deliveryChatsForSession(event.sessionId)) {
-        const view = this.interactions.actionView(event.action, chatId);
+        const view = this.interactions.actionView(event.action, chatId, this.config.controllerUserId);
         const keyboard = interactionKeyboard(view) as unknown as { inline_keyboard: unknown[][] };
         this.store.enqueueOutbox(
           `action:${event.action.id}`,
@@ -1582,51 +1609,6 @@ function formatSendPicker(threads: CodexThreadSummary[], store: Store): string {
     "",
     "The selection applies only to your next message and expires in 5 minutes."
   ].join("\n\n");
-}
-
-function sessionsKeyboard(sessions: StoredSession[]): InlineKeyboard {
-  const keyboard = new InlineKeyboard();
-  sessions.slice(0, 10).forEach((session, index) => {
-    const resumable = session.status !== "archived";
-    const usable =
-      !session.paused &&
-      (session.status === "attached" ||
-        session.status === "idle" ||
-        session.status === "active" ||
-        session.status === "blocked");
-    const action = usable ? "use" : resumable ? "resume" : undefined;
-    if (action) {
-      keyboard.text(`${index + 1}. ${action === "resume" ? "Resume thread" : "Use"}`, `sess:${action}:${session.id}`);
-    }
-    keyboard
-      .text("Transcript", `sess:transcript:${session.id}`)
-      .row();
-    if (usable) keyboard.text("Detach", `sess:detach:${session.id}`).text("Archive", `sess:archive:${session.id}`).row();
-    keyboard.text("Forget local", `sess:forget:${session.id}`).row();
-  });
-  return keyboard;
-}
-
-function panelKeyboard(session?: StoredSession): InlineKeyboard {
-  const keyboard = new InlineKeyboard()
-    .text("Refresh", "panel:refresh")
-    .text("Status", "panel:status")
-    .text("Usage", "panel:usage")
-    .row()
-    .text("New", "panel:new")
-    .text("Resume", "panel:resume")
-    .text("Model", "panel:models")
-    .row()
-    .text("Plan", "panel:plan")
-    .text("Default", "panel:default")
-    .row();
-  if (session) {
-    keyboard
-      .text(session.paused ? "Resume input" : "Pause input", `panel:${session.paused ? "unpause" : "pause"}`)
-      .text("Transcript", "panel:transcript")
-      .row();
-  }
-  return keyboard;
 }
 
 function formatModels(models: CodexModelSummary[]): string {
