@@ -202,8 +202,8 @@ export class AppServerAdapter implements AppServerRuntime {
       input
     })) as { turn?: { id: string } };
     if (result.turn?.id) {
-      this.activeTurns.set(sessionId, result.turn.id);
       this.store.setActiveTurn(sessionId, result.turn.id);
+      this.activeTurns.set(sessionId, result.turn.id);
     }
   }
 
@@ -355,16 +355,16 @@ export class AppServerAdapter implements AppServerRuntime {
   async archiveThread(sessionId: string): Promise<void> {
     const session = this.requireSession(sessionId);
     await this.rpc.request("thread/archive", { threadId: session.codexThreadId });
+    this.store.markThreadArchived(sessionId);
     this.sessionsByThread.delete(session.codexThreadId!);
     this.activeTurns.delete(sessionId);
-    this.store.markThreadArchived(sessionId);
   }
 
   async detach(sessionId: string): Promise<void> {
     const session = this.requireSession(sessionId);
+    this.store.markThreadDetached(sessionId);
     this.sessionsByThread.delete(session.codexThreadId!);
     this.activeTurns.delete(sessionId);
-    this.store.markThreadDetached(sessionId);
   }
 
   async interrupt(sessionId: string): Promise<void> {
@@ -410,9 +410,8 @@ export class AppServerAdapter implements AppServerRuntime {
         { method: "turn/interrupt" }
       );
     }
-    this.activeTurns.delete(sessionId);
     this.store.setActiveTurn(sessionId, null);
-    this.store.setSessionStatus(sessionId, "idle");
+    this.activeTurns.delete(sessionId);
   }
 
   async getRecentLog(sessionId: string, limit: number): Promise<LogEntry[]> {
@@ -722,8 +721,8 @@ export class AppServerAdapter implements AppServerRuntime {
     if (message.method === "turn/started") {
       const turn = asRecord(params.turn);
       if (typeof turn.id === "string") {
-        this.activeTurns.set(sessionId, turn.id);
         this.store.setActiveTurn(sessionId, turn.id);
+        this.activeTurns.set(sessionId, turn.id);
       }
       this.queue.push({ type: "statusChanged", sessionId, status: "active" });
       return;
@@ -744,9 +743,8 @@ export class AppServerAdapter implements AppServerRuntime {
     if (message.method === "turn/completed") {
       const turn = asRecord(params.turn);
       const status = turn.status === "failed" || turn.status === "interrupted" ? turn.status : "completed";
+      this.store.setActiveTurn(sessionId, null, status === "failed" ? "error" : "idle");
       this.activeTurns.delete(sessionId);
-      this.store.setActiveTurn(sessionId, null);
-      this.store.setSessionStatus(sessionId, status === "failed" ? "error" : "idle");
       const event: CodexEvent = {
         type: "taskCompleted",
         sessionId,

@@ -3,7 +3,7 @@ import { access, mkdtemp, mkdir, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import pino from "pino";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AppConfig } from "../src/config.js";
 import type { LegacyTmuxBridge } from "../src/legacy/legacy-tmux-bridge.js";
 import type { SessionManager } from "../src/runtime/session-manager.js";
@@ -120,7 +120,10 @@ describe("TelegramGateway dispatch", () => {
     );
   });
 
-  afterEach(() => store.close());
+  afterEach(() => {
+    vi.useRealTimers();
+    store.close();
+  });
 
   it.each([
     ["/help", "Plain text needs /send"],
@@ -131,6 +134,21 @@ describe("TelegramGateway dispatch", () => {
   ])("dispatches %s without a network transport", async (command, expected) => {
     await runtime.bot.handleUpdate(messageUpdate(command, nextUpdateId()));
     expect(sentTexts(runtime)).toContainEqual(expect.stringContaining(expected));
+  });
+
+  it("applies configured transcript retention during an hourly maintenance tick", () => {
+    vi.useFakeTimers();
+    const writtenAt = new Date("2026-07-01T00:00:00Z");
+    vi.setSystemTime(writtenAt);
+    store.appendTranscript("session_1", "expired transcript");
+    (gateway as unknown as { config: AppConfig }).config.transcriptRetentionDays = 5;
+
+    const maintenanceAt = writtenAt.getTime() + 6 * 24 * 60 * 60 * 1000;
+    (gateway as unknown as { performMaintenance(now: number): void }).performMaintenance(maintenanceAt);
+
+    expect(store.getTranscript("session_1")).toBe("");
+    expect((gateway as unknown as { nextMaintenanceAt: number }).nextMaintenanceAt)
+      .toBe(maintenanceAt + 60 * 60 * 1000);
   });
 
   it("dispatches /attach through the injected runtime", async () => {

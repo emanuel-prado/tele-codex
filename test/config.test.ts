@@ -19,7 +19,23 @@ describe("loadConfig", () => {
     expect(config.rateLimitWarnPercent).toBe(80);
     expect(config.tmuxSubmitKey).toBe("enter");
     expect(config.tmuxPasteSettleMs).toBe(250);
+    expect(config.transcriptRetentionDays).toBeUndefined();
     expect(config.workspaceRoot.endsWith("/Workspace")).toBe(true);
+  });
+
+  it("parses an opt-in transcript retention window in days", () => {
+    const config = loadConfig({
+      TELE_CODEX_BOT_TOKEN: "token",
+      TELE_CODEX_ALLOWED_USER_IDS: "1",
+      TELE_CODEX_TRANSCRIPT_RETENTION_DAYS: "30"
+    });
+
+    expect(config.transcriptRetentionDays).toBe(30);
+    expect(() => loadConfig({
+      TELE_CODEX_BOT_TOKEN: "token",
+      TELE_CODEX_ALLOWED_USER_IDS: "1",
+      TELE_CODEX_TRANSCRIPT_RETENTION_DAYS: "0"
+    })).toThrow();
   });
 
   it("rejects zero or multiple Controllers", () => {

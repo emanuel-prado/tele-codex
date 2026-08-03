@@ -12,6 +12,7 @@ const envSchema = z.object({
   TELE_CODEX_RPC_TIMEOUT_MS: z.coerce.number().int().positive().optional().default(30_000),
   TELE_CODEX_APP_SERVER_MAX_RECONNECT_ATTEMPTS: z.coerce.number().int().positive().optional().default(8),
   TELE_CODEX_RATE_LIMIT_WARN_PERCENT: z.coerce.number().min(1).max(100).optional().default(80),
+  TELE_CODEX_TRANSCRIPT_RETENTION_DAYS: z.coerce.number().int().positive().optional(),
   TELE_CODEX_ALLOW_SESSION_GRANTS: z
     .enum(["true", "false"])
     .optional()
@@ -34,6 +35,7 @@ export interface AppConfig {
   rpcTimeoutMs: number;
   appServerMaxReconnectAttempts: number;
   rateLimitWarnPercent: number;
+  transcriptRetentionDays?: number;
   allowSessionGrants: boolean;
   codexCommand: string;
   tmuxSubmitKey: string;
@@ -77,6 +79,9 @@ export function loadConfig(
     tmuxPasteSettleMs: parsed.TELE_CODEX_TMUX_PASTE_SETTLE_MS,
     workspaceRoot: resolveHome(parsed.TELE_CODEX_WORKSPACE_ROOT)
   };
+  if (parsed.TELE_CODEX_TRANSCRIPT_RETENTION_DAYS !== undefined) {
+    config.transcriptRetentionDays = parsed.TELE_CODEX_TRANSCRIPT_RETENTION_DAYS;
+  }
   if (parsed.TELE_CODEX_APP_SERVER_URL) config.appServerUrl = parsed.TELE_CODEX_APP_SERVER_URL;
   return config;
 }

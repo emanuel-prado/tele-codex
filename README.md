@@ -84,6 +84,7 @@ node dist/cli.js doctor
 | `TELE_CODEX_ALLOW_SESSION_GRANTS` | `false` | Enables native Codex “approve for session” decisions. Opt in only when needed. |
 | `TELE_CODEX_RPC_TIMEOUT_MS` | `30000` | Maximum wait for an app-server JSON-RPC response. |
 | `TELE_CODEX_APP_SERVER_MAX_RECONNECT_ATTEMPTS` | `8` | Failed reconnect attempts before the supervised runtime exits for systemd restart. |
+| `TELE_CODEX_TRANSCRIPT_RETENTION_DAYS` | unset | Delete finalized Transcript chunks older than this many days during hourly maintenance. Unset preserves them indefinitely. |
 | `TELE_CODEX_RATE_LIMIT_WARN_PERCENT` | `80` | First account-limit warning threshold. |
 
 Manual project paths passed to `/new` must stay inside `TELE_CODEX_WORKSPACE_ROOT`.

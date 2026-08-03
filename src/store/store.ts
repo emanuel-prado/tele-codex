@@ -140,8 +140,13 @@ export class Store {
   constructor(path: string) {
     this.path = path;
     this.db = new Database(path);
-    this.db.pragma("journal_mode = WAL");
-    this.migrate();
+    try {
+      this.migrate();
+      this.db.pragma("journal_mode = WAL");
+    } catch (error) {
+      this.db.close();
+      throw error;
+    }
     this.threads = new ThreadAttachmentRepository(this.db);
     this.interactions = new InteractionRepository(this.db);
     this.notifications = new NotificationOutboxRepository(this.db);
@@ -160,7 +165,7 @@ export class Store {
 
   upsertSession(session: SessionRef, status: SessionStatus): StoredSession {
     if (!session.codexThreadId) throw new Error("App-server threads require a Codex thread id.");
-    return this.upsertCodexThread(session, status);
+    return this.db.transaction(() => this.upsertCodexThread(session, status))();
   }
 
   setSessionStatus(sessionId: string, status: SessionStatus): void {
@@ -170,7 +175,7 @@ export class Store {
       } else if (status === "detached" || status === "stopped") {
         this.markThreadDetached(sessionId);
       } else {
-        this.upsertAttachment(sessionId, status);
+        this.db.transaction(() => this.upsertAttachment(sessionId, status))();
       }
       return;
     }
@@ -181,7 +186,7 @@ export class Store {
       ? this.db.prepare("select thread_id as id from appserver_attachments where connection_generation is not null").all() as Array<{ id: string }>
       : this.db.prepare("select thread_id as id from appserver_attachments where connection_generation = ?").all(connectionGeneration) as Array<{ id: string }>;
     const transaction = this.db.transaction(() => {
-      for (const row of normalized) this.markThreadDetached(row.id);
+      for (const row of normalized) this.detachThread(row.id);
     });
     transaction();
     return normalized.map((row) => row.id);
@@ -195,20 +200,21 @@ export class Store {
     }
   }
 
-  setActiveTurn(sessionId: string, turnId: string | null): void {
+  setActiveTurn(sessionId: string, turnId: string | null, completedStatus: "idle" | "error" = "idle"): void {
     if (this.getCodexThreadRow(sessionId)) {
-      if (turnId) {
-        this.db.prepare(
-          `insert into active_turns (thread_id, codex_turn_id, status, started_at, updated_at)
-           values (?, ?, 'active', ?, ?)
-           on conflict(thread_id) do update set codex_turn_id=excluded.codex_turn_id, status='active', updated_at=excluded.updated_at`
-        ).run(sessionId, turnId, Date.now(), Date.now());
-        this.upsertAttachment(sessionId, "active");
-      } else {
-        this.db.prepare("delete from active_turns where thread_id = ?").run(sessionId);
-        this.db.prepare("update codex_threads set updated_at = ? where id = ?")
-          .run(this.nextSessionVersion(sessionId), sessionId);
-      }
+      this.db.transaction(() => {
+        if (turnId) {
+          this.db.prepare(
+            `insert into active_turns (thread_id, codex_turn_id, status, started_at, updated_at)
+             values (?, ?, 'active', ?, ?)
+             on conflict(thread_id) do update set codex_turn_id=excluded.codex_turn_id, status='active', updated_at=excluded.updated_at`
+          ).run(sessionId, turnId, Date.now(), Date.now());
+          this.upsertAttachment(sessionId, "active");
+        } else {
+          this.db.prepare("delete from active_turns where thread_id = ?").run(sessionId);
+          this.upsertAttachment(sessionId, completedStatus);
+        }
+      })();
       return;
     }
   }
@@ -355,6 +361,10 @@ export class Store {
   }
 
   markThreadDetached(sessionId: string): void {
+    this.db.transaction(() => this.detachThread(sessionId))();
+  }
+
+  private detachThread(sessionId: string): void {
     const now = this.nextSessionVersion(sessionId);
     this.db.prepare("delete from active_turns where thread_id = ?").run(sessionId);
     this.db.prepare(
@@ -366,9 +376,11 @@ export class Store {
   }
 
   markThreadArchived(sessionId: string): void {
-    this.markThreadDetached(sessionId);
-    this.db.prepare("update codex_threads set lifecycle_status = 'archived', updated_at = ? where id = ?")
-      .run(this.nextSessionVersion(sessionId), sessionId);
+    this.db.transaction(() => {
+      this.detachThread(sessionId);
+      this.db.prepare("update codex_threads set lifecycle_status = 'archived', updated_at = ? where id = ?")
+        .run(this.nextSessionVersion(sessionId), sessionId);
+    })();
   }
 
   forgetThread(sessionId: string): boolean {
@@ -804,13 +816,15 @@ export class Store {
   }
 
   setTelegramMessage(actionId: string, chatId: number, messageId: number): void {
-    this.db
-      .prepare("update pending_actions set telegram_chat_id = ?, telegram_message_id = ? where id = ?")
-      .run(chatId, messageId, actionId);
-    this.db.prepare(
-      `insert into action_messages (action_id, chat_id, message_id) values (?, ?, ?)
-       on conflict(action_id, chat_id) do update set message_id=excluded.message_id`
-    ).run(actionId, chatId, messageId);
+    this.db.transaction(() => {
+      this.db
+        .prepare("update pending_actions set telegram_chat_id = ?, telegram_message_id = ? where id = ?")
+        .run(chatId, messageId, actionId);
+      this.db.prepare(
+        `insert into action_messages (action_id, chat_id, message_id) values (?, ?, ?)
+         on conflict(action_id, chat_id) do update set message_id=excluded.message_id`
+      ).run(actionId, chatId, messageId);
+    })();
   }
 
   listTelegramMessages(actionId: string): Array<{ chatId: number; messageId: number }> {
@@ -965,10 +979,12 @@ export class Store {
 
   private reconcilePersistedAppServerRuntime(): void {
     const now = Date.now();
-    this.db.prepare("delete from active_turns").run();
-    this.db.prepare(
-      "update appserver_attachments set status = 'detached', connection_generation = null, updated_at = ? where status != 'detached' or connection_generation is not null"
-    ).run(now);
+    this.db.transaction(() => {
+      this.db.prepare("delete from active_turns").run();
+      this.db.prepare(
+        "update appserver_attachments set status = 'detached', connection_generation = null, updated_at = ? where status != 'detached' or connection_generation is not null"
+      ).run(now);
+    })();
   }
 
   private upsertRuntimeState(sessionId: string, column: "progress_json" | "diff_text" | "goal_json", value: string | null): void {

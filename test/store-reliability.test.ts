@@ -1,3 +1,7 @@
+import Database from "better-sqlite3";
+import { mkdtemp } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Store } from "../src/store/store.js";
 import type { PendingAction } from "../src/types/events.js";
@@ -128,7 +132,101 @@ describe("Store reliability state", () => {
     expect(store.getSession("session_2")).toMatchObject({ status: "idle", connectionGeneration: 2 });
     store.close();
   });
+
+  it("rolls back detach when its attachment transition fails and remains consistent after restart", async () => {
+    const fixture = await fileStore();
+    const session = fixture.store.upsertSession(
+      { id: "session_1", adapter: "appserver", label: "one", codexThreadId: "thread_1", connectionGeneration: 1 },
+      "idle"
+    );
+    fixture.store.setActiveTurn(session.id, "turn_1");
+    fixture.db.exec(`create trigger fail_detach before update on appserver_attachments
+      when new.status = 'detached' begin select raise(abort, 'injected detach failure'); end`);
+
+    expect(() => fixture.store.markThreadDetached(session.id)).toThrow(/injected detach failure/);
+    expect(fixture.store.getSession(session.id)).toMatchObject({ status: "active", activeTurnId: "turn_1" });
+
+    fixture.db.exec("drop trigger fail_detach");
+    fixture.close();
+    const restarted = new Store(fixture.path);
+    expect(restarted.getSession(session.id)).toMatchObject({ status: "detached" });
+    expect(restarted.getSession(session.id)?.activeTurnId).toBeUndefined();
+    restarted.close();
+  });
+
+  it("rolls back a new Active Turn when its attachment transition fails", async () => {
+    const fixture = await fileStore();
+    const session = fixture.store.upsertSession(
+      { id: "session_1", adapter: "appserver", label: "one", codexThreadId: "thread_1", connectionGeneration: 1 },
+      "idle"
+    );
+    fixture.db.exec(`create trigger fail_active before update on appserver_attachments
+      when new.status = 'active' begin select raise(abort, 'injected active failure'); end`);
+
+    expect(() => fixture.store.setActiveTurn(session.id, "turn_1")).toThrow(/injected active failure/);
+    expect(fixture.store.getSession(session.id)).toMatchObject({ status: "idle" });
+    expect(fixture.store.getSession(session.id)?.activeTurnId).toBeUndefined();
+    fixture.close();
+  });
+
+  it("rolls back Active Turn completion when its attachment transition fails", async () => {
+    const fixture = await fileStore();
+    const session = fixture.store.upsertSession(
+      { id: "session_1", adapter: "appserver", label: "one", codexThreadId: "thread_1", connectionGeneration: 1 },
+      "idle"
+    );
+    fixture.store.setActiveTurn(session.id, "turn_1");
+    fixture.db.exec(`create trigger fail_completion before update on appserver_attachments
+      when new.status = 'error' begin select raise(abort, 'injected completion failure'); end`);
+
+    expect(() => fixture.store.setActiveTurn(session.id, null, "error")).toThrow(/injected completion failure/);
+    expect(fixture.store.getSession(session.id)).toMatchObject({ status: "active", activeTurnId: "turn_1" });
+    fixture.close();
+  });
+
+  it("rolls back Telegram references when action-message insertion fails", async () => {
+    const fixture = await fileStore();
+    fixture.store.putPendingAction(action(1));
+    fixture.db.exec(`create trigger fail_action_message before insert on action_messages
+      begin select raise(abort, 'injected Telegram reference failure'); end`);
+
+    expect(() => fixture.store.setTelegramMessage("action_1", 10, 20)).toThrow(/injected Telegram reference failure/);
+    expect(fixture.db.prepare(
+      "select telegram_chat_id, telegram_message_id from pending_actions where id = 'action_1'"
+    ).get()).toEqual({ telegram_chat_id: null, telegram_message_id: null });
+    expect(fixture.store.listTelegramMessages("action_1")).toEqual([]);
+    fixture.close();
+  });
+
+  it("rolls back thread creation when attachment insertion fails", async () => {
+    const fixture = await fileStore();
+    fixture.db.exec(`create trigger fail_attachment before insert on appserver_attachments
+      begin select raise(abort, 'injected attachment failure'); end`);
+
+    expect(() => fixture.store.upsertSession(
+      { id: "session_1", adapter: "appserver", label: "one", codexThreadId: "thread_1", connectionGeneration: 1 },
+      "idle"
+    )).toThrow(/injected attachment failure/);
+    expect(fixture.store.getSession("session_1")).toBeUndefined();
+    fixture.close();
+  });
 });
+
+async function fileStore() {
+  const directory = await mkdtemp(join(tmpdir(), "tele-codex-atomic-store-"));
+  const path = join(directory, "state.sqlite");
+  const store = new Store(path);
+  const db = new Database(path);
+  return {
+    path,
+    store,
+    db,
+    close() {
+      db.close();
+      store.close();
+    }
+  };
+}
 
 function action(connectionGeneration: number): PendingAction {
   return {
