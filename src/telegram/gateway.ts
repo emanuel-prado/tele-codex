@@ -225,13 +225,21 @@ export class TelegramGateway {
     while (!signal.aborted) {
       await this.sessions.expirePendingActions();
       if (Date.now() >= this.nextMaintenanceAt) {
-        this.store.maintain();
-        this.store.checkpoint("PASSIVE");
-        this.nextMaintenanceAt = Date.now() + 60 * 60 * 1000;
+        this.performMaintenance(Date.now());
       }
       this.health.heartbeat("action-sweeper");
       await waitForWorkerTick(signal, 1_000);
     }
+  }
+
+  private performMaintenance(now: number): void {
+    const days = this.config.transcriptRetentionDays;
+    this.store.maintain({
+      now,
+      ...(days === undefined ? {} : { transcriptRetentionMs: days * 24 * 60 * 60 * 1000 })
+    });
+    this.store.checkpoint("PASSIVE");
+    this.nextMaintenanceAt = now + 60 * 60 * 1000;
   }
 
   private registerHandlers(): void {

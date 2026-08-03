@@ -15,20 +15,38 @@ export class MigrationError extends Error {
   }
 }
 
+export class UnsupportedSchemaVersionError extends Error {
+  constructor(readonly databaseVersion: number, readonly supportedVersion: number) {
+    super(`Database schema version ${databaseVersion} is newer than supported version ${supportedVersion}. Upgrade tele-codex before opening this database.`);
+    this.name = "UnsupportedSchemaVersionError";
+  }
+}
+
 export function migrateDatabase(db: Database.Database, migrations: readonly Migration[] = MIGRATIONS): number {
-  db.exec(`
-    create table if not exists schema_migrations (
-      version integer primary key,
-      name text not null,
-      applied_at integer not null
-    )
-  `);
+  const ordered = [...migrations].sort((left, right) => left.version - right.version);
+  const supportedVersion = ordered.at(-1)?.version ?? 0;
+  const hasMigrationTable = Boolean(db.prepare(
+    "select 1 from sqlite_master where type = 'table' and name = 'schema_migrations'"
+  ).get());
+  if (hasMigrationTable) {
+    const databaseVersion = schemaVersion(db);
+    if (databaseVersion > supportedVersion) {
+      throw new UnsupportedSchemaVersionError(databaseVersion, supportedVersion);
+    }
+  } else {
+    db.exec(`
+      create table schema_migrations (
+        version integer primary key,
+        name text not null,
+        applied_at integer not null
+      )
+    `);
+  }
 
   const applied = new Set(
     (db.prepare("select version from schema_migrations order by version").all() as Array<{ version: number }>)
       .map((row) => Number(row.version))
   );
-  const ordered = [...migrations].sort((left, right) => left.version - right.version);
   for (const migration of ordered) {
     if (applied.has(migration.version)) continue;
     try {

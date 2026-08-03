@@ -1,11 +1,51 @@
 import Database from "better-sqlite3";
+import { mkdtemp } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { migrateDatabase, MigrationError } from "../src/store/migrations.js";
+import { CURRENT_SCHEMA_VERSION, migrateDatabase, MigrationError } from "../src/store/migrations.js";
 import { EventLogRepository, NotificationOutboxRepository, TranscriptRepository } from "../src/store/repositories.js";
 import { Store } from "../src/store/store.js";
 import type { PendingAction } from "../src/types/events.js";
 
 describe("versioned SQLite storage", () => {
+  it("rejects a newer schema before changing the database", () => {
+    const db = new Database(":memory:");
+    db.exec(`
+      create table schema_migrations (version integer primary key, name text not null, applied_at integer not null);
+      insert into schema_migrations values (${CURRENT_SCHEMA_VERSION + 1}, 'future', 1);
+      create table sentinel (value text);
+      insert into sentinel values ('unchanged');
+    `);
+
+    expect(() => migrateDatabase(db)).toThrow(
+      `Database schema version ${CURRENT_SCHEMA_VERSION + 1} is newer than supported version ${CURRENT_SCHEMA_VERSION}`
+    );
+    expect(db.prepare("select * from sentinel").all()).toEqual([{ value: "unchanged" }]);
+    expect(db.prepare("select * from schema_migrations").all()).toHaveLength(1);
+    db.close();
+  });
+
+  it("rejects a newer on-disk schema before changing its journal mode", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "tele-codex-future-schema-"));
+    const path = join(directory, "state.sqlite");
+    const db = new Database(path);
+    db.exec(`
+      create table schema_migrations (version integer primary key, name text not null, applied_at integer not null);
+      insert into schema_migrations values (${CURRENT_SCHEMA_VERSION + 1}, 'future', 1);
+    `);
+    expect(db.pragma("journal_mode", { simple: true })).toBe("delete");
+    db.close();
+
+    expect(() => new Store(path)).toThrow(/newer than supported/);
+
+    const unchanged = new Database(path);
+    expect(unchanged.pragma("journal_mode", { simple: true })).toBe("delete");
+    expect(unchanged.prepare("select version from schema_migrations").all())
+      .toEqual([{ version: CURRENT_SCHEMA_VERSION + 1 }]);
+    unchanged.close();
+  });
+
   it("records ordered migrations and rolls a failed migration back with context", () => {
     const db = new Database(":memory:");
     expect(() => migrateDatabase(db, [
@@ -138,6 +178,9 @@ describe("versioned SQLite storage", () => {
     store.putPendingAction(action("delivering", now + 60_000));
     store.resolvePendingAction("delivering", "resolved");
     store.enqueueOutbox("action:delivering", 1, { text: "important" }, "delivering");
+    store.enqueueOutbox("retryable", 1, { text: "retry me" });
+    const retryable = store.dueOutbox().find((message) => message.eventKey === "retryable")!;
+    store.retryOutbox(retryable.id, 20, "still unavailable");
     store.appendLog({ sessionId: "session", timestamp: 1, type: "old", severity: "info", text: "old" });
     store.appendTranscript("session", "old transcript");
 
@@ -156,7 +199,17 @@ describe("versioned SQLite storage", () => {
     expect(store.getPendingAction("delivering")).toBeDefined();
     expect(store.claimCallbackToken("active-control", 1, 2, "claim")).toBeUndefined();
     expect(store.dueOutbox()).toHaveLength(1);
+    expect(store.outboxCounts()).toEqual({ pending: 1, failed: 1 });
     expect(store.diagnostics()).toMatchObject({ schemaVersion: 7, walBytes: 0 });
+    store.close();
+  });
+
+  it("preserves finalized Transcripts when retention is unset", () => {
+    const store = new Store(":memory:");
+    store.appendTranscript("session", "keep indefinitely");
+
+    expect(store.maintain({ now: Date.now() + 365 * 24 * 60 * 60 * 1000 }).transcripts).toBe(0);
+    expect(store.getTranscript("session")).toContain("keep indefinitely");
     store.close();
   });
 });
