@@ -280,11 +280,6 @@ export class SessionManager {
     this.setActiveId(session.id);
   }
 
-  async interrupt(sessionId?: string): Promise<void> {
-    const session = this.resolveSession(sessionId);
-    await this.appserver.interrupt(session.id);
-  }
-
   async kill(sessionId?: string): Promise<void> {
     const session = this.resolveSession(sessionId);
     await this.appserver.interrupt(session.id);

@@ -360,9 +360,30 @@ export class AppServerAdapter implements AppServerRuntime {
 
   async interrupt(sessionId: string): Promise<void> {
     const session = this.requireSession(sessionId);
+    const generation = this.connectionGeneration;
+    if (!this.connected || generation === undefined) {
+      throw new Error("App-server is disconnected. Wait for reconnection, then resume this Codex thread before interrupting.");
+    }
+    const attachment = this.sessionsByThread.get(session.codexThreadId);
+    if (!attachment) {
+      throw new Error("This Codex thread has no current App-server Attachment. Resume it before interrupting.");
+    }
+    if (attachment.sessionId !== sessionId || attachment.generation !== generation || session.connectionGeneration !== generation) {
+      throw new Error("This Codex thread has a stale App-server Attachment. Resume it before interrupting.");
+    }
     const turnId = this.activeTurns.get(sessionId);
-    if (!turnId) return;
+    if (!turnId || session.activeTurnId !== turnId) {
+      throw new Error("No active Codex turn is attached. Wait for work to start or resume the thread.");
+    }
     await this.rpc.request("turn/interrupt", { threadId: session.codexThreadId, turnId });
+    const currentAttachment = this.sessionsByThread.get(session.codexThreadId);
+    if (!this.connected || this.connectionGeneration !== generation ||
+        currentAttachment?.sessionId !== sessionId || currentAttachment.generation !== generation) {
+      throw new Error("The App-server connection changed before interruption was confirmed. Resume the thread and check its current state.");
+    }
+    this.activeTurns.delete(sessionId);
+    this.store.setActiveTurn(sessionId, null);
+    this.store.setSessionStatus(sessionId, "idle");
   }
 
   async getRecentLog(sessionId: string, limit: number): Promise<LogEntry[]> {
@@ -650,7 +671,7 @@ export class AppServerAdapter implements AppServerRuntime {
       const status = turn.status === "failed" || turn.status === "interrupted" ? turn.status : "completed";
       this.activeTurns.delete(sessionId);
       this.store.setActiveTurn(sessionId, null);
-      this.store.setSessionStatus(sessionId, status === "completed" ? "idle" : "error");
+      this.store.setSessionStatus(sessionId, status === "failed" ? "error" : "idle");
       const event: CodexEvent = {
         type: "taskCompleted",
         sessionId,
