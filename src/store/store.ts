@@ -50,7 +50,7 @@ export interface InteractionDraft {
   chatId: number;
   userId: number;
   questionIndex: number;
-  answers: Record<string, { answers: string[] }>;
+  answers: Record<string, { answers: string[]; value?: unknown }>;
   awaitingText: boolean;
 }
 
@@ -754,11 +754,10 @@ export class Store {
     const row = this.db
       .prepare(
         `select d.* from interaction_drafts d
-         join pending_actions a on a.id = d.action_id
-         where d.chat_id = ? and d.user_id = ? and d.awaiting_text = 1 and a.status = 'pending' and a.expires_at > ?
+         where d.chat_id = ? and d.user_id = ? and d.awaiting_text = 1
          order by d.updated_at desc limit 1`
       )
-      .get(chatId, userId, Date.now()) as Row | undefined;
+      .get(chatId, userId) as Row | undefined;
     return row ? mapInteractionDraft(row) : undefined;
   }
 
