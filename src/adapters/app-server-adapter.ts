@@ -25,6 +25,7 @@ import {
   formatRequestUserInput,
   parseTokenUsage
 } from "./app-server-protocol.js";
+import { appServerFailure, AppServerFailure, normalizeAppServerFailure } from "./app-server-failure.js";
 
 export class AppServerAdapter implements AppServerRuntime {
   private readonly rpc: AppServerRpcClient;
@@ -39,7 +40,11 @@ export class AppServerAdapter implements AppServerRuntime {
   private reconnectAttempt = 0;
   private stopping = false;
   private connectionGeneration: number | undefined;
+  private connectingGeneration: number | undefined;
+  private connectingFailure: AppServerFailure | undefined;
+  private lastConnectionFailure: AppServerFailure | undefined;
   private runtimeSettled = false;
+  private runtimeFailed = false;
   private resolveRuntime!: () => void;
   private rejectRuntime!: (error: Error) => void;
   private readonly runtimePromise = new Promise<void>((resolve, reject) => {
@@ -54,6 +59,7 @@ export class AppServerAdapter implements AppServerRuntime {
     private readonly health: RuntimeHealthReporter = noopRuntimeHealth,
     rpc?: AppServerRpcClient
   ) {
+    void this.runtimePromise.catch(() => undefined);
     this.store.clearSessionAttachments();
     const startupOpenActions = this.store.listOpenActions();
     const orphaned = this.store.orphanOpenActions();
@@ -76,6 +82,15 @@ export class AppServerAdapter implements AppServerRuntime {
       }
     });
     this.rpc.on("close", (_details: unknown, generation: number) => this.handleDisconnect(generation));
+    this.rpc.on("failure", (failure: AppServerFailure, generation: number) => {
+      if (generation === this.connectingGeneration) {
+        this.connectingFailure = failure;
+        this.rpc.close();
+        return;
+      }
+      if (generation !== this.connectionGeneration) return;
+      this.failRuntime(failure);
+    });
   }
 
   async start(opts: StartSession): Promise<SessionRef> {
@@ -362,24 +377,44 @@ export class AppServerAdapter implements AppServerRuntime {
     const session = this.requireSession(sessionId);
     const generation = this.connectionGeneration;
     if (!this.connected || generation === undefined) {
-      throw new Error("App-server is disconnected. Wait for reconnection, then resume this Codex thread before interrupting.");
+      throw appServerFailure(
+        "missing_connection",
+        "App-server is disconnected. Wait for reconnection, then resume this Codex thread before interrupting.",
+        { method: "turn/interrupt" }
+      );
     }
     const attachment = this.sessionsByThread.get(session.codexThreadId);
     if (!attachment) {
-      throw new Error("This Codex thread has no current App-server Attachment. Resume it before interrupting.");
+      throw appServerFailure(
+        "invalid_state",
+        "This Codex thread has no current App-server Attachment. Resume it before interrupting.",
+        { method: "turn/interrupt" }
+      );
     }
     if (attachment.sessionId !== sessionId || attachment.generation !== generation || session.connectionGeneration !== generation) {
-      throw new Error("This Codex thread has a stale App-server Attachment. Resume it before interrupting.");
+      throw appServerFailure(
+        "generation_changed",
+        "This Codex thread has a stale App-server Attachment. Resume it before interrupting.",
+        { method: "turn/interrupt" }
+      );
     }
     const turnId = this.activeTurns.get(sessionId);
     if (!turnId || session.activeTurnId !== turnId) {
-      throw new Error("No active Codex turn is attached. Wait for work to start or resume the thread.");
+      throw appServerFailure(
+        "invalid_state",
+        "No active Codex turn is attached. Wait for work to start or resume the thread.",
+        { method: "turn/interrupt" }
+      );
     }
     await this.rpc.request("turn/interrupt", { threadId: session.codexThreadId, turnId });
     const currentAttachment = this.sessionsByThread.get(session.codexThreadId);
     if (!this.connected || this.connectionGeneration !== generation ||
         currentAttachment?.sessionId !== sessionId || currentAttachment.generation !== generation) {
-      throw new Error("The App-server connection changed before interruption was confirmed. Resume the thread and check its current state.");
+      throw appServerFailure(
+        "generation_changed",
+        "The App-server connection changed before interruption was confirmed. Resume the thread and check its current state.",
+        { method: "turn/interrupt" }
+      );
     }
     this.activeTurns.delete(sessionId);
     this.store.setActiveTurn(sessionId, null);
@@ -405,8 +440,14 @@ export class AppServerAdapter implements AppServerRuntime {
     try {
       await this.ensureConnected();
     } catch (error) {
-      this.health.appServer({ state: "failed", detail: error instanceof Error ? error.message : String(error) });
-      throw error;
+      const failure = normalizeAppServerFailure(
+        error,
+        "transport_loss",
+        "App-server connection failed during startup.",
+        { method: "initialize" }
+      );
+      this.health.appServer({ state: "reconnecting", detail: failure.message });
+      this.scheduleReconnect(failure);
     }
   }
 
@@ -422,7 +463,9 @@ export class AppServerAdapter implements AppServerRuntime {
     this.connected = false;
     this.rpc.close();
     this.queue.close();
-    this.health.appServer({ state: "stopped", pid: undefined, detail: "App-server transport stopped." });
+    if (!this.runtimeFailed) {
+      this.health.appServer({ state: "stopped", pid: undefined, detail: "App-server transport stopped." });
+    }
     if (!this.runtimeSettled) {
       this.runtimeSettled = true;
       this.resolveRuntime();
@@ -441,30 +484,50 @@ export class AppServerAdapter implements AppServerRuntime {
   private async connect(): Promise<void> {
     const generation = (this.store.getRuntimeValue<number>("appserver_connection_generation") ?? 0) + 1;
     this.store.setRuntimeValue("appserver_connection_generation", generation);
-    if (this.config.appServerUrl) {
-      await this.rpc.connectWebSocket(this.config.appServerUrl, process.env.TELE_CODEX_APP_SERVER_TOKEN, generation);
-    } else {
-      await this.rpc.connectStdio(this.config.codexCommand, generation);
+    this.connectingGeneration = generation;
+    this.connectingFailure = undefined;
+    try {
+      if (this.config.appServerUrl) {
+        await this.rpc.connectWebSocket(this.config.appServerUrl, process.env.TELE_CODEX_APP_SERVER_TOKEN, generation);
+      } else {
+        await this.rpc.connectStdio(this.config.codexCommand, generation);
+      }
+      try {
+        await this.rpc.request("initialize", {
+          clientInfo: { name: "tele-codex", title: "Telegram Companion for Codex", version: "0.1.0" },
+          capabilities: { experimentalApi: true, requestAttestation: false }
+        });
+      } catch (error) {
+        throw normalizeAppServerFailure(error, "remote_rejection", "App-server rejected initialization.", { method: "initialize" });
+      }
+      try {
+        this.rpc.notify("initialized", undefined, generation);
+      } catch (error) {
+        throw normalizeAppServerFailure(error, "transport_loss", "App-server lost the initialized notification.", { method: "initialized" });
+      }
+      this.connectionGeneration = generation;
+      this.connected = true;
+      this.reconnectAttempt = 0;
+      this.lastConnectionFailure = undefined;
+      if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = undefined;
+      const transport = this.rpc.transportInfo();
+      this.health.appServer({
+        state: "connected",
+        transport: transport.kind,
+        pid: transport.pid,
+        connectionGeneration: generation,
+        reconnectAttempt: 0,
+        detail: "App-server transport connected."
+      });
+    } catch (error) {
+      this.connected = false;
+      this.rpc.close();
+      throw this.connectingFailure ?? normalizeAppServerFailure(error, "transport_loss", "App-server connection failed.", { method: "connect" });
+    } finally {
+      if (this.connectingGeneration === generation) this.connectingGeneration = undefined;
+      this.connectingFailure = undefined;
     }
-    this.connectionGeneration = generation;
-    await this.rpc.request("initialize", {
-      clientInfo: { name: "tele-codex", title: "Telegram Companion for Codex", version: "0.1.0" },
-      capabilities: { experimentalApi: true, requestAttestation: false }
-    });
-    this.rpc.notify("initialized", undefined, generation);
-    this.connected = true;
-    this.reconnectAttempt = 0;
-    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
-    this.reconnectTimer = undefined;
-    const transport = this.rpc.transportInfo();
-    this.health.appServer({
-      state: "connected",
-      transport: transport.kind,
-      pid: transport.pid,
-      connectionGeneration: generation,
-      reconnectAttempt: 0,
-      detail: "App-server transport connected."
-    });
   }
 
   private handleDisconnect(generation: number): void {
@@ -475,6 +538,7 @@ export class AppServerAdapter implements AppServerRuntime {
     }
     if (!this.connected && this.reconnectTimer) return;
     this.connected = false;
+    this.connectionGeneration = undefined;
     this.health.appServer({ state: "reconnecting", pid: undefined, detail: "App-server transport disconnected." });
     this.activeTurns.clear();
     const openActions = this.store.listOpenActions(generation);
@@ -504,10 +568,28 @@ export class AppServerAdapter implements AppServerRuntime {
     this.scheduleReconnect();
   }
 
-  private scheduleReconnect(): void {
+  private scheduleReconnect(error?: unknown): void {
+    if (error !== undefined) {
+      this.lastConnectionFailure = normalizeAppServerFailure(
+        error,
+        "transport_loss",
+        "App-server reconnect failed.",
+        { method: "connect" }
+      );
+    }
     if (this.reconnectTimer || this.stopping || this.runtimeSettled) return;
     if (this.reconnectAttempt >= this.config.appServerMaxReconnectAttempts) {
-      this.failRuntime(new Error(`App-server reconnect exhausted after ${this.reconnectAttempt} attempts.`));
+      const last = this.lastConnectionFailure;
+      this.failRuntime(new AppServerFailure(
+        last?.kind ?? "transport_loss",
+        `App-server reconnect exhausted after ${this.reconnectAttempt} attempts.`,
+        {
+          method: last?.method ?? "connect",
+          ...(last?.code !== undefined ? { code: last.code } : {}),
+          ...(last && Object.prototype.hasOwnProperty.call(last, "data") ? { data: last.data } : {}),
+          ...(last ? { cause: last } : {})
+        }
+      ));
       return;
     }
     const attempt = ++this.reconnectAttempt;
@@ -533,15 +615,21 @@ export class AppServerAdapter implements AppServerRuntime {
           this.recoveringSessionIds.clear();
         })
         .catch((error) => {
-          this.logger.warn({ error, delay, attempt }, "app-server reconnect failed");
-          this.scheduleReconnect();
+          const failure = normalizeAppServerFailure(error, "transport_loss", "App-server reconnect failed.", { method: "connect" });
+          this.logger.warn({ error: failure.message, delay, attempt }, "app-server reconnect failed");
+          this.scheduleReconnect(failure);
         });
     }, delay);
   }
 
   private failRuntime(error: unknown): void {
     if (this.stopping || this.runtimeSettled) return;
-    const failure = error instanceof Error ? error : new Error(String(error));
+    const failure = normalizeAppServerFailure(
+      error,
+      "protocol_defect",
+      "App-server protocol handling failed."
+    );
+    this.runtimeFailed = true;
     this.runtimeSettled = true;
     this.health.appServer({ state: "failed", pid: undefined, detail: failure.message });
     this.rejectRuntime(failure);
@@ -776,13 +864,15 @@ export class AppServerAdapter implements AppServerRuntime {
 
   private requireSession(sessionId: string) {
     const session = this.store.getSession(sessionId);
-    if (!session?.codexThreadId) throw new Error(`Unknown app-server session: ${sessionId}`);
+    if (!session?.codexThreadId) {
+      throw appServerFailure("invalid_state", "The requested Codex thread is not available in local state.");
+    }
     return session;
   }
 
   private requireConnectionGeneration(): number {
     if (!this.connected || this.connectionGeneration === undefined) {
-      throw new Error("App-server is not connected.");
+      throw appServerFailure("missing_connection", "App-server is not connected.");
     }
     return this.connectionGeneration;
   }
@@ -800,7 +890,7 @@ export class AppServerAdapter implements AppServerRuntime {
 function extractThreadId(result: { thread?: { id: string } } | { id?: string }): string {
   if ("thread" in result && result.thread?.id) return result.thread.id;
   if ("id" in result && result.id) return result.id;
-  throw new Error(`Unable to find thread id in app-server response: ${JSON.stringify(result)}`);
+  throw appServerFailure("protocol_defect", "App-server returned a thread response without an id.", { method: "thread/start" });
 }
 
 function makeActionFromServerRequest(

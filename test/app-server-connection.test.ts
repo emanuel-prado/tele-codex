@@ -4,6 +4,8 @@ import type { AppConfig } from "../src/config.js";
 import { Store } from "../src/store/store.js";
 import type { PendingAction } from "../src/types/events.js";
 import { RuntimeHealth } from "../src/runtime/health.js";
+import { RuntimeSupervisor } from "../src/runtime/supervisor.js";
+import { FakeAppServer } from "./support/fake-app-server.js";
 
 type AdapterInternals = {
   connected: boolean;
@@ -144,6 +146,83 @@ describe("AppServerAdapter connection generations", () => {
     await expect(internals.waitForFailure()).resolves.toBeUndefined();
     store.close();
   });
+
+  it("publishes a connection generation only after initialize and initialized both succeed", async () => {
+    const store = new Store(":memory:");
+    const server = new FakeAppServer();
+    let adapter!: AppServerAdapter;
+    server.respondTo("initialize", (_params: unknown, generation: number) => {
+      const internals = adapter as unknown as AdapterInternals;
+      expect(generation).toBe(1);
+      expect(internals.connectionGeneration).toBeUndefined();
+      expect(internals.connected).toBe(false);
+      server.emit("message", approvalRequest(9), generation);
+      return { userAgent: "fake" };
+    });
+    adapter = new AppServerAdapter(config(), store, logger(), undefined, server);
+
+    await adapter.startTransport();
+
+    const internals = adapter as unknown as AdapterInternals;
+    expect(internals.connectionGeneration).toBe(1);
+    expect(internals.connected).toBe(true);
+    expect(store.listPendingActions()).toEqual([]);
+    expect(server.messages("initialized")).toHaveLength(1);
+    adapter.close();
+    store.close();
+  });
+
+  it.each(["initialize", "initialized"] as const)(
+    "closes a half-open transport when %s fails and reconnects under supervision",
+    async (stage) => {
+      vi.useFakeTimers();
+      const store = new Store(":memory:");
+      const server = new FakeAppServer();
+      const health = new RuntimeHealth();
+      let initializeAttempts = 0;
+      server.respondTo("initialize", () => {
+        initializeAttempts += 1;
+        if (stage === "initialize" && initializeAttempts === 1) throw new Error("initialization timed out");
+        return { userAgent: "fake" };
+      });
+      if (stage === "initialized") server.failNotification("initialized", new Error("initialized write failed"));
+      const adapter = new AppServerAdapter(config(), store, logger(), health, server);
+
+      await expect(adapter.startTransport()).resolves.toBeUndefined();
+      expect(health.snapshot().appServer).toMatchObject({ state: "reconnecting", reconnectAttempt: 1 });
+      expect((adapter as unknown as AdapterInternals).connectionGeneration).toBeUndefined();
+      expect(server.trace.some((entry) => entry.direction === "close" && entry.generation === 1)).toBe(true);
+
+      if (stage === "initialized") server.clearNotificationFailure("initialized");
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(health.snapshot().appServer).toMatchObject({ state: "connected", connectionGeneration: 2 });
+      adapter.close();
+      store.close();
+    }
+  );
+
+  it("turns repeated startup initialization failure into one supervised runtime rejection", async () => {
+    vi.useFakeTimers();
+    const store = new Store(":memory:");
+    const server = new FakeAppServer();
+    const health = new RuntimeHealth();
+    server.respondTo("initialize", () => { throw new Error("initialization rejected"); });
+    const adapter = new AppServerAdapter({ ...config(), appServerMaxReconnectAttempts: 1 }, store, logger(), health, server);
+    const supervisor = new RuntimeSupervisor(health, logger());
+
+    await supervisor.start([{
+      name: "app-server-transport",
+      start: () => adapter.startTransport(),
+      wait: () => adapter.waitForFailure(),
+      stop: () => adapter.close()
+    }]);
+    const failure = expect(supervisor.wait()).rejects.toThrow(/app-server-transport failed.*reconnect exhausted/i);
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    await failure;
+    expect(health.snapshot().appServer).toMatchObject({ state: "failed", reconnectAttempt: 1 });
+    store.close();
+  });
 });
 
 function attach(internals: AdapterInternals, store: Store, generation: number): void {
@@ -202,5 +281,5 @@ function config(): AppConfig {
 }
 
 function logger(): never {
-  return { debug() {}, warn() {}, error() {} } as never;
+  return { debug() {}, warn() {}, error() {}, fatal() {} } as never;
 }
