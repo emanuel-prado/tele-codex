@@ -1,4 +1,7 @@
 import { Bot } from "grammy";
+import { mkdtemp, mkdir, symlink } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import pino from "pino";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { AppConfig } from "../src/config.js";
@@ -67,6 +70,7 @@ describe("TelegramGateway dispatch", () => {
   let killCount: number;
   let killError: Error | undefined;
   let forwardedText: string[];
+  let launchedCwd: string | undefined;
 
   beforeEach(() => {
     store = new Store(":memory:");
@@ -75,6 +79,7 @@ describe("TelegramGateway dispatch", () => {
     killCount = 0;
     killError = undefined;
     forwardedText = [];
+    launchedCwd = undefined;
     const sessions = {
       getActiveSession: () => activeSession,
       attach: async ({ codexThreadId }: { codexThreadId: string }) => {
@@ -86,6 +91,10 @@ describe("TelegramGateway dispatch", () => {
         killCount += 1;
       },
       sendToSession: async (_sessionId: string, text: string) => { forwardedText.push(text); },
+      newSession: async ({ cwd }: { cwd: string }) => {
+        launchedCwd = cwd;
+        return { id: "session_new" };
+      },
       goal: async () => undefined
     } as unknown as SessionManager;
     const config = testConfig();
@@ -118,6 +127,19 @@ describe("TelegramGateway dispatch", () => {
     await runtime.bot.handleUpdate(messageUpdate("/attach appserver thread_1", nextUpdateId()));
     expect(attachedThread).toBe("thread_1");
     expect(sentTexts(runtime)).toContain("Attached app-server thread:\nsession_1");
+  });
+
+  it("passes only the canonical contained workspace path to session launch", async () => {
+    const parent = await mkdtemp(join(tmpdir(), "tele-codex-gateway-workspace-"));
+    const project = join(parent, "project");
+    const projectLink = join(parent, "project-link");
+    await mkdir(project);
+    await symlink(project, projectLink);
+
+    await runtime.bot.handleUpdate(messageUpdate(`/new ${projectLink}`, nextUpdateId()));
+
+    expect(launchedCwd).toBe(project);
+    expect(sentTexts(runtime)).toContain("Started app-server session in project:\nsession_new");
   });
 
   it("responds to unknown slash commands", async () => {
