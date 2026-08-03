@@ -23,7 +23,6 @@ export interface AppServerRpcClient {
   transportInfo(): { kind?: "stdio" | "websocket"; pid?: number };
   on(event: "activity", listener: (generation: number) => void): this;
   on(event: "message", listener: (message: JsonRpcMessage, generation: number) => void): this;
-  on(event: "stderr", listener: (chunk: string, generation: number) => void): this;
   on(event: "close", listener: (details: unknown, generation: number) => void): this;
   on(event: "failure", listener: (failure: AppServerFailure, generation: number) => void): this;
 }
@@ -65,8 +64,11 @@ export class JsonRpcClient extends EventEmitter implements AppServerRpcClient {
     child.stdout.on("data", (chunk: string) => this.consume(chunk, activeGeneration));
     child.stderr.setEncoding("utf8");
     child.stderr.on("data", (chunk: string) => {
-      this.logger.debug({ chunk }, "codex app-server stderr");
-      this.emit("stderr", chunk, activeGeneration);
+      this.logger.debug({
+        generation: activeGeneration,
+        stderrBytes: Buffer.byteLength(chunk, "utf8"),
+        stderrLines: chunk.split("\n").filter(Boolean).length
+      }, "codex app-server stderr diagnostic");
     });
     child.stdin.on("error", (error) => {
       this.rejectPending(error, activeGeneration, "App-server transport was lost while writing a request.");

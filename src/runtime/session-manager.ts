@@ -203,10 +203,12 @@ export class SessionManager {
     }
     try {
       await this.appserver.respondAction(decision);
+      this.store.scrubInteractionDraft(action.id);
     } catch (error) {
       if (this.store.getPendingAction(action.id)?.status === "submitting") {
         this.store.failPendingAction(action.id, error instanceof Error ? error.message : "Action submission failed.");
       }
+      this.store.scrubInteractionDraft(action.id);
       throw error;
     }
   }
@@ -215,7 +217,6 @@ export class SessionManager {
     let expired = 0;
     for (const action of this.store.listExpiredSubmissions()) {
       this.store.resolvePendingAction(action.id, "orphaned");
-      this.store.deleteInteractionDraft(action.id);
       this.queue.push({
         type: "actionOrphaned",
         sessionId: action.sessionId,
@@ -243,7 +244,6 @@ export class SessionManager {
         : undefined;
       if (action.kind === "question" && typeof payload?.params?.autoResolutionMs === "number") {
         this.store.resolvePendingAction(action.id, "expired");
-        this.store.deleteInteractionDraft(action.id);
         expired += 1;
         continue;
       }
@@ -251,11 +251,10 @@ export class SessionManager {
       if (action.kind === "question") decision.answers = {};
       try {
         await this.appserver.respondAction(decision);
-        this.store.deleteInteractionDraft(action.id);
+        this.store.scrubInteractionDraft(action.id);
         expired += 1;
       } catch (error) {
         this.store.resolvePendingAction(action.id, "orphaned");
-        this.store.deleteInteractionDraft(action.id);
         this.queue.push({
           type: "actionOrphaned",
           sessionId: action.sessionId,

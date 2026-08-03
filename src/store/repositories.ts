@@ -1,6 +1,7 @@
 import type Database from "better-sqlite3";
 import type { LogEntry } from "../types/events.js";
 import type { OutboxMessage, RoutingCompose } from "./store.js";
+import { sanitizeDiagnosticText } from "../runtime/diagnostics.js";
 
 type Row = Record<string, unknown>;
 
@@ -77,14 +78,15 @@ export class NotificationOutboxRepository {
   }
 
   markSent(id: number, now = Date.now()): void {
-    this.db.prepare("update notification_outbox set status = 'sent', updated_at = ? where id = ?").run(now, id);
+    this.db.prepare("update notification_outbox set status = 'sent', payload_json = '{}', last_error = null, updated_at = ? where id = ?")
+      .run(now, id);
   }
 
   retry(id: number, attempts: number, error: string, now = Date.now()): void {
     const status = attempts >= 20 ? "failed" : "pending";
     const delay = Math.min(300_000, 1_000 * 2 ** Math.min(attempts, 8));
     this.db.prepare("update notification_outbox set status = ?, attempts = ?, next_attempt_at = ?, last_error = ?, updated_at = ? where id = ?")
-      .run(status, attempts, now + delay, error.slice(0, 1000), now, id);
+      .run(status, attempts, now + delay, sanitizeDiagnosticText(error).slice(0, 1000), now, id);
   }
 
   counts(): { pending: number; failed: number } {
@@ -102,13 +104,13 @@ export class NotificationOutboxRepository {
   }
 }
 
-export class TranscriptLogRepository {
-  constructor(private readonly db: Database.Database, private readonly maxChunkBytes = 32 * 1024) {}
+export class EventLogRepository {
+  constructor(private readonly db: Database.Database) {}
 
   appendLog(entry: Omit<LogEntry, "id" | "timestamp"> & { timestamp?: number }): void {
     this.db.prepare(`insert into event_log (session_id, timestamp, type, severity, text, payload_json) values (?, ?, ?, ?, ?, ?)`)
-      .run(entry.sessionId, entry.timestamp ?? Date.now(), entry.type, entry.severity, entry.text,
-        entry.payload === undefined ? null : JSON.stringify(entry.payload));
+      .run(entry.sessionId, entry.timestamp ?? Date.now(), entry.type, entry.severity,
+        sanitizeDiagnosticText(entry.text), null);
   }
 
   recentLogs(sessionId: string, limit: number): LogEntry[] {
@@ -119,6 +121,10 @@ export class TranscriptLogRepository {
         ...(row.payload_json ? { payload: JSON.parse(String(row.payload_json)) } : {})
       }));
   }
+}
+
+export class TranscriptRepository {
+  constructor(private readonly db: Database.Database, private readonly maxChunkBytes = 32 * 1024) {}
 
   append(sessionId: string, text: string, metadata?: unknown): void {
     const identity = transcriptIdentity(metadata);
