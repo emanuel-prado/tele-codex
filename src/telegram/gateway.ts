@@ -440,7 +440,7 @@ export class TelegramGateway {
         await ctx.reply("Usage: /send <thread-alias-or-id> <message>, or run /send to choose a thread.");
         return;
       }
-      const routed = await this.routing.sendDirect(ctx.chat.id, ctx.from!.id, direct[1]!, direct[2]!);
+      const routed = await this.routing.sendDirect(ctx.chat.id, direct[1]!, direct[2]!);
       await ctx.reply(`Sent to ${routed.session.label}.`);
     });
 
@@ -1344,7 +1344,7 @@ export class TelegramGateway {
       this.store.appendTranscript(event.sessionId, event.text, { turnId: event.turnId, itemId: event.itemId });
       const session = this.store.getSession(event.sessionId);
       if (!session || this.store.listSessionChats(event.sessionId).length === 0) return;
-      this.bufferAgentMessage(event.sessionId, event.text, session);
+      this.bufferAgentMessage(event.sessionId, event.text);
       return;
     }
 
@@ -1485,7 +1485,7 @@ export class TelegramGateway {
     }));
   }
 
-  private bufferAgentMessage(sessionId: string, text: string, session?: StoredSession): void {
+  private bufferAgentMessage(sessionId: string, text: string): void {
     if (!text.trim()) return;
 
     let buffer = this.messageBuffers.get(sessionId);
@@ -1496,9 +1496,9 @@ export class TelegramGateway {
     for (const chatId of this.store.listSessionChats(sessionId)) {
       const delivery = buffer.deliveries.get(chatId);
       if (delivery) {
-        delivery.text = appendAgentMessageChunk(delivery.text, text, session);
+        delivery.text = appendAgentMessageChunk(delivery.text, text);
       } else {
-        buffer.deliveries.set(chatId, { text: appendAgentMessageChunk("", text, session), attempts: 0 });
+        buffer.deliveries.set(chatId, { text: appendAgentMessageChunk("", text), attempts: 0 });
       }
     }
     this.scheduleAgentMessageFlush(sessionId, AGENT_MESSAGE_FLUSH_DELAY_MS);

@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { parseSubmitSequence } from "../src/adapters/submit-key.js";
+import { parseSubmitSequence } from "../src/legacy/submit-key.js";
 
-describe("submit key parsing", () => {
-  it("maps ctrl-enter to CSI-u enhanced keyboard sequence", () => {
+describe("parseSubmitSequence", () => {
+  it("maps ctrl-enter to a literal CSI-u sequence", () => {
     expect(parseSubmitSequence("ctrl-enter")).toEqual([
       { type: "literal", value: "\x1b[13;5u" }
     ]);
@@ -15,7 +15,7 @@ describe("submit key parsing", () => {
     ]);
   });
 
-  it("normalizes function-key submit strategies for tmux", () => {
+  it("normalizes function keys", () => {
     expect(parseSubmitSequence("f12")).toEqual([{ type: "tmuxKey", key: "F12" }]);
   });
 });

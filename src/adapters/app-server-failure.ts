@@ -7,7 +7,7 @@ export type AppServerFailureKind =
   | "invalid_state"
   | "protocol_defect";
 
-export interface AppServerFailureDetails {
+interface AppServerFailureDetails {
   method?: string;
   code?: number;
   data?: unknown;

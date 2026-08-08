@@ -31,7 +31,6 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@grammyjs/types": "^3.20.0",
     "better-sqlite3": "^11.8.1",
     "grammy": "^1.34.0",
     "pino": "^9.5.0",

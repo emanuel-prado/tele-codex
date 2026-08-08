@@ -26,7 +26,7 @@ export interface LegacyTmuxObservation {
   attachmentId: string;
   paneIdentity: string;
   capturePosition: number;
-  kind: "output" | "heuristic-interaction" | "diagnostic";
+  kind: "output" | "heuristic-interaction";
   text: string;
   confidence?: "high" | "medium" | "low";
   reason?: string;

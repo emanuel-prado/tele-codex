@@ -24,8 +24,8 @@ export class TelegramBotRuntime implements TelegramRuntime {
   constructor(
     token: string,
     policy: PolicyEngine,
-    private readonly health: RuntimeHealthReporter,
-    private readonly logger: Logger
+    health: RuntimeHealthReporter,
+    logger: Logger
   ) {
     this.bot = new Bot(token);
     this.bot.use(async (ctx, next) => {
