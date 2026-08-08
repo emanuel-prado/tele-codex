@@ -62,6 +62,30 @@ interface PaneSnapshot {
   hash: string;
 }
 
+type LegacyTmuxFailureKind = "missing-binary" | "pane-loss" | "transient";
+
+class LegacyTmuxFailure extends Error {
+  constructor(
+    readonly boundary: string,
+    readonly failureKind: LegacyTmuxFailureKind
+  ) {
+    const detail = failureKind === "missing-binary"
+      ? "tmux executable was not found (ENOENT)."
+      : failureKind === "pane-loss"
+        ? "the target pane is unavailable."
+        : "tmux command failed.";
+    super(`Legacy tmux fallback failed at ${boundary}: ${detail}`);
+    this.name = "LegacyTmuxFailure";
+  }
+}
+
+class LegacyTmuxPaneFailure extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "LegacyTmuxPaneFailure";
+  }
+}
+
 export class LegacyTmuxBridge {
   private readonly classifier = new NotificationClassifier();
 
@@ -79,26 +103,63 @@ export class LegacyTmuxBridge {
   async listPanes(): Promise<TmuxPane[]> {
     const format = ["#{session_name}", "#{window_index}", "#{pane_index}", "#{pane_current_command}", "#{pane_title}", "#{pane_active}", "#{pane_id}", "#{pane_pid}"].join("\t");
     const { stdout } = await this.tmux(["list-panes", "-a", "-F", format]);
-    const panes = await Promise.all(stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).map(async (line) => {
+    const listedTargets = new Set<string>();
+    const lostTargets = new Set<string>();
+    let hasMalformedRecords = false;
+    const candidates = stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).map((line) => {
       const [sessionName = "", windowIndex = "", paneIndex = "", command = "", title = "", active = "0", paneId = "", panePid = ""] = line.split("\t");
+      const hasTarget = Boolean(sessionName && windowIndex && paneIndex);
       const target = `${sessionName}:${windowIndex}.${paneIndex}`;
-      return {
-        target,
-        sessionName,
-        windowIndex,
-        paneIndex,
-        command,
-        title,
-        active: active === "1",
-        preview: await this.capturePreview(target),
-        paneIdentity: `${paneId}:${panePid}`
-      };
-    }));
+      if (hasTarget) listedTargets.add(target);
+      if (!hasTarget || !paneId || !panePid) {
+        hasMalformedRecords = true;
+        this.logger.warn({
+          boundary: "legacy-tmux.list-panes-row",
+          failureKind: "malformed-output"
+        }, "legacy tmux pane record ignored");
+        return undefined;
+      }
+      return { target, sessionName, windowIndex, paneIndex, command, title, active, paneId, panePid };
+    }).filter((pane): pane is NonNullable<typeof pane> => pane !== undefined);
+    const panes = (await Promise.all(candidates.map(async (pane): Promise<TmuxPane | undefined> => {
+      try {
+        return {
+          target: pane.target,
+          sessionName: pane.sessionName,
+          windowIndex: pane.windowIndex,
+          paneIndex: pane.paneIndex,
+          command: pane.command,
+          title: pane.title,
+          active: pane.active === "1",
+          preview: await this.capturePreview(pane.target),
+          paneIdentity: `${pane.paneId}:${pane.panePid}`
+        };
+      } catch (error) {
+        if (isProvenPaneFailure(error)) {
+          lostTargets.add(pane.target);
+          return undefined;
+        }
+        return {
+          target: pane.target,
+          sessionName: pane.sessionName,
+          windowIndex: pane.windowIndex,
+          paneIndex: pane.paneIndex,
+          command: pane.command,
+          title: pane.title,
+          active: pane.active === "1",
+          preview: "",
+          paneIdentity: `${pane.paneId}:${pane.panePid}`
+        };
+      }
+    }))).filter((pane): pane is TmuxPane => pane !== undefined);
     const byTarget = new Map(panes.map((pane) => [pane.target, pane]));
     for (const attachment of this.store.listLegacyTmuxAttachments()) {
       if (attachment.status === "stale") continue;
       const pane = byTarget.get(attachment.target);
-      if (!pane || (attachment.paneIdentity && attachment.paneIdentity !== pane.paneIdentity)) {
+      const provenMissing = lostTargets.has(attachment.target)
+        || (!hasMalformedRecords && !listedTargets.has(attachment.target));
+      const replaced = pane && attachment.paneIdentity && attachment.paneIdentity !== pane.paneIdentity;
+      if (provenMissing || replaced) {
         this.store.updateLegacyTmuxAttachment(attachment.id, { status: "stale", inputStatus: "stale" });
       }
     }
@@ -136,7 +197,7 @@ export class LegacyTmuxBridge {
         await this.sendText(attachment.target, text, attachment.submitStrategy);
       }
     } catch (error) {
-      if (isPaneFailure(error)) this.markStale(attachment.id);
+      if (isProvenPaneFailure(error)) this.markStale(attachment.id);
       throw error;
     }
     const result = await this.capture(attachmentId, chatId);
@@ -150,7 +211,7 @@ export class LegacyTmuxBridge {
       await this.assertPaneIdentity(attachment);
       await this.tmux(["send-keys", "-t", attachment.target, "C-c"]);
     } catch (error) {
-      this.markStale(attachment.id);
+      if (isProvenPaneFailure(error)) this.markStale(attachment.id);
       throw error;
     }
   }
@@ -161,6 +222,7 @@ export class LegacyTmuxBridge {
     try {
       snapshot = await this.readPane(attachment.target);
     } catch (error) {
+      if (!isProvenPaneFailure(error)) throw error;
       this.markStale(attachment.id);
       return {
         attachmentId,
@@ -231,7 +293,7 @@ export class LegacyTmuxBridge {
     try {
       await this.assertPaneIdentity(attachment);
     } catch (error) {
-      this.markStale(attachment.id);
+      if (isProvenPaneFailure(error)) this.markStale(attachment.id);
       throw error;
     }
     const selectedStrategy = strategy ?? attachment.submitStrategy;
@@ -258,16 +320,23 @@ export class LegacyTmuxBridge {
         preview: preview.slice(-800)
       };
     } catch (error) {
-      this.store.updateLegacyTmuxAttachment(attachmentId, { status: "stale", inputStatus: "stale" });
+      if (isProvenPaneFailure(error)) {
+        this.markStale(attachmentId);
+      } else {
+        this.store.updateLegacyTmuxAttachment(attachmentId, { inputStatus: "unknown" });
+      }
       throw error;
     }
   }
 
   async tryNextStrategy(attachmentId: string, chatId: number): Promise<ProbeResult> {
     const attachment = this.requireAttachment(attachmentId, chatId);
-    const candidates = [...new Set([this.config.tmuxSubmitKey, ...DEFAULT_SUBMIT_STRATEGIES])];
+    const candidates = distinctSubmitStrategies([this.config.tmuxSubmitKey, ...DEFAULT_SUBMIT_STRATEGIES]);
     const index = candidates.indexOf(attachment.submitStrategy);
-    return this.probe(attachmentId, chatId, candidates[(index + 1) % candidates.length] ?? "enter");
+    const next = index >= 0
+      ? candidates[(index + 1) % candidates.length]
+      : candidates.find((candidate) => submitStrategyKey(candidate) !== submitStrategyKey(attachment.submitStrategy));
+    return this.probe(attachmentId, chatId, next ?? "enter");
   }
 
   markPasteOnly(attachmentId: string, chatId: number): void {
@@ -291,7 +360,7 @@ export class LegacyTmuxBridge {
   private async assertPaneIdentity(attachment: LegacyTmuxAttachment): Promise<void> {
     const snapshot = await this.readPane(attachment.target, 1);
     if (attachment.paneIdentity && snapshot.identity !== attachment.paneIdentity) {
-      throw new Error("Legacy tmux target was replaced by a different pane. Attach it again.");
+      throw new LegacyTmuxPaneFailure("Legacy tmux target was replaced by a different pane. Attach it again.");
     }
   }
 
@@ -319,7 +388,7 @@ export class LegacyTmuxBridge {
     const format = ["#{pane_id}", "#{pane_pid}", "#{history_size}", "#{cursor_y}", "#{pane_dead}"].join("\t");
     const { stdout: info } = await this.tmux(["display-message", "-p", "-t", target, format]);
     const [paneId, panePid, history = "0", cursor = "0", dead = "0"] = info.trim().split("\t");
-    if (!paneId || !panePid || dead === "1") throw new Error(`Legacy tmux pane ${target} is unavailable or dead.`);
+    if (!paneId || !panePid || dead === "1") throw new LegacyTmuxPaneFailure("Legacy tmux pane is unavailable or dead.");
     const text = await this.capturePreview(target, Math.min(lines, MAX_CAPTURE_LINES));
     return {
       identity: `${paneId}:${panePid}`,
@@ -333,11 +402,14 @@ export class LegacyTmuxBridge {
     try {
       return await this.run("tmux", args, { timeoutMs: COMMAND_TIMEOUT_MS, maxBuffer: MAX_COMMAND_OUTPUT_BYTES });
     } catch (error) {
-      const detail = error instanceof Error && /ENOENT/.test(error.message)
-        ? "tmux executable was not found (ENOENT)."
-        : "tmux command failed.";
-      this.logger.warn({ operation: args[0], error: detail }, "legacy tmux command failed");
-      throw new Error(`Legacy tmux fallback failed: ${detail}`);
+      const boundary = args[0] ?? "command";
+      const failureKind = classifyTmuxFailure(error);
+      const failure = new LegacyTmuxFailure(boundary, failureKind);
+      this.logger.warn({
+        boundary: `legacy-tmux.${boundary}`,
+        failureKind
+      }, "legacy tmux command failed");
+      throw failure;
     }
   }
 
@@ -436,7 +508,28 @@ function contentHash(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
-function isPaneFailure(error: unknown): boolean {
+function classifyTmuxFailure(error: unknown): LegacyTmuxFailureKind {
   const detail = error instanceof Error ? error.message : String(error);
-  return /pane|tmux target|can't find|unavailable|dead/i.test(detail);
+  if (/ENOENT/.test(detail)) return "missing-binary";
+  if (/(?:can't|cannot) find pane|no such pane|pane (?:is )?(?:missing|not found|unavailable|dead)/i.test(detail)) return "pane-loss";
+  return "transient";
+}
+
+function isProvenPaneFailure(error: unknown): boolean {
+  return error instanceof LegacyTmuxPaneFailure
+    || (error instanceof LegacyTmuxFailure && error.failureKind === "pane-loss");
+}
+
+function distinctSubmitStrategies(strategies: string[]): string[] {
+  const keys = new Set<string>();
+  return strategies.filter((strategy) => {
+    const key = submitStrategyKey(strategy);
+    if (keys.has(key)) return false;
+    keys.add(key);
+    return true;
+  });
+}
+
+function submitStrategyKey(strategy: string): string {
+  return JSON.stringify(parseSubmitSequence(strategy));
 }

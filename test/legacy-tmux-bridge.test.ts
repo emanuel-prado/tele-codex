@@ -61,6 +61,57 @@ describe("LegacyTmuxBridge", () => {
     store.close();
   });
 
+  it("isolates malformed and disappearing panes while listing healthy panes", async () => {
+    const store = new Store(":memory:");
+    store.upsertLegacyTmuxAttachment({
+      id: "tmux_unknown",
+      target: "unknown:9.9",
+      label: "possibly malformed",
+      chatId: 10,
+      status: "attached",
+      inputStatus: "unknown",
+      submitStrategy: "enter"
+    });
+    store.upsertLegacyTmuxAttachment({
+      id: "tmux_gone",
+      target: "work:1.1",
+      label: "disappearing",
+      chatId: 10,
+      status: "attached",
+      inputStatus: "unknown",
+      submitStrategy: "enter"
+    });
+    const logs: unknown[] = [];
+    const run: TmuxCommandRunner = async (_file, args) => {
+      if (args[0] === "list-panes") {
+        return {
+          stdout: [
+            "work\t1\t0\tcodex\tHealthy\t1\t%1\t111",
+            "malformed pane record",
+            "work\t1\t1\tcodex\tGone\t0\t%2\t222"
+          ].join("\n")
+        };
+      }
+      if (args[0] === "capture-pane" && args.at(-1) === "work:1.1") {
+        throw new Error("can't find pane: work:1.1");
+      }
+      if (args[0] === "capture-pane") return { stdout: "healthy preview" };
+      return { stdout: "" };
+    };
+    const bridge = new LegacyTmuxBridge(config(), store, { warn(fields: unknown) { logs.push(fields); } } as never, run);
+
+    await expect(bridge.listPanes()).resolves.toEqual([
+      expect.objectContaining({ target: "work:1.0", preview: "healthy preview", paneIdentity: "%1:111" })
+    ]);
+    expect(logs).toEqual(expect.arrayContaining([
+      expect.objectContaining({ boundary: "legacy-tmux.list-panes-row", failureKind: "malformed-output" }),
+      expect.objectContaining({ boundary: "legacy-tmux.capture-pane", failureKind: "pane-loss" })
+    ]));
+    expect(store.getLegacyTmuxAttachment("tmux_unknown")?.status).toBe("attached");
+    expect(store.getLegacyTmuxAttachment("tmux_gone")?.status).toBe("stale");
+    store.close();
+  });
+
   it("processes only new output across unchanged and overlapping bounded captures", async () => {
     const store = new Store(":memory:");
     const tmux = fakeTmux("old line\nworking");
@@ -157,6 +208,43 @@ describe("LegacyTmuxBridge", () => {
     expect(tmux.commands.some((item) => item.args.join(" ") === "send-keys -t work:1.0 C-c")).toBe(true);
     expect(tmux.commands.some((item) => item.args.includes("kill-pane") || item.args.includes("kill-session"))).toBe(false);
     expect(store.getLegacyTmuxAttachment(attachment.id)?.status).toBe("attached");
+    store.close();
+  });
+
+  it("keeps an attachment live after a transient interrupt failure and stales it after proven loss", async () => {
+    const store = new Store(":memory:");
+    const tmux = fakeTmux("running");
+    const logs: unknown[] = [];
+    const bridge = new LegacyTmuxBridge(config(), store, { warn(fields: unknown) { logs.push(fields); } } as never,
+      async (file, args, options) => {
+        if (args.join(" ") === "send-keys -t work:1.0 C-c") throw new Error("temporary transport interruption");
+        return tmux.run(file, args, options);
+      }, async () => {});
+    const attachment = await bridge.attach("work:1.0", 10);
+
+    await expect(bridge.interrupt(attachment.id, 10)).rejects.toThrow(/legacy tmux fallback failed at send-keys/i);
+    expect(store.getLegacyTmuxAttachment(attachment.id)).toMatchObject({ status: "attached", inputStatus: "unknown" });
+    expect(logs).toContainEqual(expect.objectContaining({
+      boundary: "legacy-tmux.send-keys",
+      failureKind: "transient"
+    }));
+    expect(JSON.stringify(logs)).not.toContain("temporary transport interruption");
+
+    tmux.state.exists = false;
+    await expect(bridge.interrupt(attachment.id, 10)).rejects.toThrow(/target pane is unavailable/i);
+    expect(store.getLegacyTmuxAttachment(attachment.id)).toMatchObject({ status: "stale", inputStatus: "stale" });
+    store.close();
+  });
+
+  it("orders submit fallbacks by distinct key sequence", async () => {
+    const store = new Store(":memory:");
+    const tmux = fakeTmux("running");
+    const bridge = new LegacyTmuxBridge({ tmuxSubmitKey: "return", tmuxPasteSettleMs: 0 }, store, logger(), tmux.run, async () => {});
+    const attachment = await bridge.attach("work:1.0", 10);
+
+    await expect(bridge.probe(attachment.id, 10)).resolves.toMatchObject({ strategy: "return" });
+    await expect(bridge.tryNextStrategy(attachment.id, 10)).resolves.toMatchObject({ strategy: "f12" });
+    await expect(bridge.tryNextStrategy(attachment.id, 10)).resolves.toMatchObject({ strategy: "ctrl-enter" });
     store.close();
   });
 
