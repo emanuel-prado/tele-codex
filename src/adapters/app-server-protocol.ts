@@ -1,7 +1,7 @@
 import type { PendingAction } from "../types/events.js";
 import type { SessionTokenUsage, TokenUsageBreakdown } from "../types/control.js";
 
-export interface UserInputQuestion {
+interface UserInputQuestion {
   id: string;
   header?: string;
   question: string;
@@ -10,7 +10,7 @@ export interface UserInputQuestion {
   options: UserInputOption[];
 }
 
-export interface UserInputOption {
+interface UserInputOption {
   label: string;
   description?: string;
 }

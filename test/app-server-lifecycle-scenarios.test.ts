@@ -19,9 +19,9 @@ describe("app-server lifecycle scenarios", () => {
     scenario.server.notification("turn/completed", { threadId: "thread-a", turn: { id: "turn-a", status: "completed" } });
     scenario.server.serverRequest(41, "item/commandExecution/requestApproval", { threadId: "thread-a", turnId: "turn-b", command: "npm test" });
 
-    const events = await takeEvents(scenario.adapter.events(), 5);
+    const events = await takeEvents(scenario.adapter.events(), 3);
     expect(events.map((event) => event.type), scenario.server.formatTrace()).toEqual([
-      "statusChanged", "statusChanged", "agentMessage", "taskCompleted", "approvalRequested"
+      "agentMessage", "taskCompleted", "approvalRequested"
     ]);
     const approval = events.find((event): event is Extract<CodexEvent, { type: "approvalRequested" }> => event.type === "approvalRequested");
     expect(approval, scenario.server.formatTrace()).toBeDefined();
@@ -44,7 +44,7 @@ describe("app-server lifecycle scenarios", () => {
     scenario.server.respondTo("thread/resume", { thread: { id: "thread-a" } });
     const session = await scenario.adapter.start({ cwd: "/tmp" });
     scenario.server.serverRequest(7, "item/commandExecution/requestApproval", { threadId: "thread-a", command: "true" });
-    const approval = (await takeEvents(scenario.adapter.events(), 2)).find(
+    const approval = (await takeEvents(scenario.adapter.events(), 1)).find(
       (event): event is Extract<CodexEvent, { type: "approvalRequested" }> => event.type === "approvalRequested"
     )!;
     scenario.server.disconnect(1);
@@ -75,7 +75,7 @@ describe("app-server lifecycle scenarios", () => {
     await scenario.adapter.interrupt(first.id);
     await scenario.adapter.detach(first.id);
     await scenario.adapter.archiveThread(second.id);
-    const events = await takeEvents(scenario.adapter.events(), 3);
+    const events = await takeEvents(scenario.adapter.events(), 1);
 
     expect(events.find((event) => event.type === "agentMessage"), scenario.server.formatTrace()).toMatchObject({ sessionId: second.id, text: "only b" });
     expect(scenario.server.messages("turn/interrupt")).toHaveLength(1);
@@ -194,7 +194,7 @@ describe("app-server lifecycle scenarios", () => {
     scenario.server.serverRequest(8, "item/tool/call", { threadId: "thread-a" });
     scenario.server.malformed({ params: { threadId: "thread-a" } });
     scenario.server.notification("turn/started", { threadId: "thread-a", turn: { id: "stale" } }, 0);
-    const events = await takeEvents(scenario.adapter.events(), 2);
+    const events = await takeEvents(scenario.adapter.events(), 1);
 
     expect(events.find((event) => event.type === "error"), scenario.server.formatTrace()).toMatchObject({ sessionId: session.id });
     expect(scenario.server.trace.some((entry) => "error" in entry.message && entry.message.error?.code === -32601)).toBe(true);

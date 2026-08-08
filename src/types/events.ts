@@ -103,12 +103,6 @@ export type CodexEvent =
       reason: string;
     }
   | {
-      type: "statusChanged";
-      sessionId: string;
-      status: SessionStatus;
-      detail?: string;
-    }
-  | {
       type: "goalChanged";
       sessionId: string;
       goal: ThreadGoalSummary;
@@ -134,12 +128,6 @@ export type CodexEvent =
       type: "warning";
       sessionId: string;
       message: string;
-    }
-  | {
-      type: "logChunk";
-      sessionId: string;
-      text: string;
-      severity: "debug" | "info" | "warn" | "error";
     };
 
 export interface LogEntry {
@@ -160,5 +148,4 @@ export interface UserDecision {
   content?: unknown;
   permissionScope?: "turn" | "session";
   protocolDecision?: unknown;
-  grantForSession?: boolean;
 }

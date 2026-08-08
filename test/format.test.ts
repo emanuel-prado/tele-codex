@@ -46,19 +46,8 @@ describe("Telegram formatting", () => {
   });
 
   it("preserves app-server delta spacing when buffering agent messages", () => {
-    const session = {
-      id: "s",
-      adapter: "appserver" as const,
-      codexThreadId: "thread_1",
-      label: "project",
-      status: "active" as const,
-      paused: false,
-      createdAt: 1,
-      updatedAt: 2
-    };
-
     const text = ["The", " ", "hand", "off", " ", "says", "."].reduce(
-      (buffer, chunk) => appendAgentMessageChunk(buffer, chunk, session),
+      (buffer, chunk) => appendAgentMessageChunk(buffer, chunk),
       ""
     );
 

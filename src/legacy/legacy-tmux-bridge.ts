@@ -6,7 +6,7 @@ import type { AppConfig } from "../config.js";
 import { Store } from "../store/store.js";
 import type { LegacyTmuxAttachment } from "../types/legacy-tmux.js";
 import { createId } from "../utils/ids.js";
-import { parseSubmitSequence } from "../adapters/submit-key.js";
+import { parseSubmitSequence } from "./submit-key.js";
 import { NotificationClassifier, stripAnsi, type HeuristicInteraction } from "../classifier/notification-classifier.js";
 import type { LegacyTmuxObservation } from "../types/legacy-tmux.js";
 
