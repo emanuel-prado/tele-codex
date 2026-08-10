@@ -1,4 +1,4 @@
-export type HeuristicConfidence = "high" | "medium" | "low";
+type HeuristicConfidence = "high" | "medium" | "low";
 
 export interface HeuristicInteraction {
   kind: "approval" | "question";

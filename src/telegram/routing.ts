@@ -12,7 +12,7 @@ interface SendPickerPayload {
   expectedVersion: number;
 }
 
-export interface RoutedText {
+interface RoutedText {
   session: StoredSession;
   source: "reply" | "compose" | "sticky" | "direct";
 }
@@ -84,7 +84,7 @@ export class TelegramRouting {
     });
   }
 
-  async sendDirect(chatId: number, userId: number, target: string, text: string): Promise<RoutedText> {
+  async sendDirect(chatId: number, target: string, text: string): Promise<RoutedText> {
     const session = await this.resolveTarget(target);
     await this.send(chatId, session, text);
     return { session, source: "direct" };

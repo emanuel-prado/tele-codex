@@ -27,7 +27,7 @@ interface ModelPayload {
   expectedVersion: number;
 }
 
-export interface ProcessSelection {
+interface ProcessSelection {
   sessionId: string;
   processId: string;
   command: string;

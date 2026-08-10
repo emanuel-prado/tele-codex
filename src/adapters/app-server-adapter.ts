@@ -14,7 +14,7 @@ import type {
   ThreadGoalSummary
 } from "../types/control.js";
 import { AsyncQueue } from "../utils/async-queue.js";
-import { createId, createNonce, nowMs } from "../utils/ids.js";
+import { createId, nowMs } from "../utils/ids.js";
 import { Store } from "../store/store.js";
 import type { StoredSession } from "../store/store.js";
 import { noopRuntimeHealth, type RuntimeHealthReporter } from "../runtime/health.js";
@@ -113,8 +113,6 @@ export class AppServerAdapter implements AppServerRuntime {
     if (model) this.sessionModels.set(session.id, model);
     const stored = this.store.upsertSession(session, "idle");
     this.sessionsByThread.set(threadId, { sessionId: stored.id, generation });
-    this.queue.push({ type: "statusChanged", sessionId: stored.id, status: "idle", detail: "App-server thread started." });
-
     if (opts.prompt) {
       await this.sendUserText(stored.id, opts.prompt);
     }
@@ -724,7 +722,6 @@ export class AppServerAdapter implements AppServerRuntime {
         this.store.setActiveTurn(sessionId, turn.id);
         this.activeTurns.set(sessionId, turn.id);
       }
-      this.queue.push({ type: "statusChanged", sessionId, status: "active" });
       return;
     }
 
@@ -763,7 +760,6 @@ export class AppServerAdapter implements AppServerRuntime {
       const mode = asRecord(settings.collaborationMode);
       const modeText = typeof mode.mode === "string" ? `, mode ${mode.mode}` : "";
       this.store.appendLog({ sessionId, type: "thread.settings", severity: "info", text: `${model}${modeText}` });
-      this.queue.push({ type: "statusChanged", sessionId, status: "idle", detail: `${model}${modeText}` });
       return;
     }
 

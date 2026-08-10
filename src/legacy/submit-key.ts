@@ -1,4 +1,4 @@
-export type SubmitStep =
+type SubmitStep =
   | { type: "tmuxKey"; key: string }
   | { type: "literal"; value: string };
 

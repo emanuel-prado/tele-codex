@@ -1,4 +1,4 @@
-export type ResumeCommand =
+type ResumeCommand =
   | { kind: "picker" }
   | { kind: "last" }
   | { kind: "target"; target: string };

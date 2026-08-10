@@ -79,7 +79,7 @@ describe("TelegramRouting", () => {
     fixture.addThread("session_1", "thread_1", "one");
     fixture.addThread("session_2", "thread_2", "two");
 
-    await fixture.routing.sendDirect(10, 100, "one", "direct one");
+    await fixture.routing.sendDirect(10, "one", "direct one");
     await fixture.routing.setSticky(10, 100, "thread_2");
     expect((await fixture.routing.routeText(10, 100, "sticky two"))?.source).toBe("sticky");
     fixture.routing.clearSticky(10, 100);

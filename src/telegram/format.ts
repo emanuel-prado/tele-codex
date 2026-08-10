@@ -2,7 +2,6 @@ import type { PendingAction } from "../types/events.js";
 import type { CodexThreadSummary, SessionTokenUsage } from "../types/control.js";
 import type { StoredSession } from "../store/store.js";
 
-const TELEGRAM_TEXT_LIMIT = 4096;
 const DEFAULT_MESSAGE_BUDGET = 3900;
 
 export function formatAction(action: PendingAction): string {
@@ -90,7 +89,7 @@ export function formatAgentMessage(session: StoredSession | undefined, text: str
   return truncateMiddle(`[${label}]${cwd}\n\n${text.trim()}`, DEFAULT_MESSAGE_BUDGET);
 }
 
-export function appendAgentMessageChunk(existing: string, chunk: string, session?: StoredSession): string {
+export function appendAgentMessageChunk(existing: string, chunk: string): string {
   return `${existing}${chunk}`;
 }
 
@@ -102,10 +101,6 @@ export function truncateMiddle(value: string, maxChars = DEFAULT_MESSAGE_BUDGET)
   const head = Math.ceil(available / 2);
   const tail = Math.floor(available / 2);
   return `${value.slice(0, head)}${marker}${value.slice(value.length - tail)}`;
-}
-
-export function telegramTextLimit(): number {
-  return TELEGRAM_TEXT_LIMIT;
 }
 
 function actionTitle(action: PendingAction): string {
