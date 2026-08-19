@@ -61,11 +61,8 @@ export class AppServerAdapter implements AppServerRuntime {
   ) {
     void this.runtimePromise.catch(() => undefined);
     this.store.clearSessionAttachments();
-    const startupOpenActions = this.store.listOpenActions();
-    const orphaned = this.store.orphanOpenActions();
+    const orphaned = this.store.orphanOpenActionsForStartup();
     if (orphaned > 0) {
-      this.store.setRuntimeValue("startup_orphaned_actions", orphaned);
-      this.store.setRuntimeValue("startup_orphaned_action_ids", startupOpenActions.map((action) => action.id));
       this.logger.warn({ orphaned }, "orphaned pending actions from a previous app-server connection");
     }
     this.rpc = rpc ?? new JsonRpcClient(logger, config.rpcTimeoutMs);
