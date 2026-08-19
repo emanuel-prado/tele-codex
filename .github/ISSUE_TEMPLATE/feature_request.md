@@ -16,7 +16,7 @@ What should tele-codex do?
 
 ## Adapter Scope
 
-Is this for app-server, tmux fallback, or both?
+Which app-server, Telegram, persistence, or security boundary does this affect?
 
 ## Security Notes
 

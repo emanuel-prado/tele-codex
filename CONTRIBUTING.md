@@ -27,7 +27,7 @@ npm run build
 - Keep Telegram UX in `src/telegram/`.
 - Route session and control operations through `SessionManager`.
 - Keep raw Codex app-server JSON-RPC method names inside the app-server adapter.
-- Treat PTY/tmux as fallback-only.
+- Keep app-server as the sole execution adapter; propose any new execution boundary through an architecture and security issue first.
 - Add tests around pure parsing, formatting, policy, and protocol-shape helpers when behavior changes.
 
 ## Pull Requests

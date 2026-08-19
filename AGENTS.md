@@ -24,9 +24,9 @@ These instructions apply to the entire repository. Repository-specific security 
 
 ## Session and Adapter Architecture
 
-- App-server is the primary adapter. PTY/tmux is fallback-only and must not leak terminal-specific assumptions into app-server session management.
+- App-server is the sole execution adapter. Adding another execution boundary requires an explicit architecture and security issue.
 - Keep Telegram UX, session routing, adapters, persistence, and security policy behind explicit boundaries.
-- A local bridge session, Codex thread, Telegram conversation, app-server connection, and tmux pane are distinct identities. Do not infer that one exists merely because another is persisted.
+- A local bridge session, Codex thread, Telegram conversation, and app-server connection are distinct identities. Do not infer that one exists merely because another is persisted.
 - Persist durable state only when it can be reconciled after restart. Stale or unreachable sessions must be identifiable, prunable, and excluded from active-session UX.
 - Never route plain text or commands to an implicit stale session. Session selection and `/send` behavior must have an explicit, testable routing contract.
 
@@ -50,7 +50,7 @@ npm run build
 
 Run `npm run test:appserver` when the installed Codex app-server contract or adapter integration changes.
 
-Changes to routing, session lifecycle, persistence, approvals, retries, or Telegram commands require tests for happy paths, stale state, missing connections, timeouts, restarts, duplicate callbacks, and user-visible error reporting. Use fakes for Telegram, app-server, tmux, clocks, and process boundaries in the default test suite.
+Changes to routing, session lifecycle, persistence, approvals, retries, or Telegram commands require tests for happy paths, stale state, missing connections, timeouts, restarts, duplicate callbacks, and user-visible error reporting. Use fakes for Telegram, app-server, clocks, and process boundaries in the default test suite.
 
 Update `docs/technical-design.md` when adapter boundaries, session identity, persistence ownership, security policy, or unattended-operation guarantees change.
 

@@ -3,7 +3,7 @@ import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { CURRENT_SCHEMA_VERSION, migrateDatabase, MigrationError } from "../src/store/migrations.js";
+import { CURRENT_SCHEMA_VERSION, MIGRATIONS, migrateDatabase, MigrationError } from "../src/store/migrations.js";
 import {
   EventLogRepository,
   NotificationOutboxRepository,
@@ -95,7 +95,7 @@ describe("versioned SQLite storage", () => {
       );
     `);
 
-    expect(migrateDatabase(db)).toBe(7);
+    expect(migrateDatabase(db)).toBe(8);
     expect(db.prepare("select token, action_id, resource_kind, expected_version, user_id from callback_tokens order by token").all()).toEqual([
       { token: "owned", action_id: "b", resource_kind: "legacy", expected_version: null, user_id: 20 },
       { token: "project", action_id: "/workspace/one", resource_kind: "workspace-project", expected_version: 42, user_id: 20 }
@@ -105,6 +105,34 @@ describe("versioned SQLite storage", () => {
     expect((db.prepare("pragma table_info(pending_actions)").all() as Array<{ name: string }>)
       .some((column) => column.name === "nonce")).toBe(false);
     expect(db.prepare("select name from sqlite_master where type = 'table' and name = 'session_grants'").get()).toBeUndefined();
+    db.close();
+  });
+
+  it.each([0, 1, 2, 3, 4, 5, 6, 7])("upgrades schema v%i through legacy tmux removal", (version) => {
+    const db = new Database(":memory:");
+    if (version > 0) migrateDatabase(db, MIGRATIONS.filter((migration) => migration.version <= version));
+
+    const tables = () => new Set(
+      (db.prepare("select name from sqlite_master where type = 'table'").all() as Array<{ name: string }>).map((row) => row.name)
+    );
+    if (tables().has("legacy_tmux_attachments")) {
+      db.prepare(`insert into legacy_tmux_attachments
+        (id, target, label, chat_id, status, input_status, submit_strategy, created_at, updated_at)
+        values ('legacy_1', '%1', 'legacy', 10, 'attached', 'ready', 'enter', 1, 1)`).run();
+    }
+    if (tables().has("legacy_tmux_observations")) {
+      db.prepare(`insert into legacy_tmux_observations
+        (event_key, attachment_id, pane_identity, capture_position, kind, text, observed_at)
+        values ('legacy:event', 'legacy_1', '%1:10', 1, 'output', 'private terminal data', 1)`).run();
+    }
+    if (tables().has("callback_tokens")) insertLegacyCallback(db);
+
+    expect(migrateDatabase(db)).toBe(8);
+    expect(tables().has("legacy_tmux_attachments")).toBe(false);
+    expect(tables().has("legacy_tmux_observations")).toBe(false);
+    expect(db.prepare(`select count(*) as count from callback_tokens
+      where operation in ('legacy-tmux-attach', 'legacy-tmux-probe')
+         or resource_kind in ('legacy-tmux-target', 'legacy-tmux-attachment')`).get()).toEqual({ count: 0 });
     db.close();
   });
 
@@ -250,7 +278,7 @@ describe("versioned SQLite storage", () => {
     expect(store.claimCallbackToken("active-control", 1, 2, "claim")).toBeUndefined();
     expect(store.dueOutbox()).toHaveLength(1);
     expect(store.outboxCounts()).toEqual({ pending: 1, failed: 1 });
-    expect(store.diagnostics()).toMatchObject({ schemaVersion: 7, walBytes: 0 });
+    expect(store.diagnostics()).toMatchObject({ schemaVersion: 8, walBytes: 0 });
     store.close();
   });
 
@@ -269,4 +297,23 @@ function action(id: string, expiresAt: number): PendingAction {
     id, kind: "commandApproval", sessionId: "session", requestId: id, title: "Approval",
     body: "run", payload: {}, expiresAt
   };
+}
+
+function insertLegacyCallback(db: Database.Database): void {
+  const columns = new Set((db.prepare("pragma table_info(callback_tokens)").all() as Array<{ name: string }>)
+    .map((column) => column.name));
+  const names = ["token", "action_id", "chat_id"];
+  const values: unknown[] = ["legacy-control", "legacy_1", 10];
+  if (columns.has("user_id")) {
+    names.push("user_id");
+    values.push(20);
+  }
+  if (columns.has("resource_kind")) {
+    names.push("resource_kind");
+    values.push("legacy-tmux-attachment");
+  }
+  names.push("operation", "payload_json", "expires_at", "created_at");
+  values.push("legacy-tmux-probe", JSON.stringify({ attachmentId: "legacy_1" }), 999_999, 1);
+  db.prepare(`insert into callback_tokens (${names.join(", ")}) values (${names.map(() => "?").join(", ")})`)
+    .run(...values);
 }

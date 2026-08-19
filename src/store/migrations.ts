@@ -1,7 +1,7 @@
 import type Database from "better-sqlite3";
 import { RuntimeStateRepository, ThreadRuntimeRepository } from "./repositories.js";
 
-export const CURRENT_SCHEMA_VERSION = 7;
+export const CURRENT_SCHEMA_VERSION = 8;
 
 export interface Migration {
   version: number;
@@ -68,7 +68,7 @@ export function schemaVersion(db: Database.Database): number {
   return Number(row.version);
 }
 
-const MIGRATIONS: readonly Migration[] = [
+export const MIGRATIONS: readonly Migration[] = [
   {
     version: 1,
     name: "legacy-baseline",
@@ -372,6 +372,23 @@ const MIGRATIONS: readonly Migration[] = [
           update notification_outbox set payload_json = '{}' where status = 'sent';
         `);
       }
+    }
+  },
+  {
+    version: 8,
+    name: "remove-legacy-tmux-fallback",
+    up(db) {
+      if (tableExists(db, "callback_tokens")) {
+        db.exec(`
+          delete from callback_tokens
+          where operation in ('legacy-tmux-attach', 'legacy-tmux-probe')
+             or resource_kind in ('legacy-tmux-target', 'legacy-tmux-attachment');
+        `);
+      }
+      db.exec(`
+        drop table if exists legacy_tmux_observations;
+        drop table if exists legacy_tmux_attachments;
+      `);
     }
   }
 ];

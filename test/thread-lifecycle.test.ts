@@ -26,7 +26,7 @@ describe("Codex thread persistence", () => {
 
     const db = new Database(path);
     db.prepare("delete from schema_migrations where version >= 2").run();
-    db.exec("drop table active_turns; drop table appserver_attachments; drop table codex_threads; drop table legacy_tmux_attachments");
+    db.exec("drop table active_turns; drop table appserver_attachments; drop table codex_threads; drop table if exists legacy_tmux_attachments");
     createLegacySessionsTable(db);
     insertLegacySession(db, "session_old", "thread_1", "Old", 10, "stopped");
     insertLegacySession(db, "session_new", "thread_1", "New", 20, "idle");
