@@ -133,7 +133,7 @@ export function renderUnit(input: { cwd: string; nodePath: string; cliPath: stri
     "",
     "[Service]",
     "Type=simple",
-    `WorkingDirectory=${systemdQuote(input.cwd)}`,
+    `WorkingDirectory=${systemdPathValue(input.cwd)}`,
     `ExecStart=${systemdQuote(input.nodePath)} ${systemdQuote(input.cliPath)} --env-file ${systemdQuote(input.envFile)}`,
     "Restart=on-failure",
     "RestartSec=5s",
@@ -149,6 +149,20 @@ export function renderUnit(input: { cwd: string; nodePath: string; cliPath: stri
 
 function systemdQuote(value: string): string {
   return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+}
+
+function systemdPathValue(value: string): string {
+  const escapes: Record<string, string> = {
+    " ": "\\x20",
+    "\t": "\\t",
+    "\n": "\\n",
+    "\r": "\\r",
+    "\\": "\\\\",
+    '"': "\\x22",
+    "'": "\\x27",
+    "%": "%%"
+  };
+  return [...value].map((character) => escapes[character] ?? character).join("");
 }
 
 async function commandOk(
