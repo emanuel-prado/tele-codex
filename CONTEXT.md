@@ -2,7 +2,7 @@
 
 tele-codex gives one local operator a controlled Telegram surface for working
 with Codex threads. Telegram is a remote-control and delivery boundary; Codex
-app-server remains the primary execution adapter.
+app-server is the sole execution adapter.
 
 ## Language
 

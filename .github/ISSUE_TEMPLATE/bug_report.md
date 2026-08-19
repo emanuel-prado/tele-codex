@@ -19,7 +19,7 @@ What should have happened?
 - Node version:
 - Codex CLI version:
 - OS:
-- Adapter: appserver / tmux fallback
+- App-server connection mode: local stdio / remote WebSocket
 
 ## Reproduction
 

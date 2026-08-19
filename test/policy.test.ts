@@ -14,8 +14,6 @@ const baseConfig: AppConfig = {
   rateLimitWarnPercent: 80,
   allowSessionGrants: false,
   codexCommand: "codex",
-  tmuxSubmitKey: "C-j",
-  tmuxPasteSettleMs: 250,
   workspaceRoot: "/tmp"
 };
 

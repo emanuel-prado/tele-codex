@@ -17,10 +17,20 @@ describe("loadConfig", () => {
     expect(config.rpcTimeoutMs).toBe(30_000);
     expect(config.appServerMaxReconnectAttempts).toBe(8);
     expect(config.rateLimitWarnPercent).toBe(80);
-    expect(config.tmuxSubmitKey).toBe("enter");
-    expect(config.tmuxPasteSettleMs).toBe(250);
     expect(config.transcriptRetentionDays).toBeUndefined();
     expect(config.workspaceRoot.endsWith("/Workspace")).toBe(true);
+  });
+
+  it("ignores removed legacy tmux environment keys", () => {
+    const config = loadConfig({
+      TELE_CODEX_BOT_TOKEN: "token",
+      TELE_CODEX_ALLOWED_USER_IDS: "1",
+      TELE_CODEX_TMUX_SUBMIT_KEY: "C-j",
+      TELE_CODEX_TMUX_PASTE_SETTLE_MS: "500"
+    });
+
+    expect("tmuxSubmitKey" in config).toBe(false);
+    expect("tmuxPasteSettleMs" in config).toBe(false);
   });
 
   it("parses an opt-in transcript retention window in days", () => {

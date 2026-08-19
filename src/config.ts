@@ -19,8 +19,6 @@ const envSchema = z.object({
     .default("false")
     .transform((value) => value === "true"),
   TELE_CODEX_CODEX_COMMAND: z.string().optional().default("codex"),
-  TELE_CODEX_TMUX_SUBMIT_KEY: z.string().optional().default("enter"),
-  TELE_CODEX_TMUX_PASTE_SETTLE_MS: z.coerce.number().int().nonnegative().optional().default(250),
   TELE_CODEX_WORKSPACE_ROOT: z.string().optional().default("~/Workspace"),
   TELE_CODEX_APP_SERVER_URL: z.string().optional()
 });
@@ -38,8 +36,6 @@ export interface AppConfig {
   transcriptRetentionDays?: number;
   allowSessionGrants: boolean;
   codexCommand: string;
-  tmuxSubmitKey: string;
-  tmuxPasteSettleMs: number;
   workspaceRoot: string;
   appServerUrl?: string;
 }
@@ -75,8 +71,6 @@ export function loadConfig(
     rateLimitWarnPercent: parsed.TELE_CODEX_RATE_LIMIT_WARN_PERCENT,
     allowSessionGrants: parsed.TELE_CODEX_ALLOW_SESSION_GRANTS,
     codexCommand: parsed.TELE_CODEX_CODEX_COMMAND,
-    tmuxSubmitKey: parsed.TELE_CODEX_TMUX_SUBMIT_KEY,
-    tmuxPasteSettleMs: parsed.TELE_CODEX_TMUX_PASTE_SETTLE_MS,
     workspaceRoot: resolveHome(parsed.TELE_CODEX_WORKSPACE_ROOT)
   };
   if (parsed.TELE_CODEX_TRANSCRIPT_RETENTION_DAYS !== undefined) {

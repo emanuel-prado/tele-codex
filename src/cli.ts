@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 import { loadConfig } from "./config.js";
 import { AppServerAdapter } from "./adapters/app-server-adapter.js";
-import { LegacyTmuxBridge } from "./legacy/legacy-tmux-bridge.js";
 import { PolicyEngine } from "./security/policy.js";
 import { Store } from "./store/store.js";
 import { TelegramGateway } from "./telegram/gateway.js";
@@ -34,9 +33,8 @@ async function main(): Promise<void> {
     const supervisor = new RuntimeSupervisor(health, logger);
     const appserver = new AppServerAdapter(config, store, logger, health);
     const sessions = new SessionManager(appserver, store, logger);
-    const legacyTmux = new LegacyTmuxBridge(config, store, logger);
     const policy = new PolicyEngine(config);
-    const telegram = new TelegramGateway(config, sessions, legacyTmux, store, policy, logger, health);
+    const telegram = new TelegramGateway(config, sessions, store, policy, logger, health);
 
     const storeSubsystem = cleanupSubsystem("sqlite-store", () => store.close());
     const appServerSubsystem: SupervisedSubsystem = {

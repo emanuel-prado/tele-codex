@@ -2,7 +2,6 @@ import Database from "better-sqlite3";
 import { existsSync, statSync } from "node:fs";
 import type { RateLimitSummary, SessionProgress, SessionTokenUsage, ThreadGoalSummary } from "../types/control.js";
 import type { LogEntry, PendingAction, SessionRef, SessionStatus } from "../types/events.js";
-import type { LegacyTmuxAttachment, LegacyTmuxInputStatus, LegacyTmuxObservation, LegacyTmuxStatus } from "../types/legacy-tmux.js";
 import { sanitizeDiagnosticText } from "../runtime/diagnostics.js";
 import { createId } from "../utils/ids.js";
 import { migrateDatabase, schemaVersion } from "./migrations.js";
@@ -114,7 +113,6 @@ export interface MaintenanceResult {
   interactionDrafts: number;
   sentOutbox: number;
   logs: number;
-  legacyTmuxObservations: number;
   actions: number;
   transcripts: number;
 }
@@ -251,129 +249,6 @@ export class Store {
       `${CODEX_THREAD_SELECT}${includeAll ? "" : " where t.lifecycle_status = 'available'"}`
     ).all() as Row[];
     return threadRows.map(mapCodexThread).sort((left, right) => right.updatedAt - left.updatedAt);
-  }
-
-  upsertLegacyTmuxAttachment(input: {
-    id: string;
-    target: string;
-    label: string;
-    cwd?: string;
-    chatId: number;
-    status?: LegacyTmuxStatus;
-    inputStatus?: LegacyTmuxInputStatus;
-    submitStrategy: string;
-  }): LegacyTmuxAttachment {
-    const now = this.nextLegacyVersion(input.id);
-    this.db.prepare(
-      `insert into legacy_tmux_attachments
-        (id, target, label, cwd, chat_id, status, input_status, submit_strategy, created_at, updated_at)
-       values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-       on conflict(id) do update set
-         target=excluded.target, label=excluded.label, cwd=excluded.cwd, chat_id=excluded.chat_id,
-         status=excluded.status, input_status=excluded.input_status,
-         submit_strategy=excluded.submit_strategy, updated_at=excluded.updated_at`
-    ).run(
-      input.id,
-      input.target,
-      input.label,
-      input.cwd ?? null,
-      input.chatId,
-      input.status ?? "attached",
-      input.inputStatus ?? "unknown",
-      input.submitStrategy,
-      now,
-      now
-    );
-    return this.getLegacyTmuxAttachment(input.id)!;
-  }
-
-  getLegacyTmuxAttachment(id: string): LegacyTmuxAttachment | undefined {
-    const row = this.db.prepare("select * from legacy_tmux_attachments where id = ?").get(id) as Row | undefined;
-    return row ? mapLegacyTmuxAttachment(row) : undefined;
-  }
-
-  listLegacyTmuxAttachments(chatId?: number): LegacyTmuxAttachment[] {
-    const rows = chatId === undefined
-      ? this.db.prepare("select * from legacy_tmux_attachments order by updated_at desc").all() as Row[]
-      : this.db.prepare("select * from legacy_tmux_attachments where chat_id = ? order by updated_at desc").all(chatId) as Row[];
-    return rows.map(mapLegacyTmuxAttachment);
-  }
-
-  updateLegacyTmuxAttachment(
-    id: string,
-    state: Partial<Pick<LegacyTmuxAttachment, "status" | "inputStatus" | "submitStrategy" | "lastProbe" | "lastProbeAt">>
-  ): void {
-    const attachment = this.getLegacyTmuxAttachment(id);
-    if (!attachment) return;
-    this.db.prepare(
-      `update legacy_tmux_attachments set
-        status = ?, input_status = ?, submit_strategy = ?, last_probe = ?, last_probe_at = ?, updated_at = ?
-       where id = ?`
-    ).run(
-      state.status ?? attachment.status,
-      state.inputStatus ?? attachment.inputStatus,
-      state.submitStrategy ?? attachment.submitStrategy,
-      state.lastProbe === undefined ? attachment.lastProbe ?? null : state.lastProbe,
-      state.lastProbeAt === undefined ? attachment.lastProbeAt ?? null : state.lastProbeAt,
-      this.nextLegacyVersion(id),
-      id
-    );
-  }
-
-  updateLegacyTmuxCapture(
-    id: string,
-    capture: Pick<LegacyTmuxAttachment, "paneIdentity" | "capturePosition" | "captureHash" | "captureTail" | "lastCaptureAt">
-  ): void {
-    this.db.prepare(
-      `update legacy_tmux_attachments set
-        pane_identity = ?, capture_position = ?, capture_hash = ?, capture_tail = ?, last_capture_at = ?, updated_at = ?
-       where id = ?`
-    ).run(
-      capture.paneIdentity ?? null,
-      capture.capturePosition ?? null,
-      capture.captureHash ?? null,
-      capture.captureTail ?? null,
-      capture.lastCaptureAt ?? null,
-      this.nextLegacyVersion(id),
-      id
-    );
-  }
-
-  appendLegacyTmuxObservation(observation: LegacyTmuxObservation): boolean {
-    return this.db.prepare(
-      `insert into legacy_tmux_observations
-        (event_key, attachment_id, pane_identity, capture_position, kind, text, confidence, reason, observed_at)
-       values (?, ?, ?, ?, ?, ?, ?, ?, ?) on conflict(event_key) do nothing`
-    ).run(
-      observation.eventKey,
-      observation.attachmentId,
-      observation.paneIdentity,
-      observation.capturePosition,
-      observation.kind,
-      observation.text,
-      observation.confidence ?? null,
-      observation.reason ?? null,
-      observation.observedAt
-    ).changes === 1;
-  }
-
-  listLegacyTmuxObservations(attachmentId: string, limit = 50): LegacyTmuxObservation[] {
-    return (this.db.prepare(
-      "select * from legacy_tmux_observations where attachment_id = ? order by id desc limit ?"
-    ).all(attachmentId, limit) as Row[]).reverse().map(mapLegacyTmuxObservation);
-  }
-
-  hasRecentLegacyTmuxObservation(input: {
-    attachmentId: string;
-    paneIdentity: string;
-    kind: LegacyTmuxObservation["kind"];
-    text: string;
-    since: number;
-  }): boolean {
-    return Boolean(this.db.prepare(
-      `select 1 from legacy_tmux_observations
-       where attachment_id = ? and pane_identity = ? and kind = ? and text = ? and observed_at >= ? limit 1`
-    ).get(input.attachmentId, input.paneIdentity, input.kind, input.text, input.since));
   }
 
   markThreadDetached(sessionId: string): void {
@@ -898,7 +773,6 @@ export class Store {
         "delete from notification_outbox where status = 'sent' and updated_at < ?"
       ).run(outboxCutoff).changes;
       const logs = this.db.prepare("delete from event_log where timestamp < ?").run(logCutoff).changes;
-      const legacyTmuxObservations = this.db.prepare("delete from legacy_tmux_observations where observed_at < ?").run(logCutoff).changes;
       this.db.prepare(
         `delete from callback_tokens where action_id in
           (select id from pending_actions where status not in ('pending', 'submitting', 'failed')
@@ -919,7 +793,7 @@ export class Store {
       const transcripts = policy.transcriptRetentionMs === undefined ? 0 : this.db.prepare(
         "delete from transcript_chunks where timestamp < ? and finalized_at is not null"
       ).run(now - policy.transcriptRetentionMs).changes;
-      return { callbackTokens, interactionDrafts, sentOutbox, logs, legacyTmuxObservations, actions, transcripts };
+      return { callbackTokens, interactionDrafts, sentOutbox, logs, actions, transcripts };
     })();
   }
 
@@ -971,12 +845,6 @@ export class Store {
   private nextSessionVersion(sessionId: string): number {
     const current = this.threads.resourceVersion(sessionId) ?? 0;
     return Math.max(Date.now(), current + 1);
-  }
-
-  private nextLegacyVersion(attachmentId: string): number {
-    const row = this.db.prepare("select updated_at from legacy_tmux_attachments where id = ?")
-      .get(attachmentId) as { updated_at: number } | undefined;
-    return Math.max(Date.now(), Number(row?.updated_at ?? 0) + 1);
   }
 
   private getCodexThreadRow(sessionId: string): Row | undefined {
@@ -1066,43 +934,6 @@ function isSessionStatus(value: string): value is SessionStatus {
   return value === "starting" || value === "attached" || value === "idle" || value === "active" ||
     value === "paused" || value === "blocked" || value === "error" || value === "detached" ||
     value === "archived" || value === "stopped";
-}
-
-function mapLegacyTmuxAttachment(row: Row): LegacyTmuxAttachment {
-  const attachment: LegacyTmuxAttachment = {
-    id: String(row.id),
-    target: String(row.target),
-    label: String(row.label),
-    chatId: Number(row.chat_id),
-    status: row.status as LegacyTmuxStatus,
-    inputStatus: row.input_status as LegacyTmuxInputStatus,
-    submitStrategy: String(row.submit_strategy),
-    createdAt: Number(row.created_at),
-    updatedAt: Number(row.updated_at)
-  };
-  if (row.cwd) attachment.cwd = String(row.cwd);
-  if (row.last_probe) attachment.lastProbe = String(row.last_probe);
-  if (row.last_probe_at) attachment.lastProbeAt = Number(row.last_probe_at);
-  if (row.pane_identity) attachment.paneIdentity = String(row.pane_identity);
-  if (row.capture_position != null) attachment.capturePosition = Number(row.capture_position);
-  if (row.capture_hash) attachment.captureHash = String(row.capture_hash);
-  if (row.capture_tail) attachment.captureTail = String(row.capture_tail);
-  if (row.last_capture_at != null) attachment.lastCaptureAt = Number(row.last_capture_at);
-  return attachment;
-}
-
-function mapLegacyTmuxObservation(row: Row): LegacyTmuxObservation {
-  return {
-    eventKey: String(row.event_key),
-    attachmentId: String(row.attachment_id),
-    paneIdentity: String(row.pane_identity),
-    capturePosition: Number(row.capture_position),
-    kind: row.kind as LegacyTmuxObservation["kind"],
-    text: String(row.text),
-    ...(row.confidence ? { confidence: row.confidence as "high" | "medium" | "low" } : {}),
-    ...(row.reason ? { reason: String(row.reason) } : {}),
-    observedAt: Number(row.observed_at)
-  };
 }
 
 function mapPendingAction(row: Row): StoredPendingAction {

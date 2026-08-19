@@ -314,8 +314,6 @@ function config(): AppConfig {
     rateLimitWarnPercent: 80,
     allowSessionGrants: true,
     codexCommand: "codex",
-    tmuxSubmitKey: "enter",
-    tmuxPasteSettleMs: 0,
     workspaceRoot: "/tmp"
   };
 }

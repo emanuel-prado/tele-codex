@@ -7,21 +7,20 @@ import type { AppConfig } from "../src/config.js";
 import { Store } from "../src/store/store.js";
 
 describe("doctor", () => {
-  it("reports healthy required checks and warns for missing optional tmux", async () => {
+  it("reports healthy required checks", async () => {
     const root = await mkdtemp(join(tmpdir(), "tele-codex-doctor-workspace-"));
     const dbDir = await mkdtemp(join(tmpdir(), "tele-codex-doctor-db-"));
     const dbPath = join(dbDir, "db.sqlite");
     new Store(dbPath).close();
     const report = await runDoctor(config(root, dbPath), {
-      runCommand: async (command, args) => {
-        if (command === "tmux") throw new Error("not found");
+      runCommand: async (_command, args) => {
         return { stdout: args.includes("--version") ? "codex 1.0.0\n" : "app-server help\n", stderr: "" };
       },
       serviceStatus: healthyService
     });
 
     expect(report.ok).toBe(true);
-    expect(report.checks.find((check) => check.name === "tmux fallback")?.status).toBe("warn");
+    expect(report.checks.some((check) => check.name.toLowerCase().includes("tmux"))).toBe(false);
     expect(report.checks.find((check) => check.name === "Codex app-server")?.detail)
       .toBe("installed codex 1.0.0; checked contract codex-cli 0.148.0");
     expect(formatDoctorReport(report)).toContain("tele-codex doctor: ok");
@@ -52,7 +51,7 @@ describe("doctor", () => {
     });
 
     expect(report.checks.find((check) => check.name === "Database integrity")?.detail)
-      .toMatch(/^schema v7, database .* MiB, WAL .* MiB$/);
+      .toMatch(/^schema v8, database .* MiB, WAL .* MiB$/);
   });
 
   it("diagnoses missing configuration without creating runtime state", async () => {
@@ -81,8 +80,6 @@ function config(workspaceRoot: string, dbPath: string): AppConfig {
     rateLimitWarnPercent: 80,
     allowSessionGrants: true,
     codexCommand: "codex",
-    tmuxSubmitKey: "enter",
-    tmuxPasteSettleMs: 250,
     workspaceRoot
   };
 }

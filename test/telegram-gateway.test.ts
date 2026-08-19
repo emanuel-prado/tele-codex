@@ -6,7 +6,6 @@ import { Writable } from "node:stream";
 import pino from "pino";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AppConfig } from "../src/config.js";
-import type { LegacyTmuxBridge } from "../src/legacy/legacy-tmux-bridge.js";
 import { RuntimeHealth } from "../src/runtime/health.js";
 import { createLogger } from "../src/runtime/logger.js";
 import type { SessionManager } from "../src/runtime/session-manager.js";
@@ -132,7 +131,6 @@ describe("TelegramGateway dispatch", () => {
     gateway = new TelegramGateway(
       config,
       sessions,
-      {} as LegacyTmuxBridge,
       store,
       new PolicyEngine(config),
       pino({ level: "silent" }),
@@ -233,7 +231,7 @@ describe("TelegramGateway dispatch", () => {
     vi.useFakeTimers();
     const health = new RuntimeHealth();
     const streamingGateway = new TelegramGateway(
-      testConfig(), sessions, {} as LegacyTmuxBridge, store, new PolicyEngine(testConfig()),
+      testConfig(), sessions, store, new PolicyEngine(testConfig()),
       pino({ level: "silent" }), health, runtime
     );
     activeSession = store.upsertSession({
@@ -266,7 +264,7 @@ describe("TelegramGateway dispatch", () => {
     }));
     const health = new RuntimeHealth();
     const streamingGateway = new TelegramGateway(
-      testConfig(), sessions, {} as LegacyTmuxBridge, store, new PolicyEngine(testConfig()),
+      testConfig(), sessions, store, new PolicyEngine(testConfig()),
       logger, health, runtime
     );
     activeSession = store.upsertSession({
@@ -298,7 +296,7 @@ describe("TelegramGateway dispatch", () => {
   it("coalesces concurrent flushes without duplicating sends or losing newly buffered text", async () => {
     vi.useFakeTimers();
     const streamingGateway = new TelegramGateway(
-      testConfig(), sessions, {} as LegacyTmuxBridge, store, new PolicyEngine(testConfig()),
+      testConfig(), sessions, store, new PolicyEngine(testConfig()),
       pino({ level: "silent" }), undefined, runtime
     );
     activeSession = store.upsertSession({
@@ -355,7 +353,7 @@ describe("TelegramGateway dispatch", () => {
     } as unknown as SessionManager;
     const config = { ...testConfig(), workspaceRoot, allowedChatIds: new Set([100]) };
     const recoveryGateway = new TelegramGateway(
-      config, recoverySessions, {} as LegacyTmuxBridge, store, new PolicyEngine(config),
+      config, recoverySessions, store, new PolicyEngine(config),
       pino({ level: "silent" }), undefined, recoveryRuntime
     );
 
@@ -407,7 +405,7 @@ describe("TelegramGateway dispatch", () => {
     } as unknown as SessionManager;
     const config = { ...testConfig(), workspaceRoot };
     const approvalGateway = new TelegramGateway(
-      config, approvalSessions, {} as LegacyTmuxBridge, store, new PolicyEngine(config),
+      config, approvalSessions, store, new PolicyEngine(config),
       pino({ level: "silent" }), undefined, runtime
     );
 
@@ -419,7 +417,7 @@ describe("TelegramGateway dispatch", () => {
   });
 
   it("responds to unknown slash commands", async () => {
-    await runtime.bot.handleUpdate(messageUpdate("/doesnotexist", nextUpdateId()));
+    await runtime.bot.handleUpdate(messageUpdate("/tmux", nextUpdateId()));
     expect(sentTexts(runtime)).toContain("Unknown command. Run /help to see supported commands.");
   });
 
@@ -444,7 +442,7 @@ describe("TelegramGateway dispatch", () => {
   });
 
   it("answers unknown callback payloads", async () => {
-    await runtime.bot.handleUpdate(callbackUpdate("unknown-control", nextUpdateId()));
+    await runtime.bot.handleUpdate(callbackUpdate("legacy:cached-control", nextUpdateId()));
     expect(callbackAnswers(runtime)).toContainEqual(expect.objectContaining({
       text: "This control is unknown or no longer supported. Run the command again.",
       show_alert: true
@@ -472,7 +470,7 @@ describe("TelegramGateway dispatch", () => {
       respondAction: async () => { submissions += 1; }
     } as unknown as SessionManager;
     const approvalGateway = new TelegramGateway(
-      testConfig(), approvalSessions, {} as LegacyTmuxBridge, store, new PolicyEngine(testConfig()),
+      testConfig(), approvalSessions, store, new PolicyEngine(testConfig()),
       pino({ level: "silent" }), undefined, approvalRuntime
     );
     const action = approvalAction();
@@ -516,7 +514,7 @@ describe("TelegramGateway dispatch", () => {
       }
     } as unknown as SessionManager;
     const slowGateway = new TelegramGateway(
-      testConfig(), slowSessions, {} as LegacyTmuxBridge, store, new PolicyEngine(testConfig()),
+      testConfig(), slowSessions, store, new PolicyEngine(testConfig()),
       pino({ level: "silent" }), undefined, slowRuntime
     );
     const action = approvalAction();
@@ -742,8 +740,6 @@ function testConfig(): AppConfig {
     rateLimitWarnPercent: 80,
     allowSessionGrants: false,
     codexCommand: "codex",
-    tmuxSubmitKey: "enter",
-    tmuxPasteSettleMs: 0,
     workspaceRoot: "/tmp"
   };
 }

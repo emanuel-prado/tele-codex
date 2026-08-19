@@ -6,7 +6,7 @@
 
 `tele-codex` is a local Telegram companion for Codex CLI. It lets one trusted Telegram user monitor, resume, and steer Codex sessions running on the same machine.
 
-Codex app-server over JSON-RPC is the product runtime. A separate, explicit tmux bridge remains available as a legacy best-effort fallback; it is not a Codex thread adapter.
+Codex app-server over JSON-RPC is the sole execution runtime.
 
 ## Features
 
@@ -21,7 +21,6 @@ Codex app-server over JSON-RPC is the product runtime. A separate, explicit tmux
 - Goals, account limits, turn plans/diffs, thread search, and background-process controls.
 - SQLite persistence for sessions, pending actions, event logs, transcripts, and session grants.
 - Full transcript export with Telegram-safe message truncation for live output.
-- Explicit legacy tmux attachment with heuristic input probing.
 
 ## Requirements
 
@@ -29,7 +28,6 @@ Codex app-server over JSON-RPC is the product runtime. A separate, explicit tmux
 - Codex CLI installed and authenticated on the same machine.
 - A Telegram bot token from BotFather.
 - Your Telegram numeric user ID.
-- `tmux` only if you plan to use the optional legacy fallback.
 
 ## Setup
 
@@ -79,8 +77,6 @@ node dist/cli.js doctor
 | `TELE_CODEX_WORKSPACE_ROOT` | `~/Workspace` | Root used by `/new` project discovery. |
 | `TELE_CODEX_CODEX_COMMAND` | `codex` | Codex executable. |
 | `TELE_CODEX_APP_SERVER_URL` | unset | Optional remote app-server websocket URL. |
-| `TELE_CODEX_TMUX_SUBMIT_KEY` | `enter` | Submit strategy for the legacy tmux fallback. |
-| `TELE_CODEX_TMUX_PASTE_SETTLE_MS` | `250` | Delay between tmux paste and submit key. |
 | `TELE_CODEX_ALLOW_SESSION_GRANTS` | `false` | Enables native Codex “approve for session” decisions. Opt in only when needed. |
 | `TELE_CODEX_RPC_TIMEOUT_MS` | `30000` | Maximum wait for an app-server JSON-RPC response. |
 | `TELE_CODEX_APP_SERVER_MAX_RECONNECT_ATTEMPTS` | `8` | Failed reconnect attempts before the supervised runtime exits for systemd restart. |
@@ -107,7 +103,7 @@ Core:
 - `/send <thread-alias-or-id> <message>` sends directly to one thread.
 - Replying to a tele-codex agent message routes the reply to the thread that produced it.
 - `/use <thread-alias-or-id>` enables explicit sticky routing for that chat and user; `/use off` disables it.
-- `/attach appserver <threadId>` attaches a specific Codex thread. Use `/tmux` for the separate legacy fallback.
+- `/attach appserver <threadId>` attaches a specific Codex thread.
 - Other plain text is not forwarded and explains how to choose a destination.
 
 App-server controls:
@@ -144,16 +140,6 @@ Session utilities:
 - `/kill` interrupts the active turn after confirmation; it does not delete or detach the durable thread.
 - `/help` lists the commands supported by the running bot. Unknown commands return this guidance instead of failing silently.
 
-Legacy tmux fallback:
-
-- `/tmux` lists panes with chat/user-scoped opaque attach controls.
-- `/tmux attach <target>` attaches a pane directly; `/tmux <target>` is shorthand.
-- `/tmux list` lists this chat's separately persisted legacy attachments.
-- `/tmux test <attachmentId>` sends a heuristic probe and asks you to verify the pane locally.
-- `/tmux send <attachmentId> <text>` sends only after the attachment input was explicitly confirmed.
-- `/tmux capture <attachmentId>` inspects only newly observed bounded pane output. Heuristic interaction warnings never create normal Approve/Deny actions.
-- `/tmux interrupt <attachmentId>` sends Ctrl-C to the externally managed pane; it does not kill or take ownership of the pane/process.
-
 ## Security Model
 
 This is designed for a single trusted user controlling a local machine. Do not expose it as a public webhook or shared bot without revisiting the threat model.
@@ -189,18 +175,15 @@ The project is intentionally small:
 - `src/telegram/` handles Telegram command/callback UX and explicit per-chat thread routing.
 - `src/runtime/` owns session lifecycle and workspace resolution.
 - `src/adapters/` contains the structured app-server implementation.
-- `src/legacy/` contains the separate best-effort tmux bridge.
 - `src/store/` persists local bridge state.
 - `src/security/` enforces Telegram and approval policy.
 - `docs/technical-design.md` describes the main seams and risks.
 
 ## Runtime Notes
 
-App-server is the only Codex runtime because it exposes structured JSON-RPC events and controls for approvals, thread resume, model selection, collaboration mode, and compaction. Core startup, routing, health, sessions, approvals, and transcripts never construct or inspect tmux state.
+App-server is the only Codex runtime because it exposes structured JSON-RPC events and controls for approvals, thread resume, model selection, collaboration mode, and compaction.
 
 Token usage is captured from app-server `thread/tokenUsage/updated` notifications. `/usage`, `/status`, and `/panel` show the latest usage snapshot once Codex has reported one for the active thread.
-
-Legacy tmux is fallback-only. It has separate attachment identity, persistence, observations, and Telegram commands. Captures are bounded, track pane identity plus a durable last-seen boundary, and process only overlapping/new output; ambiguous redraws are skipped. Terminal interaction detection requires explicit markers, carries confidence/reason metadata, and only produces a warning to inspect the local pane. It never becomes an app-server approval, question, transcript, or log.
 
 ## Unattended Linux Operation
 

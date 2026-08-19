@@ -46,7 +46,6 @@ export async function runDoctor(config: AppConfig, options: DoctorOptions = {}):
   checks.push(appServer.status === "pass"
     ? { ...appServer, detail: `installed ${codex.detail}; checked contract ${APP_SERVER_CONTRACT_VERSION}` }
     : appServer);
-  checks.push(await optionalCommandCheck("tmux fallback", "tmux", ["-V"], runCommand));
   checks.push(await serviceCheck(options.serviceStatus ?? (() => new ServiceManager().status())));
 
   return {
@@ -188,16 +187,6 @@ async function commandCheck(
   } catch (error) {
     return { name, status: "fail", detail: error instanceof Error ? error.message : `${command} failed` };
   }
-}
-
-async function optionalCommandCheck(
-  name: string,
-  command: string,
-  args: string[],
-  runCommand: NonNullable<DoctorOptions["runCommand"]>
-): Promise<HealthCheck> {
-  const result = await commandCheck(name, command, args, runCommand);
-  return result.status === "fail" ? { ...result, status: "warn", detail: `${result.detail} (only needed for tmux fallback)` } : result;
 }
 
 async function defaultRunCommand(command: string, args: string[]): Promise<{ stdout: string; stderr: string }> {
