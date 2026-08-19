@@ -1,6 +1,6 @@
 # App-server contract testing
 
-The checked fixture in `contracts/app-server/contract.json` records the Codex CLI version, every app-server method tele-codex calls or handles, and the required fields of critical lifecycle messages. `npm run contract:check` regenerates TypeScript and JSON schemas from the installed experimental app-server API and rejects missing methods or changed required shapes. Use `npm run contract:refresh` only for an intentional Codex upgrade, then review the protocol changes and update `APP_SERVER_CONTRACT_VERSION`.
+The checked fixture in `contracts/app-server/contract.json` records the Codex CLI version, every app-server method tele-codex calls or handles, and the required fields of critical lifecycle messages. It currently targets Codex CLI 0.148.0, including the required `isBlocking` field on `ToolRequestUserInputParams`. `npm run contract:check` regenerates TypeScript and JSON schemas from the installed experimental app-server API and rejects missing methods or changed required shapes. Use `npm run contract:refresh` only for an intentional Codex upgrade, then review the protocol changes and update `APP_SERVER_CONTRACT_VERSION`.
 
 CI runs `npm run contract:fixture`, which compares the adapter's method registry and reported version with the checked fixture without requiring Codex. The default test suite does not need Codex, Telegram, credentials, or network access. Its lifecycle coverage is split by ownership:
 

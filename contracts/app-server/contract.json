@@ -1,6 +1,6 @@
 {
-  "codexVersion": "codex-cli 0.146.0",
-  "generatedAt": "2026-08-01",
+  "codexVersion": "codex-cli 0.148.0",
+  "generatedAt": "2026-08-19",
   "clientMethods": [
     "account/rateLimits/read",
     "initialize",
@@ -51,12 +51,49 @@
     "warning"
   ],
   "requiredFields": {
-    "CommandExecutionRequestApprovalParams.json": ["itemId", "startedAtMs", "threadId", "turnId"],
-    "ToolRequestUserInputParams.json": ["itemId", "questions", "threadId", "turnId"],
-    "v1/InitializeResponse.json": ["codexHome", "platformFamily", "platformOs", "userAgent"],
-    "v2/ServerRequestResolvedNotification.json": ["requestId", "threadId"],
-    "v2/ThreadResumeResponse.json": ["approvalPolicy", "approvalsReviewer", "cwd", "model", "modelProvider", "sandbox", "thread"],
-    "v2/ThreadStartResponse.json": ["approvalPolicy", "approvalsReviewer", "cwd", "model", "modelProvider", "sandbox", "thread"],
-    "v2/TurnStartResponse.json": ["turn"]
+    "CommandExecutionRequestApprovalParams.json": [
+      "itemId",
+      "startedAtMs",
+      "threadId",
+      "turnId"
+    ],
+    "ToolRequestUserInputParams.json": [
+      "isBlocking",
+      "itemId",
+      "questions",
+      "threadId",
+      "turnId"
+    ],
+    "v1/InitializeResponse.json": [
+      "codexHome",
+      "platformFamily",
+      "platformOs",
+      "userAgent"
+    ],
+    "v2/ServerRequestResolvedNotification.json": [
+      "requestId",
+      "threadId"
+    ],
+    "v2/ThreadResumeResponse.json": [
+      "approvalPolicy",
+      "approvalsReviewer",
+      "cwd",
+      "model",
+      "modelProvider",
+      "sandbox",
+      "thread"
+    ],
+    "v2/ThreadStartResponse.json": [
+      "approvalPolicy",
+      "approvalsReviewer",
+      "cwd",
+      "model",
+      "modelProvider",
+      "sandbox",
+      "thread"
+    ],
+    "v2/TurnStartResponse.json": [
+      "turn"
+    ]
   }
 }

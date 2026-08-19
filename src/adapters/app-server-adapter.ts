@@ -659,6 +659,16 @@ export class AppServerAdapter implements AppServerRuntime {
       return;
     }
 
+    if (!hasValidInteractiveParams(message.method, params)) {
+      this.rpc.fail(message.id as string | number, -32602, "Invalid item/tool/requestUserInput params: isBlocking must be boolean.", generation);
+      this.queue.push({
+        type: "error",
+        sessionId,
+        message: "tele-codex safely rejected an app-server user-input request without a valid isBlocking field. Update the checked Codex contract before retrying."
+      });
+      return;
+    }
+
     const action = makeActionFromServerRequest(
       sessionId,
       message.id as string | number,
@@ -894,9 +904,12 @@ function makeActionFromServerRequest(
           ? "mcpElicitation"
           : "commandApproval";
   const title = kind === "question" ? "Codex asks" : "Codex approval required";
+  const questionNotice = kind === "question" && params.isBlocking === false
+    ? "Codex may continue and resolve this request before you answer."
+    : undefined;
   const body =
     kind === "question"
-      ? formatRequestUserInput({ params })
+      ? [formatRequestUserInput({ params }), questionNotice].filter(Boolean).join("\n\n")
       : [reason, command ? `Command:\n${command}` : undefined, params.cwd ? `cwd: ${String(params.cwd)}` : undefined]
           .filter(Boolean)
           .join("\n\n");
@@ -910,7 +923,7 @@ function makeActionFromServerRequest(
     title,
     body: body || JSON.stringify(params),
     payload: { method, params },
-    expiresAt: nowMs() + actionTimeout(params, timeoutMs)
+    expiresAt: nowMs() + actionTimeout(method, params, timeoutMs)
   };
   if (typeof params.threadId === "string") action.threadId = params.threadId;
   if (typeof params.turnId === "string") action.turnId = params.turnId;
@@ -928,7 +941,12 @@ function isSupportedInteractiveRequest(method: string | undefined): boolean {
     method === "execCommandApproval";
 }
 
-function actionTimeout(params: Record<string, unknown>, configuredMs: number): number {
+function hasValidInteractiveParams(method: string | undefined, params: Record<string, unknown>): boolean {
+  return method !== "item/tool/requestUserInput" || typeof params.isBlocking === "boolean";
+}
+
+function actionTimeout(method: string, params: Record<string, unknown>, configuredMs: number): number {
+  if (method === "item/tool/requestUserInput") return configuredMs;
   const automatic = params.autoResolutionMs;
   return typeof automatic === "number" && automatic > 0 ? Math.min(configuredMs, automatic) : configuredMs;
 }
