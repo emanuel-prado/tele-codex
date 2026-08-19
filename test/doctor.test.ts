@@ -23,7 +23,7 @@ describe("doctor", () => {
     expect(report.ok).toBe(true);
     expect(report.checks.find((check) => check.name === "tmux fallback")?.status).toBe("warn");
     expect(report.checks.find((check) => check.name === "Codex app-server")?.detail)
-      .toBe("installed codex 1.0.0; checked contract codex-cli 0.146.0");
+      .toBe("installed codex 1.0.0; checked contract codex-cli 0.148.0");
     expect(formatDoctorReport(report)).toContain("tele-codex doctor: ok");
   });
 
