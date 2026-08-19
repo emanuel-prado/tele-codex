@@ -14,6 +14,7 @@ import { Store } from "../src/store/store.js";
 import type { StoredSession } from "../src/store/store.js";
 import type { CodexEvent, PendingAction } from "../src/types/events.js";
 import type { TelegramCommandDefinition, TelegramRuntime } from "../src/telegram/bot-runtime.js";
+import { withPromptCallbackAck } from "../src/telegram/error-boundary.js";
 import { TelegramGateway } from "../src/telegram/gateway.js";
 
 interface ApiCall {
@@ -44,7 +45,10 @@ class FakeTelegramRuntime implements TelegramRuntime {
     }
   });
 
-  constructor() {
+  constructor(callbackAckDelayMs?: number) {
+    if (callbackAckDelayMs !== undefined) {
+      this.bot.use((ctx, next) => withPromptCallbackAck(ctx, next, { debug() {} } as never, callbackAckDelayMs));
+    }
     this.bot.api.config.use(async (_previous, method, payload) => {
       this.calls.push({ method, payload: payload as Record<string, unknown> });
       if (method === "sendDocument" && this.failDocumentDelivery) {
@@ -318,6 +322,100 @@ describe("TelegramGateway dispatch", () => {
     expect(bufferedChatIds(streamingGateway, activeSession.id)).toEqual([]);
   });
 
+  it("queues one durable combined startup recovery card and retries it without duplication", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000);
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "tele-codex-recovery-workspace-"));
+    const recoveryRuntime = new FakeTelegramRuntime();
+    const first = store.upsertSession({
+      id: "session_1", adapter: "appserver", label: "First thread", cwd: "/private/first", codexThreadId: "thread_1"
+    }, "detached");
+    const second = store.upsertSession({
+      id: "session_2", adapter: "appserver", label: "Second thread", cwd: "/private/second", codexThreadId: "thread_2"
+    }, "detached");
+    const action: PendingAction = {
+      id: "approval_1", kind: "commandApproval", sessionId: first.id, requestId: 1,
+      title: "Approval", body: "private command", payload: {}, expiresAt: Date.now() + 60_000
+    };
+    store.putPendingAction(action);
+    store.setTelegramMessage(action.id, 100, 777);
+    store.resolvePendingAction(action.id, "orphaned");
+    store.setRuntimeValue("startup_recovery", {
+      id: "recovery_test",
+      activeThreadIds: [first.id, second.id],
+      orphanedActionIds: [action.id],
+      createdAt: Date.now()
+    });
+    const recoverySessions = {
+      ...sessions,
+      listSessions: () => [first, second],
+      getLastActiveSessionId: () => first.id
+    } as unknown as SessionManager;
+    const config = { ...testConfig(), workspaceRoot, allowedChatIds: new Set([100]) };
+    const recoveryGateway = new TelegramGateway(
+      config, recoverySessions, store, new PolicyEngine(config),
+      pino({ level: "silent" }), undefined, recoveryRuntime
+    );
+
+    await sendStartupPicker(recoveryGateway);
+
+    const [queued] = store.dueOutbox();
+    expect(queued).toMatchObject({ eventKey: "startup-recovery:recovery_test", chatId: 100 });
+    expect(queued?.payload.text).toMatch(/outcome.*unknown/i);
+    expect(queued?.payload.text).toContain("First thread (session_1)");
+    expect(queued?.payload.text).toContain("Second thread (session_2)");
+    expect(queued?.payload.text).toMatch(/1 previous pending request.*orphaned/i);
+    expect(queued?.payload.text).not.toContain("/private/");
+    expect(store.getStartupRecovery()).toBeUndefined();
+    expect(recoveryRuntime.calls).toContainEqual(expect.objectContaining({
+      method: "editMessageText",
+      payload: expect.objectContaining({ message_id: 777, text: expect.stringMatching(/invalidated.*restarted/i) })
+    }));
+
+    recoveryRuntime.messageFailures.set(100, { remaining: 1, description: "Telegram unavailable" });
+    await drainOutbox(recoveryGateway);
+    expect(store.outboxCounts()).toEqual({ pending: 1, failed: 0 });
+
+    await sendStartupPicker(recoveryGateway);
+    expect(store.outboxCounts()).toEqual({ pending: 1, failed: 0 });
+
+    await vi.advanceTimersByTimeAsync(2_000);
+    await drainOutbox(recoveryGateway);
+    expect(store.outboxCounts()).toEqual({ pending: 0, failed: 0 });
+    const deliveryAttempts = sentTexts(recoveryRuntime).filter((text) => text.includes("outcome is unknown"));
+    expect(deliveryAttempts).toHaveLength(2);
+    expect(new Set(deliveryAttempts).size).toBe(1);
+  });
+
+  it("renders approval-only startup recovery without claiming an Active Turn was lost", async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "tele-codex-approval-recovery-"));
+    const session = store.upsertSession({
+      id: "session_1", adapter: "appserver", label: "Approval thread", codexThreadId: "thread_1"
+    }, "detached");
+    store.setRuntimeValue("startup_recovery", {
+      id: "recovery_approval",
+      activeThreadIds: [],
+      orphanedActionIds: ["approval_1"],
+      createdAt: Date.now()
+    });
+    const approvalSessions = {
+      ...sessions,
+      listSessions: () => [session],
+      getLastActiveSessionId: () => session.id
+    } as unknown as SessionManager;
+    const config = { ...testConfig(), workspaceRoot };
+    const approvalGateway = new TelegramGateway(
+      config, approvalSessions, store, new PolicyEngine(config),
+      pino({ level: "silent" }), undefined, runtime
+    );
+
+    await sendStartupPicker(approvalGateway);
+
+    const [queued] = store.dueOutbox();
+    expect(queued?.payload.text).toMatch(/1 previous pending request.*orphaned/i);
+    expect(queued?.payload.text).not.toMatch(/Active Turn outcome is unknown/i);
+  });
+
   it("responds to unknown slash commands", async () => {
     await runtime.bot.handleUpdate(messageUpdate("/tmux", nextUpdateId()));
     expect(sentTexts(runtime)).toContain("Unknown command. Run /help to see supported commands.");
@@ -362,6 +460,83 @@ describe("TelegramGateway dispatch", () => {
   it("does not expose raw approval commands", async () => {
     await runtime.bot.handleUpdate(messageUpdate("/approve action_1", nextUpdateId()));
     expect(sentTexts(runtime)).toContain("Unknown command. Run /help to see supported commands.");
+  });
+
+  it("uses the approval card as the only persistent waiting status", async () => {
+    let submissions = 0;
+    const approvalRuntime = new FakeTelegramRuntime();
+    const approvalSessions = {
+      ...sessions,
+      respondAction: async () => { submissions += 1; }
+    } as unknown as SessionManager;
+    const approvalGateway = new TelegramGateway(
+      testConfig(), approvalSessions, store, new PolicyEngine(testConfig()),
+      pino({ level: "silent" }), undefined, approvalRuntime
+    );
+    const action = approvalAction();
+    store.upsertSession({
+      id: action.sessionId, adapter: "appserver", label: "one", codexThreadId: "thread_1"
+    }, "active");
+    store.rememberSessionChat(action.sessionId, 100);
+    store.putPendingAction(action);
+    await deliverApproval(approvalGateway, action);
+    const control = callbackData(approvalRuntime, "Approve");
+    approvalRuntime.calls.length = 0;
+
+    await approvalRuntime.bot.handleUpdate(callbackUpdate(control, nextUpdateId()));
+    await approvalRuntime.bot.handleUpdate(callbackUpdate(control, nextUpdateId()));
+
+    expect(submissions).toBe(1);
+    expect(sentTexts(approvalRuntime)).toEqual([]);
+    expect(editedTexts(approvalRuntime)).toContain("Decision submitted; waiting for Codex confirmation.");
+    expect(callbackAnswers(approvalRuntime).at(-1)?.text).toMatch(/already used/i);
+    const waitingEdit = approvalRuntime.calls.find((call) =>
+      call.method === "editMessageText" && call.payload.text === "Decision submitted; waiting for Codex confirmation."
+    );
+    expect(waitingEdit?.payload.reply_markup).toEqual({ inline_keyboard: [] });
+
+    await handleCodexEvent(approvalGateway, { type: "actionResolved", sessionId: action.sessionId, actionId: action.id });
+    expect(editedTexts(approvalRuntime).at(-1)).toBe("Codex confirmed the response.");
+    const confirmedEdit = approvalRuntime.calls.filter((call) => call.method === "editMessageText").at(-1);
+    expect(confirmedEdit?.payload.message_id).toBe(waitingEdit?.payload.message_id);
+  });
+
+  it("does not create a second waiting message after automatic slow callback acknowledgement", async () => {
+    vi.useFakeTimers();
+    const slowRuntime = new FakeTelegramRuntime(100);
+    const submission = deferred();
+    const started = deferred();
+    const slowSessions = {
+      ...sessions,
+      respondAction: async () => {
+        started.resolve();
+        await submission.promise;
+      }
+    } as unknown as SessionManager;
+    const slowGateway = new TelegramGateway(
+      testConfig(), slowSessions, store, new PolicyEngine(testConfig()),
+      pino({ level: "silent" }), undefined, slowRuntime
+    );
+    const action = approvalAction();
+    store.upsertSession({
+      id: action.sessionId, adapter: "appserver", label: "one", codexThreadId: "thread_1"
+    }, "active");
+    store.rememberSessionChat(action.sessionId, 100);
+    store.putPendingAction(action);
+    await deliverApproval(slowGateway, action);
+    const control = callbackData(slowRuntime, "Approve");
+    slowRuntime.calls.length = 0;
+
+    const running = slowRuntime.bot.handleUpdate(callbackUpdate(control, nextUpdateId()));
+    await started.promise;
+    await vi.advanceTimersByTimeAsync(100);
+    expect(callbackAnswers(slowRuntime)).toEqual([expect.objectContaining({ text: "Working..." })]);
+
+    submission.resolve();
+    await running;
+
+    expect(sentTexts(slowRuntime)).toEqual([]);
+    expect(editedTexts(slowRuntime)).toEqual(["Decision submitted; waiting for Codex confirmation."]);
   });
 
   it("rejects stale destructive controls and applies a valid confirmation once", async () => {
@@ -478,6 +653,12 @@ function sentTexts(runtime: FakeTelegramRuntime): string[] {
     .map((call) => String(call.payload.text));
 }
 
+function editedTexts(runtime: FakeTelegramRuntime): string[] {
+  return runtime.calls
+    .filter((call) => call.method === "editMessageText")
+    .map((call) => String(call.payload.text));
+}
+
 function sentMessageChatIds(runtime: FakeTelegramRuntime): number[] {
   return runtime.calls
     .filter((call) => call.method === "sendMessage")
@@ -491,13 +672,30 @@ function sentMessageId(runtime: FakeTelegramRuntime, chatId: number): number {
 }
 
 async function deliverAgentText(gateway: TelegramGateway, sessionId: string, text: string): Promise<void> {
-  await (gateway as unknown as { handleCodexEvent(event: CodexEvent): Promise<void> }).handleCodexEvent({
+  await handleCodexEvent(gateway, {
     type: "agentMessage", sessionId, turnId: "turn_1", itemId: "item_1", text
   });
 }
 
+async function deliverApproval(gateway: TelegramGateway, action: PendingAction): Promise<void> {
+  await handleCodexEvent(gateway, { type: "approvalRequested", sessionId: action.sessionId, action });
+  await (gateway as unknown as { drainOutbox(): Promise<void> }).drainOutbox();
+}
+
+async function handleCodexEvent(gateway: TelegramGateway, event: CodexEvent): Promise<void> {
+  await (gateway as unknown as { handleCodexEvent(event: CodexEvent): Promise<void> }).handleCodexEvent(event);
+}
+
 async function flushAgentText(gateway: TelegramGateway, sessionId: string): Promise<void> {
   await (gateway as unknown as { flushAgentMessage(id: string): Promise<void> }).flushAgentMessage(sessionId);
+}
+
+async function sendStartupPicker(gateway: TelegramGateway): Promise<void> {
+  await (gateway as unknown as { sendStartupPicker(): Promise<void> }).sendStartupPicker();
+}
+
+async function drainOutbox(gateway: TelegramGateway): Promise<void> {
+  await (gateway as unknown as { drainOutbox(): Promise<void> }).drainOutbox();
 }
 
 function bufferedChatIds(gateway: TelegramGateway, sessionId: string): number[] {
@@ -544,4 +742,24 @@ function testConfig(): AppConfig {
     codexCommand: "codex",
     workspaceRoot: "/tmp"
   };
+}
+
+function approvalAction(): PendingAction {
+  return {
+    id: "approval_1",
+    kind: "commandApproval",
+    sessionId: "session_1",
+    requestId: 1,
+    connectionGeneration: 1,
+    title: "Approval",
+    body: "run true",
+    payload: { method: "item/commandExecution/requestApproval", params: {} },
+    expiresAt: Date.now() + 60_000
+  };
+}
+
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => { resolve = done; });
+  return { promise, resolve };
 }

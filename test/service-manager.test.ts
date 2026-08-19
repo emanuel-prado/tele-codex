@@ -10,7 +10,21 @@ describe("ServiceManager", () => {
     expect(unit).toContain("Restart=on-failure");
     expect(unit).toContain("KillMode=control-group");
     expect(unit).toContain("UMask=0077");
+    expect(unit).toContain("WorkingDirectory=/work/repo");
+    expect(unit).not.toContain('WorkingDirectory="/work/repo"');
     expect(unit).toContain("--env-file \"/work/repo/.env\"");
+  });
+
+  it("escapes a WorkingDirectory value without wrapping the directive in quotes", () => {
+    const unit = renderUnit({
+      cwd: "/work/tele codex%preview",
+      nodePath: "/usr/bin/node",
+      cliPath: "/work/repo/dist/cli.js",
+      envFile: "/work/repo/.env"
+    });
+
+    expect(unit).toContain("WorkingDirectory=/work/tele\\x20codex%%preview");
+    expect(unit).toContain('ExecStart="/usr/bin/node" "/work/repo/dist/cli.js" --env-file "/work/repo/.env"');
   });
 
   it("installs and enables the user service", async () => {

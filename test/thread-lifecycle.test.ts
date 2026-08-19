@@ -7,6 +7,14 @@ import { Store } from "../src/store/store.js";
 import type { PendingAction } from "../src/types/events.js";
 
 describe("Codex thread persistence", () => {
+  it("does not create startup recovery when no Active Turn existed", () => {
+    const store = new Store(":memory:");
+    store.upsertSession({ id: "session_1", adapter: "appserver", label: "one", codexThreadId: "thread_1" }, "idle");
+
+    expect(store.getStartupRecovery()).toBeUndefined();
+    store.close();
+  });
+
   it("migrates duplicate legacy sessions to the newest stable thread identity", async () => {
     const dir = await mkdtemp(join(tmpdir(), "tele-codex-thread-migration-"));
     const path = join(dir, "state.db");
@@ -78,6 +86,53 @@ describe("Codex thread persistence", () => {
     const restarted = new Store(path);
     expect(restarted.getSession(session.id)).toMatchObject({ status: "detached" });
     expect(restarted.getSession(session.id)?.activeTurnId).toBeUndefined();
+    const recovery = restarted.getRuntimeValue<{
+      id: string;
+      activeThreadIds: string[];
+      orphanedActionIds: string[];
+    }>("startup_recovery");
+    expect(recovery).toMatchObject({
+      id: expect.stringMatching(/^recovery_/),
+      activeThreadIds: [session.id],
+      orphanedActionIds: []
+    });
+    restarted.close();
+
+    const repeated = new Store(path);
+    expect(repeated.getRuntimeValue("startup_recovery")).toEqual(recovery);
+    repeated.close();
+  });
+
+  it("captures every recoverable Active Turn in one startup recovery fact", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "tele-codex-multi-turn-restart-"));
+    const path = join(dir, "state.db");
+    const initial = new Store(path);
+    const first = initial.upsertSession({ id: "session_1", adapter: "appserver", label: "one", codexThreadId: "thread_1" }, "idle");
+    const second = initial.upsertSession({ id: "session_2", adapter: "appserver", label: "two", codexThreadId: "thread_2" }, "idle");
+    initial.setActiveTurn(first.id, "turn_1");
+    initial.setActiveTurn(second.id, "turn_2");
+    initial.close();
+
+    const restarted = new Store(path);
+
+    expect(restarted.getStartupRecovery()?.activeThreadIds).toEqual([first.id, second.id]);
+    expect(restarted.listSessions().map((session) => session.status)).toEqual(["detached", "detached"]);
+    restarted.close();
+  });
+
+  it("preserves orphaned interaction recovery recorded by the previous runtime format", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "tele-codex-legacy-recovery-"));
+    const path = join(dir, "state.db");
+    const initial = new Store(path);
+    initial.setRuntimeValue("startup_orphaned_actions", 1);
+    initial.setRuntimeValue("startup_orphaned_action_ids", ["approval_1"]);
+    initial.close();
+
+    const restarted = new Store(path);
+
+    expect(restarted.getStartupRecovery()?.orphanedActionIds).toEqual(["approval_1"]);
+    expect(restarted.getRuntimeValue("startup_orphaned_actions")).toBeUndefined();
+    expect(restarted.getRuntimeValue("startup_orphaned_action_ids")).toBeUndefined();
     restarted.close();
   });
 });

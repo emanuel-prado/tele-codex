@@ -8,6 +8,77 @@ import { FakeAppServer } from "./support/fake-app-server.js";
 afterEach(() => vi.useRealTimers());
 
 describe("app-server lifecycle scenarios", () => {
+  it("rejects a user-input request without explicit blocking semantics", async () => {
+    const scenario = createScenario();
+    scenario.server.respondTo("thread/start", { thread: { id: "thread-a" } });
+    await scenario.adapter.start({ cwd: "/tmp" });
+
+    scenario.server.serverRequest(40, "item/tool/requestUserInput", {
+      threadId: "thread-a",
+      turnId: "turn-a",
+      itemId: "item-a",
+      questions: [{ id: "choice", header: "Choice", question: "Continue?", options: [] }]
+    });
+    const [event] = await takeEvents(scenario.adapter.events(), 1);
+
+    expect(event, scenario.server.formatTrace()).toMatchObject({
+      type: "error",
+      sessionId: expect.any(String),
+      message: expect.stringContaining("isBlocking")
+    });
+    expect(scenario.store.listPendingActions()).toEqual([]);
+    expect(scenario.server.trace.some((entry) => "id" in entry.message && entry.message.id === 40 && "error" in entry.message))
+      .toBe(true);
+    scenario.close();
+  });
+
+  it("uses isBlocking for user-input semantics without deriving expiry from deprecated autoResolutionMs", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000);
+    const scenario = createScenario();
+    scenario.server.respondTo("thread/start", { thread: { id: "thread-a" } });
+    await scenario.adapter.start({ cwd: "/tmp" });
+    const question = [{ id: "choice", header: "Choice", question: "Continue?", options: [] }];
+
+    scenario.server.serverRequest(40, "item/tool/requestUserInput", {
+      threadId: "thread-a", turnId: "turn-a", itemId: "item-a", questions: question,
+      isBlocking: true, autoResolutionMs: 1
+    });
+    scenario.server.serverRequest(41, "item/tool/requestUserInput", {
+      threadId: "thread-a", turnId: "turn-a", itemId: "item-b", questions: question,
+      isBlocking: false, autoResolutionMs: 1
+    });
+    const events = await takeEvents(scenario.adapter.events(), 2);
+
+    expect(events.map((event) => event.type), scenario.server.formatTrace()).toEqual(["questionAsked", "questionAsked"]);
+    const actions = events.map((event) => event.type === "questionAsked" ? event.action : undefined);
+    expect(actions[0]?.payload).toMatchObject({ params: { isBlocking: true } });
+    expect(actions[1]?.payload).toMatchObject({ params: { isBlocking: false } });
+    expect(actions[0]?.body).not.toContain("may continue");
+    expect(actions[1]?.body).toContain("Codex may continue and resolve this request before you answer.");
+    expect(actions.map((action) => action?.expiresAt)).toEqual([61_000, 61_000]);
+    scenario.close();
+  });
+
+  it("resolves a non-blocking question when Codex wins the response race", async () => {
+    const scenario = createScenario();
+    scenario.server.respondTo("thread/start", { thread: { id: "thread-a" } });
+    await scenario.adapter.start({ cwd: "/tmp" });
+    scenario.server.serverRequest(40, "item/tool/requestUserInput", {
+      threadId: "thread-a", turnId: "turn-a", itemId: "item-a", isBlocking: false,
+      questions: [{ id: "choice", header: "Choice", question: "Continue?", options: [] }]
+    });
+    const [asked] = await takeEvents(scenario.adapter.events(), 1);
+    if (asked?.type !== "questionAsked") throw new Error(scenario.server.formatTrace());
+
+    scenario.server.notification("serverRequest/resolved", { threadId: "thread-a", requestId: 40 });
+    const [resolved] = await takeEvents(scenario.adapter.events(), 1);
+
+    expect(resolved, scenario.server.formatTrace()).toMatchObject({ type: "actionResolved", actionId: asked.action.id });
+    expect(scenario.store.getPendingAction(asked.action.id)?.status).toBe("resolved");
+    scenario.close();
+  });
+
   it("starts a thread, completes a turn, and confirms an approval", async () => {
     const scenario = createScenario();
     scenario.server.respondTo("thread/start", { thread: { id: "thread-a" }, model: "gpt-test" });

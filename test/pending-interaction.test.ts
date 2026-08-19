@@ -90,6 +90,27 @@ describe("PendingInteractionManager", () => {
     store.close();
   });
 
+  it("rejects a late question callback after Codex resolves a non-blocking request", async () => {
+    const store = new Store(":memory:");
+    const action = questionAction();
+    action.payload = {
+      method: "item/tool/requestUserInput",
+      params: { ...(action.payload as { params: object }).params, isBlocking: false }
+    };
+    store.putPendingAction(action);
+    const manager = new PendingInteractionManager(store, true);
+    const token = callback(manager.actionView(action, 10, 20));
+    store.resolvePendingAction(action.id, "resolved");
+    let submitted = false;
+
+    expect(await manager.handleCallback(token, { chatId: 10, userId: 20 }, async () => { submitted = true; })).toEqual({
+      kind: "notice",
+      text: "This request is no longer pending."
+    });
+    expect(submitted).toBe(false);
+    store.close();
+  });
+
   it("keeps MCP labels separate from typed protocol values for every supported field shape", async () => {
     const store = new Store(":memory:");
     const action = elicitationAction();
