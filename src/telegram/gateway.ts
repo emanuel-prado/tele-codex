@@ -696,9 +696,8 @@ export class TelegramGateway {
           return;
         }
         if (result.kind === "submit") {
-          await this.clearActionKeyboards(result.decision.actionId);
-          await ctx.answerCallbackQuery({ text: result.text });
-          await ctx.editMessageText(result.text);
+          await ctx.answerCallbackQuery();
+          await this.finalizeActionMessages(result.decision.actionId, result.text);
           return;
         }
         await ctx.answerCallbackQuery();

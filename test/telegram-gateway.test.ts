@@ -15,6 +15,7 @@ import { Store } from "../src/store/store.js";
 import type { StoredSession } from "../src/store/store.js";
 import type { CodexEvent, PendingAction } from "../src/types/events.js";
 import type { TelegramCommandDefinition, TelegramRuntime } from "../src/telegram/bot-runtime.js";
+import { withPromptCallbackAck } from "../src/telegram/error-boundary.js";
 import { TelegramGateway } from "../src/telegram/gateway.js";
 
 interface ApiCall {
@@ -45,7 +46,10 @@ class FakeTelegramRuntime implements TelegramRuntime {
     }
   });
 
-  constructor() {
+  constructor(callbackAckDelayMs?: number) {
+    if (callbackAckDelayMs !== undefined) {
+      this.bot.use((ctx, next) => withPromptCallbackAck(ctx, next, { debug() {} } as never, callbackAckDelayMs));
+    }
     this.bot.api.config.use(async (_previous, method, payload) => {
       this.calls.push({ method, payload: payload as Record<string, unknown> });
       if (method === "sendDocument" && this.failDocumentDelivery) {
@@ -366,6 +370,83 @@ describe("TelegramGateway dispatch", () => {
     expect(sentTexts(runtime)).toContain("Unknown command. Run /help to see supported commands.");
   });
 
+  it("uses the approval card as the only persistent waiting status", async () => {
+    let submissions = 0;
+    const approvalRuntime = new FakeTelegramRuntime();
+    const approvalSessions = {
+      ...sessions,
+      respondAction: async () => { submissions += 1; }
+    } as unknown as SessionManager;
+    const approvalGateway = new TelegramGateway(
+      testConfig(), approvalSessions, {} as LegacyTmuxBridge, store, new PolicyEngine(testConfig()),
+      pino({ level: "silent" }), undefined, approvalRuntime
+    );
+    const action = approvalAction();
+    store.upsertSession({
+      id: action.sessionId, adapter: "appserver", label: "one", codexThreadId: "thread_1"
+    }, "active");
+    store.rememberSessionChat(action.sessionId, 100);
+    store.putPendingAction(action);
+    await deliverApproval(approvalGateway, action);
+    const control = callbackData(approvalRuntime, "Approve");
+    approvalRuntime.calls.length = 0;
+
+    await approvalRuntime.bot.handleUpdate(callbackUpdate(control, nextUpdateId()));
+    await approvalRuntime.bot.handleUpdate(callbackUpdate(control, nextUpdateId()));
+
+    expect(submissions).toBe(1);
+    expect(sentTexts(approvalRuntime)).toEqual([]);
+    expect(editedTexts(approvalRuntime)).toContain("Decision submitted; waiting for Codex confirmation.");
+    expect(callbackAnswers(approvalRuntime).at(-1)?.text).toMatch(/already used/i);
+    const waitingEdit = approvalRuntime.calls.find((call) =>
+      call.method === "editMessageText" && call.payload.text === "Decision submitted; waiting for Codex confirmation."
+    );
+    expect(waitingEdit?.payload.reply_markup).toEqual({ inline_keyboard: [] });
+
+    await handleCodexEvent(approvalGateway, { type: "actionResolved", sessionId: action.sessionId, actionId: action.id });
+    expect(editedTexts(approvalRuntime).at(-1)).toBe("Codex confirmed the response.");
+    const confirmedEdit = approvalRuntime.calls.filter((call) => call.method === "editMessageText").at(-1);
+    expect(confirmedEdit?.payload.message_id).toBe(waitingEdit?.payload.message_id);
+  });
+
+  it("does not create a second waiting message after automatic slow callback acknowledgement", async () => {
+    vi.useFakeTimers();
+    const slowRuntime = new FakeTelegramRuntime(100);
+    const submission = deferred();
+    const started = deferred();
+    const slowSessions = {
+      ...sessions,
+      respondAction: async () => {
+        started.resolve();
+        await submission.promise;
+      }
+    } as unknown as SessionManager;
+    const slowGateway = new TelegramGateway(
+      testConfig(), slowSessions, {} as LegacyTmuxBridge, store, new PolicyEngine(testConfig()),
+      pino({ level: "silent" }), undefined, slowRuntime
+    );
+    const action = approvalAction();
+    store.upsertSession({
+      id: action.sessionId, adapter: "appserver", label: "one", codexThreadId: "thread_1"
+    }, "active");
+    store.rememberSessionChat(action.sessionId, 100);
+    store.putPendingAction(action);
+    await deliverApproval(slowGateway, action);
+    const control = callbackData(slowRuntime, "Approve");
+    slowRuntime.calls.length = 0;
+
+    const running = slowRuntime.bot.handleUpdate(callbackUpdate(control, nextUpdateId()));
+    await started.promise;
+    await vi.advanceTimersByTimeAsync(100);
+    expect(callbackAnswers(slowRuntime)).toEqual([expect.objectContaining({ text: "Working..." })]);
+
+    submission.resolve();
+    await running;
+
+    expect(sentTexts(slowRuntime)).toEqual([]);
+    expect(editedTexts(slowRuntime)).toEqual(["Decision submitted; waiting for Codex confirmation."]);
+  });
+
   it("rejects stale destructive controls and applies a valid confirmation once", async () => {
     activeSession = store.upsertSession({
       id: "session_1", adapter: "appserver", label: "one", codexThreadId: "thread_1"
@@ -480,6 +561,12 @@ function sentTexts(runtime: FakeTelegramRuntime): string[] {
     .map((call) => String(call.payload.text));
 }
 
+function editedTexts(runtime: FakeTelegramRuntime): string[] {
+  return runtime.calls
+    .filter((call) => call.method === "editMessageText")
+    .map((call) => String(call.payload.text));
+}
+
 function sentMessageChatIds(runtime: FakeTelegramRuntime): number[] {
   return runtime.calls
     .filter((call) => call.method === "sendMessage")
@@ -493,9 +580,18 @@ function sentMessageId(runtime: FakeTelegramRuntime, chatId: number): number {
 }
 
 async function deliverAgentText(gateway: TelegramGateway, sessionId: string, text: string): Promise<void> {
-  await (gateway as unknown as { handleCodexEvent(event: CodexEvent): Promise<void> }).handleCodexEvent({
+  await handleCodexEvent(gateway, {
     type: "agentMessage", sessionId, turnId: "turn_1", itemId: "item_1", text
   });
+}
+
+async function deliverApproval(gateway: TelegramGateway, action: PendingAction): Promise<void> {
+  await handleCodexEvent(gateway, { type: "approvalRequested", sessionId: action.sessionId, action });
+  await (gateway as unknown as { drainOutbox(): Promise<void> }).drainOutbox();
+}
+
+async function handleCodexEvent(gateway: TelegramGateway, event: CodexEvent): Promise<void> {
+  await (gateway as unknown as { handleCodexEvent(event: CodexEvent): Promise<void> }).handleCodexEvent(event);
 }
 
 async function flushAgentText(gateway: TelegramGateway, sessionId: string): Promise<void> {
@@ -548,4 +644,24 @@ function testConfig(): AppConfig {
     tmuxPasteSettleMs: 0,
     workspaceRoot: "/tmp"
   };
+}
+
+function approvalAction(): PendingAction {
+  return {
+    id: "approval_1",
+    kind: "commandApproval",
+    sessionId: "session_1",
+    requestId: 1,
+    connectionGeneration: 1,
+    title: "Approval",
+    body: "run true",
+    payload: { method: "item/commandExecution/requestApproval", params: {} },
+    expiresAt: Date.now() + 60_000
+  };
+}
+
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => { resolve = done; });
+  return { promise, resolve };
 }
