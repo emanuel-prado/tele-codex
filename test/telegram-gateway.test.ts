@@ -324,6 +324,100 @@ describe("TelegramGateway dispatch", () => {
     expect(bufferedChatIds(streamingGateway, activeSession.id)).toEqual([]);
   });
 
+  it("queues one durable combined startup recovery card and retries it without duplication", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000);
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "tele-codex-recovery-workspace-"));
+    const recoveryRuntime = new FakeTelegramRuntime();
+    const first = store.upsertSession({
+      id: "session_1", adapter: "appserver", label: "First thread", cwd: "/private/first", codexThreadId: "thread_1"
+    }, "detached");
+    const second = store.upsertSession({
+      id: "session_2", adapter: "appserver", label: "Second thread", cwd: "/private/second", codexThreadId: "thread_2"
+    }, "detached");
+    const action: PendingAction = {
+      id: "approval_1", kind: "commandApproval", sessionId: first.id, requestId: 1,
+      title: "Approval", body: "private command", payload: {}, expiresAt: Date.now() + 60_000
+    };
+    store.putPendingAction(action);
+    store.setTelegramMessage(action.id, 100, 777);
+    store.resolvePendingAction(action.id, "orphaned");
+    store.setRuntimeValue("startup_recovery", {
+      id: "recovery_test",
+      activeThreadIds: [first.id, second.id],
+      orphanedActionIds: [action.id],
+      createdAt: Date.now()
+    });
+    const recoverySessions = {
+      ...sessions,
+      listSessions: () => [first, second],
+      getLastActiveSessionId: () => first.id
+    } as unknown as SessionManager;
+    const config = { ...testConfig(), workspaceRoot, allowedChatIds: new Set([100]) };
+    const recoveryGateway = new TelegramGateway(
+      config, recoverySessions, {} as LegacyTmuxBridge, store, new PolicyEngine(config),
+      pino({ level: "silent" }), undefined, recoveryRuntime
+    );
+
+    await sendStartupPicker(recoveryGateway);
+
+    const [queued] = store.dueOutbox();
+    expect(queued).toMatchObject({ eventKey: "startup-recovery:recovery_test", chatId: 100 });
+    expect(queued?.payload.text).toMatch(/outcome.*unknown/i);
+    expect(queued?.payload.text).toContain("First thread (session_1)");
+    expect(queued?.payload.text).toContain("Second thread (session_2)");
+    expect(queued?.payload.text).toMatch(/1 previous pending request.*orphaned/i);
+    expect(queued?.payload.text).not.toContain("/private/");
+    expect(store.getStartupRecovery()).toBeUndefined();
+    expect(recoveryRuntime.calls).toContainEqual(expect.objectContaining({
+      method: "editMessageText",
+      payload: expect.objectContaining({ message_id: 777, text: expect.stringMatching(/invalidated.*restarted/i) })
+    }));
+
+    recoveryRuntime.messageFailures.set(100, { remaining: 1, description: "Telegram unavailable" });
+    await drainOutbox(recoveryGateway);
+    expect(store.outboxCounts()).toEqual({ pending: 1, failed: 0 });
+
+    await sendStartupPicker(recoveryGateway);
+    expect(store.outboxCounts()).toEqual({ pending: 1, failed: 0 });
+
+    await vi.advanceTimersByTimeAsync(2_000);
+    await drainOutbox(recoveryGateway);
+    expect(store.outboxCounts()).toEqual({ pending: 0, failed: 0 });
+    const deliveryAttempts = sentTexts(recoveryRuntime).filter((text) => text.includes("outcome is unknown"));
+    expect(deliveryAttempts).toHaveLength(2);
+    expect(new Set(deliveryAttempts).size).toBe(1);
+  });
+
+  it("renders approval-only startup recovery without claiming an Active Turn was lost", async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "tele-codex-approval-recovery-"));
+    const session = store.upsertSession({
+      id: "session_1", adapter: "appserver", label: "Approval thread", codexThreadId: "thread_1"
+    }, "detached");
+    store.setRuntimeValue("startup_recovery", {
+      id: "recovery_approval",
+      activeThreadIds: [],
+      orphanedActionIds: ["approval_1"],
+      createdAt: Date.now()
+    });
+    const approvalSessions = {
+      ...sessions,
+      listSessions: () => [session],
+      getLastActiveSessionId: () => session.id
+    } as unknown as SessionManager;
+    const config = { ...testConfig(), workspaceRoot };
+    const approvalGateway = new TelegramGateway(
+      config, approvalSessions, {} as LegacyTmuxBridge, store, new PolicyEngine(config),
+      pino({ level: "silent" }), undefined, runtime
+    );
+
+    await sendStartupPicker(approvalGateway);
+
+    const [queued] = store.dueOutbox();
+    expect(queued?.payload.text).toMatch(/1 previous pending request.*orphaned/i);
+    expect(queued?.payload.text).not.toMatch(/Active Turn outcome is unknown/i);
+  });
+
   it("responds to unknown slash commands", async () => {
     await runtime.bot.handleUpdate(messageUpdate("/doesnotexist", nextUpdateId()));
     expect(sentTexts(runtime)).toContain("Unknown command. Run /help to see supported commands.");
@@ -596,6 +690,14 @@ async function handleCodexEvent(gateway: TelegramGateway, event: CodexEvent): Pr
 
 async function flushAgentText(gateway: TelegramGateway, sessionId: string): Promise<void> {
   await (gateway as unknown as { flushAgentMessage(id: string): Promise<void> }).flushAgentMessage(sessionId);
+}
+
+async function sendStartupPicker(gateway: TelegramGateway): Promise<void> {
+  await (gateway as unknown as { sendStartupPicker(): Promise<void> }).sendStartupPicker();
+}
+
+async function drainOutbox(gateway: TelegramGateway): Promise<void> {
+  await (gateway as unknown as { drainOutbox(): Promise<void> }).drainOutbox();
 }
 
 function bufferedChatIds(gateway: TelegramGateway, sessionId: string): number[] {

@@ -4,6 +4,7 @@ import type { RateLimitSummary, SessionProgress, SessionTokenUsage, ThreadGoalSu
 import type { LogEntry, PendingAction, SessionRef, SessionStatus } from "../types/events.js";
 import type { LegacyTmuxAttachment, LegacyTmuxInputStatus, LegacyTmuxObservation, LegacyTmuxStatus } from "../types/legacy-tmux.js";
 import { sanitizeDiagnosticText } from "../runtime/diagnostics.js";
+import { createId } from "../utils/ids.js";
 import { migrateDatabase, schemaVersion } from "./migrations.js";
 import {
   InteractionRepository,
@@ -68,6 +69,18 @@ export interface OutboxMessage {
     keyboard?: unknown[][];
   };
   attempts: number;
+}
+
+export interface StartupRecovery {
+  id: string;
+  activeThreadIds: string[];
+  orphanedActionIds: string[];
+  createdAt: number;
+}
+
+export interface StartupRecoveryDelivery {
+  chatId: number;
+  payload: OutboxMessage["payload"];
 }
 
 export interface StoredSession extends SessionRef {
@@ -510,6 +523,18 @@ export class Store {
     return rows.length;
   }
 
+  orphanOpenActionsForStartup(): number {
+    return this.db.transaction(() => {
+      const rows = this.db
+        .prepare("select id from pending_actions where status in ('pending', 'submitting', 'failed') order by id")
+        .all() as Array<{ id: string }>;
+      if (rows.length === 0) return 0;
+      this.mergeStartupRecovery({ orphanedActionIds: rows.map((row) => row.id) });
+      for (const row of rows) this.scrubTerminalAction(row.id, "orphaned");
+      return rows.length;
+    })();
+  }
+
   listOpenActions(connectionGeneration?: number): StoredPendingAction[] {
     const rows = connectionGeneration === undefined
       ? this.db
@@ -773,6 +798,29 @@ export class Store {
     return this.notifications.retryFailed();
   }
 
+  getStartupRecovery(): StartupRecovery | undefined {
+    return this.runtimeState.get<StartupRecovery>("startup_recovery");
+  }
+
+  queueStartupRecovery(recoveryId: string, deliveries: StartupRecoveryDelivery[]): boolean {
+    return this.db.transaction(() => {
+      const recovery = this.getStartupRecovery();
+      if (!recovery || recovery.id !== recoveryId) return false;
+      for (const delivery of deliveries) {
+        this.notifications.enqueue(`startup-recovery:${recovery.id}`, delivery.chatId, delivery.payload);
+      }
+      this.runtimeState.delete("startup_recovery");
+      return true;
+    })();
+  }
+
+  hasOutstandingStartupRecovery(): boolean {
+    return Boolean(this.db.prepare(
+      `select 1 from notification_outbox
+       where event_key like 'startup-recovery:%' and status in ('pending', 'failed') limit 1`
+    ).get());
+  }
+
   setTelegramMessage(actionId: string, chatId: number, messageId: number): void {
     this.db.transaction(() => {
       this.db
@@ -938,11 +986,39 @@ export class Store {
   private reconcilePersistedAppServerRuntime(): void {
     const now = Date.now();
     this.db.transaction(() => {
+      const legacyOrphanedActionIds = this.runtimeState.get<string[]>("startup_orphaned_action_ids") ?? [];
+      if (legacyOrphanedActionIds.length > 0) {
+        this.mergeStartupRecovery({ orphanedActionIds: legacyOrphanedActionIds });
+      }
+      this.runtimeState.delete("startup_orphaned_actions");
+      this.runtimeState.delete("startup_orphaned_action_ids");
+      const activeThreadIds = (this.db.prepare(
+        `select v.thread_id as id from active_turns v
+         join codex_threads t on t.id = v.thread_id
+         where t.lifecycle_status != 'archived'
+         order by v.thread_id`
+      ).all() as Array<{ id: string }>).map((row) => row.id);
+      if (activeThreadIds.length > 0) this.mergeStartupRecovery({ activeThreadIds });
       this.db.prepare("delete from active_turns").run();
       this.db.prepare(
         "update appserver_attachments set status = 'detached', connection_generation = null, updated_at = ? where status != 'detached' or connection_generation is not null"
       ).run(now);
     })();
+  }
+
+  private mergeStartupRecovery(input: {
+    activeThreadIds?: string[];
+    orphanedActionIds?: string[];
+  }): StartupRecovery {
+    const existing = this.getStartupRecovery();
+    const recovery: StartupRecovery = {
+      id: existing?.id ?? createId("recovery"),
+      activeThreadIds: [...new Set([...(existing?.activeThreadIds ?? []), ...(input.activeThreadIds ?? [])])].sort(),
+      orphanedActionIds: [...new Set([...(existing?.orphanedActionIds ?? []), ...(input.orphanedActionIds ?? [])])].sort(),
+      createdAt: existing?.createdAt ?? Date.now()
+    };
+    this.runtimeState.set("startup_recovery", recovery);
+    return recovery;
   }
 
 }

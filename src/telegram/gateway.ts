@@ -3,7 +3,7 @@ import type { Logger } from "pino";
 import type { AppConfig } from "../config.js";
 import { PolicyEngine } from "../security/policy.js";
 import { Store } from "../store/store.js";
-import type { CallbackToken, StoredSession } from "../store/store.js";
+import type { CallbackToken, StartupRecovery, StoredSession } from "../store/store.js";
 import type { CodexEvent, SessionRef } from "../types/events.js";
 import type {
   CodexModelSummary,
@@ -1111,18 +1111,33 @@ export class TelegramGateway {
   private async sendStartupPicker(): Promise<void> {
     const sessions = this.sessions.listSessions().filter((session) => session.status !== "stopped");
     const lastActiveId = this.sessions.getLastActiveSessionId();
-    const orphaned = this.store.getRuntimeValue<number>("startup_orphaned_actions") ?? 0;
-    const orphanedActionIds = this.store.getRuntimeValue<string[]>("startup_orphaned_action_ids") ?? [];
-    await Promise.all(orphanedActionIds.map((actionId) => this.finalizeActionMessages(
+    const recovery = this.store.getStartupRecovery();
+    await Promise.all((recovery?.orphanedActionIds ?? []).map((actionId) => this.finalizeActionMessages(
       actionId,
       "This request was invalidated when tele-codex restarted. Resume the thread and retry the original command."
     )));
-    for (const chatId of this.allowedDeliveryChats()) {
+    const deliveryChats = this.allowedDeliveryChats();
+    if (recovery) {
+      this.store.queueStartupRecovery(recovery.id, deliveryChats.map((chatId) => {
+        const keyboard = sessions.length > 0
+          ? this.sessionsKeyboard(chatId, this.config.controllerUserId, sessions) as unknown as { inline_keyboard: unknown[][] }
+          : undefined;
+        return {
+          chatId,
+          payload: {
+            text: formatStartupRecovery(recovery, sessions),
+            ...(keyboard ? { keyboard: keyboard.inline_keyboard } : {})
+          }
+        };
+      }));
+    }
+    const outstandingRecovery = this.store.hasOutstandingStartupRecovery();
+    for (const chatId of deliveryChats) {
       try {
-        if (sessions.length > 0) {
+        if (!recovery && !outstandingRecovery && sessions.length > 0) {
           const keyboard = this.sessionsKeyboard(chatId, this.config.controllerUserId, sessions) as unknown as { inline_keyboard: unknown[][] };
           this.store.enqueueOutbox(`startup-recovery:${this.runtimeId}`, chatId, {
-            text: `tele-codex restarted. Threads are not resumed automatically.\n${lastActiveId ? `Last active: ${lastActiveId}\n` : ""}${orphaned ? `${orphaned} previous pending request(s) were marked orphaned.\n` : ""}\nRecoverable sessions:\n\n${formatSessions(sessions)}`,
+            text: `tele-codex restarted. Threads are not resumed automatically.\n${lastActiveId ? `Last active: ${lastActiveId}\n` : ""}\nRecoverable sessions:\n\n${formatSessions(sessions)}`,
             keyboard: keyboard.inline_keyboard
           });
         }
@@ -1134,8 +1149,6 @@ export class TelegramGateway {
         this.logger.warn({ error, chatId }, "failed to send startup picker");
       }
     }
-    if (orphaned) this.store.setRuntimeValue("startup_orphaned_actions", 0);
-    if (orphanedActionIds.length > 0) this.store.setRuntimeValue("startup_orphaned_action_ids", []);
   }
 
   private async workspacePickerMessage(chatId: number, userId: number): Promise<[string, { reply_markup: InlineKeyboard }]> {
@@ -1681,6 +1694,27 @@ function workspacePickerText(projects: WorkspaceProject[], workspaceRoot: string
     : `Start Codex in a workspace project:\n\n${projects
         .map((project, index) => `${index + 1}. ${project.name}`)
         .join("\n")}\n\nUse /new <project-or-path> for manual entry.`;
+}
+
+function formatStartupRecovery(recovery: StartupRecovery, sessions: StoredSession[]): string {
+  const sessionsById = new Map(sessions.map((session) => [session.id, session]));
+  const affected = recovery.activeThreadIds.map((sessionId) => {
+    const session = sessionsById.get(sessionId);
+    return session ? `${session.label} (${session.id})` : sessionId;
+  });
+  return [
+    "tele-codex restarted.",
+    recovery.activeThreadIds.length > 0
+      ? "The previous Active Turn outcome is unknown. Resume each affected Codex Thread explicitly before continuing."
+      : undefined,
+    affected.length > 0 ? `Affected Codex Threads:\n${affected.map((thread) => `- ${thread}`).join("\n")}` : undefined,
+    recovery.orphanedActionIds.length > 0
+      ? `${recovery.orphanedActionIds.length} previous pending request(s) were marked orphaned. Resume the thread and retry the original command.`
+      : undefined,
+    sessions.length > 0
+      ? "Threads are not resumed automatically. Use the controls below to select a recoverable thread."
+      : "No recoverable local thread metadata is available. Use /resume to inspect Codex history."
+  ].filter(Boolean).join("\n\n");
 }
 
 function callbackError(error: unknown, fallback: string): string {
