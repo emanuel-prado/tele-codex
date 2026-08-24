@@ -570,7 +570,7 @@ export class AppServerAdapter implements AppServerRuntime {
       const last = this.lastConnectionFailure;
       this.failRuntime(new AppServerFailure(
         last?.kind ?? "transport_loss",
-        `App-server reconnect exhausted after ${this.reconnectAttempt} attempts.`,
+        `App-server reconnect exhausted after ${this.reconnectAttempt} attempts.${last ? ` Last failure: ${last.message}` : ""}`,
         {
           method: last?.method ?? "connect",
           ...(last?.code !== undefined ? { code: last.code } : {}),

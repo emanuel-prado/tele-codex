@@ -73,8 +73,16 @@ export class JsonRpcClient extends EventEmitter implements AppServerRpcClient {
     child.stdin.on("error", (error) => {
       this.rejectPending(error, activeGeneration, "App-server transport was lost while writing a request.");
     });
+    let rejectSpawn: ((error: AppServerFailure) => void) | undefined;
+    const spawned = new Promise<void>((resolve, reject) => {
+      rejectSpawn = reject;
+      child.once("spawn", resolve);
+    });
     child.on("error", (error) => {
-      this.rejectPending(error, activeGeneration, "App-server transport failed to start.");
+      const failure = stdioLaunchFailure(error);
+      rejectSpawn?.(failure);
+      rejectSpawn = undefined;
+      this.rejectPending(failure, activeGeneration, failure.message);
       if (this.child === child) this.clearActiveTransport(activeGeneration);
       this.emit("close", { error }, activeGeneration);
     });
@@ -83,6 +91,8 @@ export class JsonRpcClient extends EventEmitter implements AppServerRpcClient {
       if (this.child === child) this.clearActiveTransport(activeGeneration);
       this.emit("close", { code, signal }, activeGeneration);
     });
+    await spawned;
+    rejectSpawn = undefined;
     return activeGeneration;
   }
 
@@ -263,4 +273,14 @@ export class JsonRpcClient extends EventEmitter implements AppServerRpcClient {
     this.socket = undefined;
     this.activeGeneration = undefined;
   }
+}
+
+function stdioLaunchFailure(error: NodeJS.ErrnoException): AppServerFailure {
+  const code = error.code;
+  const message = code === "ENOENT"
+    ? "Codex app-server executable was not found (ENOENT)."
+    : code === "EACCES"
+      ? "Codex app-server executable is not executable (EACCES)."
+      : `Codex app-server process failed to launch${code ? ` (${code})` : ""}.`;
+  return normalizeAppServerFailure(error, "transport_loss", message, { method: "connect" });
 }

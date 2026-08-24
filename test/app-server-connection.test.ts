@@ -263,6 +263,23 @@ describe("AppServerAdapter connection generations", () => {
     expect(health.snapshot().appServer).toMatchObject({ state: "failed", reconnectAttempt: 1 });
     store.close();
   });
+
+  it("reports a missing child executable as the exhausted launch cause without exposing its path", async () => {
+    const store = new Store(":memory:");
+    const health = new RuntimeHealth();
+    const missingCommand = "/private/operator/path/missing-codex";
+    const adapter = new AppServerAdapter({
+      ...config(), codexCommand: missingCommand, appServerMaxReconnectAttempts: 0
+    }, store, logger(), health);
+
+    await adapter.startTransport();
+    const failure = await adapter.waitForFailure().catch((error: unknown) => error);
+
+    expect(String(failure)).toMatch(/reconnect exhausted.*executable.*not found.*ENOENT/i);
+    expect(String(failure)).not.toContain(missingCommand);
+    expect(health.snapshot().appServer.detail).toMatch(/executable.*not found.*ENOENT/i);
+    store.close();
+  });
 });
 
 function attach(internals: AdapterInternals, store: Store, generation: number): void {
