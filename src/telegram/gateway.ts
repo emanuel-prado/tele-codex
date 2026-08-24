@@ -66,7 +66,6 @@ interface AgentMessageBuffer {
 export class TelegramGateway {
   private readonly runtime: TelegramRuntime;
   private readonly bot: TelegramRuntime["bot"];
-  private readonly runtimeId = createId("runtime");
   private readonly messageBuffers = new Map<string, AgentMessageBuffer>();
   private readonly interactions: PendingInteractionManager;
   private readonly routing: TelegramRouting;
@@ -1007,7 +1006,6 @@ export class TelegramGateway {
 
   private async sendStartupPicker(): Promise<void> {
     const sessions = this.sessions.listSessions().filter((session) => session.status !== "stopped");
-    const lastActiveId = this.sessions.getLastActiveSessionId();
     const recovery = this.store.getStartupRecovery();
     await Promise.all((recovery?.orphanedActionIds ?? []).map((actionId) => this.finalizeActionMessages(
       actionId,
@@ -1027,24 +1025,6 @@ export class TelegramGateway {
           }
         };
       }));
-    }
-    const outstandingRecovery = this.store.hasOutstandingStartupRecovery();
-    for (const chatId of deliveryChats) {
-      try {
-        if (!recovery && !outstandingRecovery && sessions.length > 0) {
-          const keyboard = this.sessionsKeyboard(chatId, this.config.controllerUserId, sessions) as unknown as { inline_keyboard: unknown[][] };
-          this.store.enqueueOutbox(`startup-recovery:${this.runtimeId}`, chatId, {
-            text: `tele-codex restarted. Threads are not resumed automatically.\n${lastActiveId ? `Last active: ${lastActiveId}\n` : ""}\nRecoverable sessions:\n\n${formatSessions(sessions)}`,
-            keyboard: keyboard.inline_keyboard
-          });
-        }
-        const projects = await listWorkspaceProjects(this.config.workspaceRoot);
-        await this.bot.api.sendMessage(chatId, `${workspacePickerText(projects, this.config.workspaceRoot)}\n\nRun /new to open controls scoped to you.`);
-        this.health.deliverySuccess();
-      } catch (error) {
-        this.health.deliveryFailure(error);
-        this.logger.warn({ error, chatId }, "failed to send startup picker");
-      }
     }
   }
 

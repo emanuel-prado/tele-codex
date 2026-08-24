@@ -689,13 +689,6 @@ export class Store {
     })();
   }
 
-  hasOutstandingStartupRecovery(): boolean {
-    return Boolean(this.db.prepare(
-      `select 1 from notification_outbox
-       where event_key like 'startup-recovery:%' and status in ('pending', 'failed') limit 1`
-    ).get());
-  }
-
   setTelegramMessage(actionId: string, chatId: number, messageId: number): void {
     this.db.transaction(() => {
       this.db

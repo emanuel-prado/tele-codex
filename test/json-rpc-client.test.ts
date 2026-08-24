@@ -10,6 +10,21 @@ const logger = {
 };
 
 describe("JsonRpcClient", () => {
+  it("preserves ENOENT as the actual stdio launch cause", async () => {
+    const client = new JsonRpcClient(logger as never);
+
+    const failure = await client.connectStdio("/definitely/missing/codex").catch((error: unknown) => error);
+
+    expect(failure).toMatchObject({
+      name: "AppServerFailure",
+      kind: "transport_loss",
+      cause: expect.objectContaining({ code: "ENOENT" })
+    });
+    expect(String(failure)).toMatch(/executable.*not found.*ENOENT/i);
+    expect(String(failure)).not.toContain("/definitely/missing/codex");
+    client.close();
+  });
+
   it("rejects pending stdio requests when app-server exits before responding", async () => {
     const dir = await mkdtemp(join(tmpdir(), "tele-codex-rpc-"));
     const command = join(dir, "fake-codex");

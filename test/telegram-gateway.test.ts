@@ -387,6 +387,28 @@ describe("TelegramGateway dispatch", () => {
     expect(new Set(deliveryAttempts).size).toBe(1);
   });
 
+  it("sends nothing and queues no recovery when routine startup only has recoverable thread metadata", async () => {
+    const session = store.upsertSession({
+      id: "session_1", adapter: "appserver", label: "Existing thread", codexThreadId: "thread_1"
+    }, "detached");
+    const routineSessions = {
+      ...sessions,
+      listSessions: () => [session],
+      getLastActiveSessionId: () => session.id
+    } as unknown as SessionManager;
+    const routineGateway = new TelegramGateway(
+      testConfig(), routineSessions, store, new PolicyEngine(testConfig()),
+      pino({ level: "silent" }), undefined, runtime
+    );
+
+    await sendStartupPicker(routineGateway);
+    await sendStartupPicker(routineGateway);
+
+    expect(runtime.calls).toEqual([]);
+    expect(store.getStartupRecovery()).toBeUndefined();
+    expect(store.dueOutbox()).toEqual([]);
+  });
+
   it("renders approval-only startup recovery without claiming an Active Turn was lost", async () => {
     const workspaceRoot = await mkdtemp(join(tmpdir(), "tele-codex-approval-recovery-"));
     const session = store.upsertSession({
