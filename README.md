@@ -1,8 +1,16 @@
 <p align="center">
-  <img src="assets/brand/tele-codex-logo.png" alt="tele-codex logo" width="180">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/brand/tele-codex-wordmark-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="assets/brand/tele-codex-wordmark-light.png">
+    <img src="assets/brand/tele-codex-wordmark-light.png" alt="tele-codex" width="720">
+  </picture>
 </p>
 
-# tele-codex
+<p align="center">
+  <a href="https://github.com/emanuel-prado/tele-codex/actions/workflows/ci.yml"><img src="https://github.com/emanuel-prado/tele-codex/actions/workflows/ci.yml/badge.svg" alt="CI status"></a>
+  <a href="docs/app-server-contract-testing.md"><img src="https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fraw.githubusercontent.com%2Femanuel-prado%2Ftele-codex%2Fmaster%2Fcontracts%2Fapp-server%2Fcontract.json&amp;query=%24.codexVersion&amp;label=tested%20Codex&amp;color=0284c7" alt="Tested Codex CLI version"></a>
+  <a href="package.json"><img src="https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fraw.githubusercontent.com%2Femanuel-prado%2Ftele-codex%2Fmaster%2Fpackage.json&amp;query=%24.engines.node&amp;label=Node.js&amp;color=339933&amp;logo=nodedotjs&amp;logoColor=white" alt="Required Node.js version"></a>
+</p>
 
 `tele-codex` is a local Telegram companion for Codex CLI. It lets one trusted Telegram user monitor, resume, and steer Codex sessions running on the same machine.
 

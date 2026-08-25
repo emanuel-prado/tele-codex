@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="300" viewBox="0 0 1200 300" role="img" aria-labelledby="title">
+  <title id="title">tele-codex</title>
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M52 90h194a24 24 0 0 1 24 24v112a24 24 0 0 1-24 24H52a24 24 0 0 1-24-24V114a24 24 0 0 1 24-24Z" stroke="#16324f" stroke-width="10"/>
+    <path d="M205 90V59" stroke="#0284c7" stroke-width="10"/>
+    <circle cx="205" cy="46" r="12" stroke="#0284c7" stroke-width="8"/>
+    <path d="m52 45 146 41-65 25-28 62-18-53-49-19 92-28Z" fill="#20c5e8" stroke="#0369a1" stroke-width="8"/>
+    <path d="m104 120 26-47" stroke="#f59e0b" stroke-width="7"/>
+    <path d="m64 160 28 25-28 25M108 210h36" stroke="#0284c7" stroke-width="11"/>
+    <path d="M189 174h2M228 174h2" stroke="#16324f" stroke-width="14"/>
+  </g>
+  <text x="326" y="203" font-family="Arimo, Arial, sans-serif" font-size="139" font-weight="700" letter-spacing="-5">
+    <tspan fill="#0284c7">tele</tspan><tspan fill="#d97706">-</tspan><tspan fill="#16324f">codex</tspan>
+  </text>
+</svg>
