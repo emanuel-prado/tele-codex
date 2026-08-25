@@ -28,6 +28,14 @@ describe("README documentation", () => {
     }
   });
 
+  it("keeps the same geometry in both colour variants", async () => {
+    const light = await read("assets/brand/tele-codex-wordmark-light.svg");
+    const dark = await read("assets/brand/tele-codex-wordmark-dark.svg");
+
+    expect(svgGeometry(dark)).toEqual(svgGeometry(light));
+    expect(dark).not.toBe(light);
+  });
+
   it("links useful badges to their canonical sources", async () => {
     const readme = await read("README.md");
 
@@ -64,4 +72,12 @@ async function readBinary(path: string): Promise<Buffer> {
 
 function matches(input: string, pattern: RegExp): string[] {
   return [...input.matchAll(pattern)].map((match) => match[1]!).filter(Boolean);
+}
+
+function svgGeometry(input: string): { viewBox: string; paths: string[]; transforms: string[] } {
+  return {
+    viewBox: /viewBox="([^"]+)"/.exec(input)?.[1] ?? "",
+    paths: matches(input, /<path\b[^>]*\bd="([^"]+)"/g),
+    transforms: matches(input, /\btransform="([^"]+)"/g)
+  };
 }
