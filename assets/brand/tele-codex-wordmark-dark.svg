@@ -2,13 +2,10 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1200" height="300" viewBox="0 0 1200 300" role="img" aria-labelledby="title">
   <title id="title">tele-codex</title>
   <g fill="none" stroke-linecap="round" stroke-linejoin="round">
-    <path d="M52 90h194a24 24 0 0 1 24 24v112a24 24 0 0 1-24 24H52a24 24 0 0 1-24-24V114a24 24 0 0 1 24-24Z" stroke="#dbeafe" stroke-width="10"/>
-    <path d="M205 90V59" stroke="#38bdf8" stroke-width="10"/>
-    <circle cx="205" cy="46" r="12" stroke="#38bdf8" stroke-width="8"/>
-    <path d="m52 45 146 41-65 25-28 62-18-53-49-19 92-28Z" fill="#22d3ee" stroke="#60a5fa" stroke-width="8"/>
-    <path d="m104 120 26-47" stroke="#fbbf24" stroke-width="7"/>
-    <path d="m64 160 28 25-28 25M108 210h36" stroke="#38bdf8" stroke-width="11"/>
-    <path d="M189 174h2M228 174h2" stroke="#dbeafe" stroke-width="14"/>
+    <path d="M202 96h44a24 24 0 0 1 24 24v106a24 24 0 0 1-24 24H52a24 24 0 0 1-24-24V120a24 24 0 0 1 24-24" stroke="#dbeafe" stroke-width="10"/>
+    <path d="M31 92C27 87 32 82 40 79L200 27c10-3 16 2 14 13l-29 119c-3 13-11 18-21 11l-47-32-29 47c-6 10-16 7-15-5l4-48-40-24c-9-5-11-11-6-16Zm18-1 144-49-87 76-29-5 71-52L49 91Zm68 35 75-77-21 101-54-24Zm-28-3 20 10-22 35 2-45Z" fill="#38bdf8" fill-rule="evenodd"/>
+    <path d="m62 194 24 18-24 18M104 230h38" stroke="#38bdf8" stroke-width="11"/>
+    <path d="M190 197h2M230 197h2" stroke="#dbeafe" stroke-width="14"/>
   </g>
   <text x="326" y="203" font-family="Arimo, Arial, sans-serif" font-size="139" font-weight="700" letter-spacing="-5">
     <tspan fill="#38bdf8">tele</tspan><tspan fill="#fbbf24">-</tspan><tspan fill="#dbeafe">codex</tspan>
