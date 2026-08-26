@@ -90,6 +90,7 @@ describe("TelegramGateway dispatch", () => {
   let gateway: TelegramGateway;
   let attachedThread: string | undefined;
   let activeSession: StoredSession | undefined;
+  let pausedSession: StoredSession | undefined;
   let killCount: number;
   let killError: Error | undefined;
   let forwardedText: string[];
@@ -102,6 +103,7 @@ describe("TelegramGateway dispatch", () => {
     store = new Store(":memory:");
     runtime = new FakeTelegramRuntime();
     activeSession = undefined;
+    pausedSession = undefined;
     killCount = 0;
     killError = undefined;
     forwardedText = [];
@@ -110,6 +112,30 @@ describe("TelegramGateway dispatch", () => {
     activeTranscript = "";
     sessions = {
       getActiveSession: () => activeSession,
+      pause: (sessionId?: string) => {
+        const selected = sessionId ? store.getSession(sessionId) : activeSession ?? pausedSession;
+        if (!selected) throw new Error("No Codex thread is selected. Select or resume a thread before pausing input.");
+        if (!["attached", "idle", "active", "blocked"].includes(selected.status)) {
+          throw new Error("This Codex thread is detached or unavailable. Resume it explicitly before changing input forwarding.");
+        }
+        const changed = !selected.paused;
+        if (changed) store.setPaused(selected.id, true);
+        pausedSession = store.getSession(selected.id);
+        activeSession = undefined;
+        return { session: pausedSession!, changed };
+      },
+      resume: (sessionId?: string) => {
+        const selected = sessionId ? store.getSession(sessionId) : pausedSession ?? activeSession;
+        if (!selected) throw new Error("No paused Codex thread is available. Select or resume a thread explicitly.");
+        if (!["attached", "idle", "active", "blocked"].includes(selected.status)) {
+          throw new Error("This Codex thread is detached or unavailable. Resume it explicitly before changing input forwarding.");
+        }
+        const changed = selected.paused;
+        if (changed) store.setPaused(selected.id, false);
+        activeSession = store.getSession(selected.id);
+        pausedSession = undefined;
+        return { session: activeSession!, changed };
+      },
       attach: async ({ codexThreadId }: { codexThreadId: string }) => {
         attachedThread = codexThreadId;
         return { id: "session_1" };
@@ -154,6 +180,34 @@ describe("TelegramGateway dispatch", () => {
   ])("dispatches %s without a network transport", async (command, expected) => {
     await runtime.bot.handleUpdate(messageUpdate(command, nextUpdateId()));
     expect(sentTexts(runtime)).toContainEqual(expect.stringContaining(expected));
+  });
+
+  it("reports reversible and repeated input pause commands accurately", async () => {
+    activeSession = store.upsertSession({
+      id: "session_1", adapter: "appserver", label: "one", codexThreadId: "thread_1"
+    }, "idle");
+
+    await runtime.bot.handleUpdate(messageUpdate("/pause", nextUpdateId()));
+    await runtime.bot.handleUpdate(messageUpdate("/pause", nextUpdateId()));
+    await runtime.bot.handleUpdate(messageUpdate("/unpause", nextUpdateId()));
+    await runtime.bot.handleUpdate(messageUpdate("/unpause", nextUpdateId()));
+
+    expect(sentTexts(runtime)).toEqual([
+      "Paused Telegram input for:\none\nsession_1\nRun /unpause to resume input.",
+      "Telegram input is already paused for:\none\nsession_1\nRun /unpause to resume input.",
+      "Resumed Telegram input for:\none\nsession_1",
+      "Telegram input is already available for:\none\nsession_1"
+    ]);
+  });
+
+  it("gives actionable replies when no thread can be paused or resumed", async () => {
+    await runtime.bot.handleUpdate(messageUpdate("/pause", nextUpdateId()));
+    await runtime.bot.handleUpdate(messageUpdate("/unpause", nextUpdateId()));
+
+    expect(sentTexts(runtime)).toEqual([
+      "No Codex thread is selected. Select or resume a thread before pausing input.",
+      "No paused Codex thread is available. Select or resume a thread explicitly."
+    ]);
   });
 
   it("applies configured transcript retention during an hourly maintenance tick", () => {

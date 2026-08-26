@@ -91,6 +91,18 @@ describe("TelegramRouting", () => {
     fixture.close();
   });
 
+  it("does not forward plain text through a paused sticky route", async () => {
+    const fixture = setup();
+    const session = fixture.addThread("session_1", "thread_1", "one");
+    await fixture.routing.setSticky(10, 100, session.id);
+    fixture.manager.pause(session.id);
+
+    await expect(fixture.routing.routeText(10, 100, "do not forward")).rejects.toThrow(/cannot receive input/i);
+    expect(fixture.sent).toEqual([]);
+    expect(fixture.manager.getActiveSession()).toBeUndefined();
+    fixture.close();
+  });
+
   it("expires compose state and reports invalid or detached targets", async () => {
     const fixture = setup();
     fixture.store.putRoutingCompose({

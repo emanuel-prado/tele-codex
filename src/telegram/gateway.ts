@@ -575,13 +575,25 @@ export class TelegramGateway {
     });
 
     this.bot.command("pause", async (ctx) => {
-      this.sessions.pause();
-      await ctx.reply("Paused active session forwarding.");
+      try {
+        const result = this.sessions.pause();
+        await ctx.reply(result.changed
+          ? `Paused Telegram input for:\n${result.session.label}\n${result.session.id}\nRun /unpause to resume input.`
+          : `Telegram input is already paused for:\n${result.session.label}\n${result.session.id}\nRun /unpause to resume input.`);
+      } catch (error) {
+        await ctx.reply(callbackError(error, "Could not pause Telegram input. Select or resume a thread and try again."));
+      }
     });
 
     this.bot.command("unpause", async (ctx) => {
-      this.sessions.resume();
-      await ctx.reply("Resumed active session forwarding.");
+      try {
+        const result = this.sessions.resume();
+        await ctx.reply(result.changed
+          ? `Resumed Telegram input for:\n${result.session.label}\n${result.session.id}`
+          : `Telegram input is already available for:\n${result.session.label}\n${result.session.id}`);
+      } catch (error) {
+        await ctx.reply(callbackError(error, "Could not resume Telegram input. Select or resume a thread explicitly."));
+      }
     });
 
     this.bot.command("kill", async (ctx) => {
@@ -781,10 +793,13 @@ export class TelegramGateway {
       await this.editOrReplyPanel(ctx);
     } else if (operation === "panel:pause" || operation === "panel:unpause") {
       if (!session) throw new Error("The panel session no longer exists. Run /panel again.");
-      if (operation === "panel:pause") this.sessions.pause(session.id);
-      else this.sessions.resume(session.id);
-      await ctx.answerCallbackQuery({ text: operation === "panel:pause" ? "Paused." : "Input resumed." });
-      await this.editOrReplyPanel(ctx);
+      const result = operation === "panel:pause" ? this.sessions.pause(session.id) : this.sessions.resume(session.id);
+      await ctx.answerCallbackQuery({
+        text: operation === "panel:pause"
+          ? result.changed ? "Input paused." : "Input was already paused."
+          : result.changed ? "Input resumed." : "Input was already available."
+      });
+      await this.editOrReplyPanel(ctx, result.session);
     } else if (operation === "panel:transcript") {
       await ctx.answerCallbackQuery({ text: "Exporting transcript." });
       await this.sendTranscript(ctx, session?.id);
@@ -933,8 +948,8 @@ export class TelegramGateway {
     });
   }
 
-  private async editOrReplyPanel(ctx: Context): Promise<void> {
-    const active = this.sessions.getActiveSession();
+  private async editOrReplyPanel(ctx: Context, selectedSession?: StoredSession): Promise<void> {
+    const active = selectedSession ?? this.sessions.getActiveSession();
     const text = active ? this.panelText(active) : "No active Codex session.";
     try {
       await ctx.editMessageText(text, { reply_markup: this.panelKeyboard(ctx.chat!.id, ctx.from!.id, active) });

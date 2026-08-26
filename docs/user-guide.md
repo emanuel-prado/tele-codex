@@ -244,7 +244,8 @@ Interaction Controls carry opaque tokens and expire. Read the displayed request,
 - Use `/retrydelivery` to requeue failed durable notifications.
 - Use `/progress`, `/diff`, `/usage`, and `/limits` for turn and account detail.
 - Use `/log` for sanitized Event Log entries and `/transcript` for full agent output. Protect Transcript exports as private code.
-- Use `/pause` and `/unpause` to stop or resume Telegram input forwarding.
+- Use `/pause` to stop Telegram input for the selected Codex Thread. The Controller remembers that choice only until the process stops, so an immediate `/unpause` can resume input for the same thread. Pausing does not create a message route, and existing routes cannot send to the thread while it is paused.
+- Use `/unpause` to resume input. If the thread was detached, archived, forgotten, or the process restarted, select or resume it explicitly instead.
 
 ## Choose the right lifecycle action
 
@@ -258,6 +259,8 @@ Interaction Controls carry opaque tokens and expire. Read the displayed request,
 ## Restart recovery
 
 A process restart invalidates persisted App-server Attachments and Active Turns because neither proves a live connection after restart. tele-codex does not automatically resume a Codex Thread, replay an approval or answer, or route plain text to the previously active thread.
+
+A restart also discards the in-process target kept for `/unpause`. A persisted pause remains in force. Select or resume the Codex Thread explicitly; the restart does not unpause it or make it a message target.
 
 If startup finds a prior Active Turn or unresolved interaction, it creates one durable, idempotent recovery notification with no prompt, answer, Transcript, or workspace path. The previous outcome is unknown. Choose a thread explicitly with `/resume`, `/sessions`, or `/send`, inspect its current state, and repeat only the operation you still intend.
 
