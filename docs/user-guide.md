@@ -244,7 +244,7 @@ Interaction Controls carry opaque tokens and expire. Read the displayed request,
 - Use `/retrydelivery` to requeue failed durable notifications.
 - Use `/progress`, `/diff`, `/usage`, and `/limits` for turn and account detail.
 - Use `/log` for sanitized Event Log entries and `/transcript` for full agent output. Protect Transcript exports as private code.
-- Use `/pause` to stop Telegram input for the selected Codex Thread. The Controller remembers that choice only until the process stops, so an immediate `/unpause` can resume input for the same thread. Pausing does not create a message route, and existing routes cannot send to the thread while it is paused.
+- Use `/pause` to stop Telegram input for the selected Codex Thread. tele-codex retains that target only until the process stops, so an immediate `/unpause` can resume input for the same thread. Pausing does not create a message route, and existing routes cannot send to the thread while it is paused.
 - Use `/unpause` to resume input. If the thread was detached, archived, forgotten, or the process restarted, select or resume it explicitly instead.
 
 ## Choose the right lifecycle action
