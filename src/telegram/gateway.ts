@@ -39,7 +39,8 @@ import { TelegramPickerController } from "./picker-controller.js";
 import type { RuntimeHealth, RuntimeHealthReporter } from "../runtime/health.js";
 import { noopRuntimeHealth } from "../runtime/health.js";
 import type { SupervisedSubsystem } from "../runtime/supervisor.js";
-import { TelegramBotRuntime, type TelegramCommandDefinition, type TelegramRuntime } from "./bot-runtime.js";
+import { TelegramBotRuntime, type TelegramRuntime } from "./bot-runtime.js";
+import { TELEGRAM_COMMAND_CATALOG } from "./command-catalog.js";
 
 const INTERACTION_CONTROL_OPERATIONS = [
   "panel:refresh", "panel:status", "panel:usage", "panel:new", "panel:resume", "panel:models",
@@ -100,44 +101,8 @@ export class TelegramGateway {
   }
 
   async startPolling(): Promise<void> {
-    const commands: TelegramCommandDefinition[] = [
-      { command: "status", description: "Show active Codex session" },
-      { command: "panel", description: "Show session control panel" },
-      { command: "sessions", description: "List local sessions" },
-      { command: "new", description: "Start a new Codex session" },
-      { command: "resume", description: "Resume a previous Codex session" },
-      { command: "threads", description: "List previous Codex sessions" },
-      { command: "model", description: "Change active session model" },
-      { command: "models", description: "List available models" },
-      { command: "plan", description: "Switch active session to plan mode" },
-      { command: "mode", description: "Switch collaboration mode" },
-      { command: "compact", description: "Start context compaction" },
-      { command: "archive", description: "Archive active app-server thread" },
-      { command: "detach", description: "Detach active app-server thread" },
-      { command: "forget", description: "Forget local thread metadata" },
-      { command: "send", description: "Send one message to a selected thread" },
-      { command: "use", description: "Opt into sticky routing for this chat" },
-      { command: "attach", description: "Attach an app-server thread" },
-      { command: "log", description: "Show recent session log" },
-      { command: "usage", description: "Show active session token usage" },
-      { command: "pending", description: "Show pending Codex interactions" },
-      { command: "health", description: "Show unattended-operation health" },
-      { command: "retrydelivery", description: "Retry failed notifications" },
-      { command: "search", description: "Search previous Codex sessions" },
-      { command: "limits", description: "Show Codex account limits" },
-      { command: "progress", description: "Show the active turn plan" },
-      { command: "diff", description: "Export the latest turn diff" },
-      { command: "goal", description: "Control the active thread goal" },
-      { command: "processes", description: "Show background processes" },
-      { command: "doctor", description: "Run local health checks" },
-      { command: "transcript", description: "Export active session transcript" },
-      { command: "pause", description: "Pause Telegram input forwarding" },
-      { command: "unpause", description: "Resume Telegram input forwarding" },
-      { command: "kill", description: "Interrupt active turn" },
-      { command: "help", description: "Show help" }
-    ];
     await this.sendStartupPicker();
-    await this.runtime.start(commands);
+    await this.runtime.start([...TELEGRAM_COMMAND_CATALOG]);
   }
 
   runtimeSubsystems(): SupervisedSubsystem[] {

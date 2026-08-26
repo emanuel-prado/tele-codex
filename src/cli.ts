@@ -11,10 +11,20 @@ import { formatDoctorReport, runDoctorFromEnv } from "./runtime/doctor.js";
 import { ServiceManager } from "./runtime/service-manager.js";
 import { RuntimeHealth } from "./runtime/health.js";
 import { RuntimeSupervisor, type SupervisedSubsystem } from "./runtime/supervisor.js";
+import { discoverTelegramIds, formatTelegramIds } from "./runtime/telegram-id-discovery.js";
 
 async function main(): Promise<void> {
   const envFile = optionValue("--env-file") ?? process.env.TELE_CODEX_ENV_FILE ?? ".env";
   loadDotEnv(envFile);
+  if (process.argv[2] === "telegram-ids") {
+    try {
+      console.log(formatTelegramIds(await discoverTelegramIds(process.env.TELE_CODEX_BOT_TOKEN)));
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : "Telegram ID discovery failed. Try again later.");
+      process.exitCode = 1;
+    }
+    return;
+  }
   if (process.argv[2] === "service") {
     await runServiceCommand(envFile);
     return;
