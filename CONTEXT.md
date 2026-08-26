@@ -84,3 +84,16 @@ user-specific workspace paths.
 Avoid: transcript archive, raw RPC dump.
 
 > “Record a sanitized connection failure in the Event Log.”
+
+### Startup Recovery
+
+A durable, minimal notice created only when startup invalidates a prior Active
+Turn or unresolved interaction. It says that the outcome is unknown and
+requires the Controller to select a Codex Thread explicitly.
+
+Startup Recovery never resumes a Codex Thread automatically and never replays
+an Interaction Control, approval, answer, prompt, or Transcript.
+
+Avoid: automatic resume, restored live session, interaction replay.
+
+> “Startup Recovery requires explicit thread selection before more work.”

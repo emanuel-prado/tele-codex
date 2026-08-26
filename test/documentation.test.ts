@@ -1,6 +1,7 @@
 import { readFile, stat } from "node:fs/promises";
-import { resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
+import { TELEGRAM_COMMAND_CATALOG } from "../src/telegram/command-catalog.js";
 
 const root = resolve(import.meta.dirname, "..");
 
@@ -60,6 +61,62 @@ describe("README documentation", () => {
       await expect(stat(resolve(root, path))).resolves.toBeDefined();
     }
   });
+
+  it("links every local README and handbook target, including anchors", async () => {
+    for (const source of ["README.md", "docs/user-guide.md"]) {
+      const markdown = await read(source);
+      const links = matches(markdown, /!?(?:\[[^\]]*\])\(((?!https?:)[^)]+)\)/g);
+      for (const link of links) {
+        const [rawPath, anchor] = link.split("#", 2);
+        const target = rawPath
+          ? resolve(root, dirname(source), rawPath)
+          : resolve(root, source);
+        await expect(stat(target), `${source}: ${link}`).resolves.toBeDefined();
+        if (anchor) {
+          const targetMarkdown = await readRelative(target);
+          expect(markdownAnchors(targetMarkdown), `${source}: ${link}`).toContain(anchor);
+        }
+      }
+    }
+  });
+
+  it("documents exactly one row for every registered root command", async () => {
+    const guide = await read("docs/user-guide.md");
+    const commandSection = guide.split("## Telegram command reference\n", 2)[1] ?? "";
+    const documented = matches(commandSection, /^\| `\/([a-z]+)` \|/gm);
+    const registered = TELEGRAM_COMMAND_CATALOG.map(({ command }) => command);
+
+    expect(new Set(documented).size).toBe(documented.length);
+    expect([...documented].sort()).toEqual([...registered].sort());
+  });
+
+  it("documents the supported configuration surface and keeps the remote token blank", async () => {
+    const guide = await read("docs/user-guide.md");
+    const configSection = guide.split("### Configuration reference\n", 2)[1]?.split("### Advanced Telegram groups", 1)[0] ?? "";
+    const documented = matches(configSection, /^\| `([^`]+)` \|/gm);
+    const expected = [
+      "TELE_CODEX_BOT_TOKEN",
+      "TELE_CODEX_ALLOWED_USER_IDS",
+      "TELE_CODEX_ALLOWED_CHAT_IDS",
+      "TELE_CODEX_DB_PATH",
+      "TELE_CODEX_LOG_LEVEL",
+      "TELE_CODEX_APPROVAL_TIMEOUT_MS",
+      "TELE_CODEX_RPC_TIMEOUT_MS",
+      "TELE_CODEX_APP_SERVER_MAX_RECONNECT_ATTEMPTS",
+      "TELE_CODEX_RATE_LIMIT_WARN_PERCENT",
+      "TELE_CODEX_TRANSCRIPT_RETENTION_DAYS",
+      "TELE_CODEX_ALLOW_SESSION_GRANTS",
+      "TELE_CODEX_CODEX_COMMAND",
+      "TELE_CODEX_WORKSPACE_ROOT",
+      "TELE_CODEX_APP_SERVER_URL",
+      "TELE_CODEX_APP_SERVER_TOKEN",
+      "TELE_CODEX_ENV_FILE",
+      "--env-file PATH"
+    ];
+
+    expect(documented).toEqual(expected);
+    expect(await read(".env.example")).toMatch(/^TELE_CODEX_APP_SERVER_TOKEN=$/m);
+  });
 });
 
 async function read(path: string): Promise<string> {
@@ -68,6 +125,10 @@ async function read(path: string): Promise<string> {
 
 async function readBinary(path: string): Promise<Buffer> {
   return readFile(resolve(root, path));
+}
+
+async function readRelative(path: string): Promise<string> {
+  return readFile(path, "utf8");
 }
 
 function matches(input: string, pattern: RegExp): string[] {
@@ -80,4 +141,12 @@ function svgGeometry(input: string): { viewBox: string; paths: string[]; transfo
     paths: matches(input, /<path\b[^>]*\bd="([^"]+)"/g),
     transforms: matches(input, /\btransform="([^"]+)"/g)
   };
+}
+
+function markdownAnchors(input: string): string[] {
+  return matches(input, /^#{1,6}\s+(.+)$/gm).map((heading) => heading
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, "")
+    .trim()
+    .replace(/\s+/g, "-"));
 }

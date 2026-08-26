@@ -16,6 +16,8 @@ Workspace selection canonicalizes the configured root and requested directory th
 
 The execution boundary is mandatory and app-server-specific. Telegram, persistence, and session orchestration depend on the structured `AppServerRuntime` contract and contain no terminal-emulation adapter dispatch.
 
+The `telegram-ids` CLI preflight is a narrow exception to the running Telegram transport boundary. Before the runtime starts, it reads only `TELE_CODEX_BOT_TOKEN` from the selected environment file and makes one local, first-party Telegram `getUpdates` request. It does not initialize configuration that requires a Controller ID, create a Store, start polling, persist updates, or connect to app-server. It extracts only sender ID, chat ID, and chat type; output is deduplicated newest first. Upstream bodies, bot tokens, names, usernames, timestamps, update IDs, and message content never enter output or errors. Discovery must not run beside another poller or webhook.
+
 The app-server boundary has a deterministic fake transport for lifecycle scenarios. Its diagnostics retain message order, direction, and connection generation so reconnect and stale-message failures are reproducible without Telegram or a live Codex process. A compact checked contract fingerprints the generated client requests, server requests, notifications, and critical lifecycle shapes from a named Codex CLI version. `npm run contract:check` compares an installed CLI with that fixture; intentional upgrades use `npm run contract:refresh` and require protocol review. `/doctor` and CI diagnostics report the checked version.
 
 ## State
