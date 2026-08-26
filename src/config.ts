@@ -20,7 +20,8 @@ const envSchema = z.object({
     .transform((value) => value === "true"),
   TELE_CODEX_CODEX_COMMAND: z.string().optional().default("codex"),
   TELE_CODEX_WORKSPACE_ROOT: z.string().optional().default("~/Workspace"),
-  TELE_CODEX_APP_SERVER_URL: z.string().optional()
+  TELE_CODEX_APP_SERVER_URL: z.string().optional(),
+  TELE_CODEX_APP_SERVER_TOKEN: z.string().optional()
 });
 
 export interface AppConfig {
@@ -38,6 +39,7 @@ export interface AppConfig {
   codexCommand: string;
   workspaceRoot: string;
   appServerUrl?: string;
+  appServerToken?: string;
 }
 
 export interface ConfigInspection {
@@ -77,6 +79,9 @@ export function loadConfig(
     config.transcriptRetentionDays = parsed.TELE_CODEX_TRANSCRIPT_RETENTION_DAYS;
   }
   if (parsed.TELE_CODEX_APP_SERVER_URL) config.appServerUrl = parsed.TELE_CODEX_APP_SERVER_URL;
+  if (parsed.TELE_CODEX_APP_SERVER_TOKEN !== undefined) {
+    config.appServerToken = parsed.TELE_CODEX_APP_SERVER_TOKEN;
+  }
   return config;
 }
 

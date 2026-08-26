@@ -128,7 +128,7 @@ node dist/cli.js doctor
 | `TELE_CODEX_CODEX_COMMAND` | `codex` | Codex executable or absolute executable path. The service installer resolves and pins it. |
 | `TELE_CODEX_WORKSPACE_ROOT` | `~/Workspace` | Containment root for projects opened through `/new`. |
 | `TELE_CODEX_APP_SERVER_URL` | Unset | Advanced: remote app-server WebSocket URL instead of local stdio. tele-codex does not provision or secure that endpoint. |
-| `TELE_CODEX_APP_SERVER_TOKEN` | Unset | Advanced: bearer token sent to the configured remote WebSocket. Keep it blank for local stdio. |
+| `TELE_CODEX_APP_SERVER_TOKEN` | Unset | Advanced: bearer token sent unchanged to the configured remote WebSocket. It is read once at startup and is never used for local stdio. Keep it secret. |
 | `TELE_CODEX_ENV_FILE` | `.env` | Environment-file path used when `--env-file` is absent. |
 | `--env-file PATH` | Unset | CLI option that selects an environment file for the current command and takes priority over `TELE_CODEX_ENV_FILE`. |
 
@@ -142,7 +142,7 @@ If `TELE_CODEX_ALLOWED_CHAT_IDS` is non-empty, it replaces the private-chat defa
 
 ### Advanced remote app-server
 
-`TELE_CODEX_APP_SERVER_URL` and `TELE_CODEX_APP_SERVER_TOKEN` are references for an existing WebSocket endpoint. tele-codex does not create the endpoint, configure TLS, distribute credentials, or claim that it is safe for internet exposure. Keep both settings blank to use the supported local stdio path. If you operate a remote endpoint, protect its transport and token outside tele-codex and reassess the trust boundary.
+`TELE_CODEX_APP_SERVER_URL` and `TELE_CODEX_APP_SERVER_TOKEN` are references for an existing WebSocket endpoint. tele-codex reads both once at startup and passes a non-blank token unchanged as a bearer token. It does not show, log, or persist the token. It does not create the endpoint, configure TLS, distribute credentials, or claim that the endpoint is safe for internet exposure. Keep both settings blank to use the supported local stdio path. If you operate a remote endpoint, protect its transport and token outside tele-codex and reassess the trust boundary.
 
 ## First run
 

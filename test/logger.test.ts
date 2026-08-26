@@ -16,11 +16,13 @@ describe("runtime logger", () => {
     logger.warn({
       args: ["run-command", "private process input"],
       answer: "private approval answer",
+      appServerToken: "remote-app-server-secret",
+      TELE_CODEX_APP_SERVER_TOKEN: "environment-app-server-secret",
       error: new Error("failed in /home/controller/private-workspace and /tmp via https://api.telegram.org/bot123:secret/sendMessage")
     }, "safe diagnostic");
 
     expect(output).toContain("safe diagnostic");
-    expect(output).not.toMatch(/private process input|private approval answer|private-workspace|\/tmp|123:secret/);
+    expect(output).not.toMatch(/private process input|private approval answer|private-workspace|\/tmp|123:secret|remote-app-server-secret|environment-app-server-secret/);
     expect(output).toContain("[redacted]");
   });
 });

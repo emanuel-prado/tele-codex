@@ -476,7 +476,7 @@ export class AppServerAdapter implements AppServerRuntime {
     this.connectingFailure = undefined;
     try {
       if (this.config.appServerUrl) {
-        await this.rpc.connectWebSocket(this.config.appServerUrl, process.env.TELE_CODEX_APP_SERVER_TOKEN, generation);
+        await this.rpc.connectWebSocket(this.config.appServerUrl, this.config.appServerToken, generation);
       } else {
         await this.rpc.connectStdio(this.config.codexCommand, generation);
       }

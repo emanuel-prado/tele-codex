@@ -10,7 +10,16 @@ export function createLogger(level = "info", destination?: DestinationStream) {
       }
     },
     redact: {
-      paths: ["botToken", "*.botToken", "TELE_CODEX_BOT_TOKEN", "token", "*.token"],
+      paths: [
+        "botToken",
+        "*.botToken",
+        "TELE_CODEX_BOT_TOKEN",
+        "appServerToken",
+        "*.appServerToken",
+        "TELE_CODEX_APP_SERVER_TOKEN",
+        "token",
+        "*.token"
+      ],
       censor: "[redacted]"
     }
   }, destination);
