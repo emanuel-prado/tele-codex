@@ -65,6 +65,19 @@ describe("doctor", () => {
     expect(formatDoctorReport(report)).toContain("skipped until configuration is valid");
     await expect(access(dbPath)).rejects.toThrow();
   });
+
+  it("never includes the remote app-server token in diagnostic output", async () => {
+    const remoteToken = "doctor-must-not-print-this-secret";
+    const report = await runDoctorFromEnv({
+      TELE_CODEX_BOT_TOKEN: "token",
+      TELE_CODEX_ALLOWED_USER_IDS: "not-a-number",
+      TELE_CODEX_APP_SERVER_URL: "wss://app-server.example.test",
+      TELE_CODEX_APP_SERVER_TOKEN: remoteToken
+    });
+
+    expect(formatDoctorReport(report)).not.toContain(remoteToken);
+    expect(report.checks.every((check) => !check.detail.includes(remoteToken))).toBe(true);
+  });
 });
 
 function config(workspaceRoot: string, dbPath: string): AppConfig {

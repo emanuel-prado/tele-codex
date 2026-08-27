@@ -19,6 +19,20 @@ describe("loadConfig", () => {
     expect(config.rateLimitWarnPercent).toBe(80);
     expect(config.transcriptRetentionDays).toBeUndefined();
     expect(config.workspaceRoot.endsWith("/Workspace")).toBe(true);
+    expect(config.appServerToken).toBeUndefined();
+  });
+
+  it.each([
+    ["remote secret", "  bearer value  "],
+    ["blank remote secret", ""]
+  ])("parses a %s without changing it", (_description, token) => {
+    const config = loadConfig({
+      TELE_CODEX_BOT_TOKEN: "token",
+      TELE_CODEX_ALLOWED_USER_IDS: "1",
+      TELE_CODEX_APP_SERVER_TOKEN: token
+    });
+
+    expect(config.appServerToken).toBe(token);
   });
 
   it("ignores removed legacy tmux environment keys", () => {

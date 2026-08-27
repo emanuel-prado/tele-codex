@@ -19,9 +19,69 @@ type AdapterInternals = {
   waitForFailure(): Promise<void>;
 };
 
-afterEach(() => vi.useRealTimers());
+afterEach(() => {
+  vi.useRealTimers();
+  vi.unstubAllEnvs();
+});
 
 describe("AppServerAdapter connection generations", () => {
+  it("forwards the configured remote token exactly and ignores later ambient changes", async () => {
+    const store = new Store(":memory:");
+    const server = new ConnectionRecordingAppServer();
+    const remoteToken = "  configured remote secret  ";
+    vi.stubEnv("TELE_CODEX_APP_SERVER_TOKEN", "ambient secret before startup");
+    const adapter = new AppServerAdapter({
+      ...config(), appServerUrl: "wss://app-server.example.test", appServerToken: remoteToken
+    }, store, logger(), undefined, server);
+    vi.stubEnv("TELE_CODEX_APP_SERVER_TOKEN", "ambient secret after configuration");
+
+    await adapter.startTransport();
+
+    expect(server.websocketConnections).toEqual([{
+      url: "wss://app-server.example.test",
+      token: remoteToken,
+      generation: 1
+    }]);
+    adapter.close();
+    store.close();
+  });
+
+  it.each([
+    ["missing", undefined],
+    ["blank", ""]
+  ])("preserves unauthenticated remote startup when the token is %s", async (_description, token) => {
+    const store = new Store(":memory:");
+    const server = new ConnectionRecordingAppServer();
+    const remoteConfig: AppConfig = { ...config(), appServerUrl: "wss://app-server.example.test" };
+    if (token !== undefined) remoteConfig.appServerToken = token;
+    const adapter = new AppServerAdapter(remoteConfig, store, logger(), undefined, server);
+
+    await adapter.startTransport();
+
+    expect(server.websocketConnections).toEqual([{
+      url: "wss://app-server.example.test",
+      token,
+      generation: 1
+    }]);
+    adapter.close();
+    store.close();
+  });
+
+  it("does not forward a configured remote token to local stdio", async () => {
+    const store = new Store(":memory:");
+    const server = new ConnectionRecordingAppServer();
+    const adapter = new AppServerAdapter({
+      ...config(), appServerToken: "remote-only secret"
+    }, store, logger(), undefined, server);
+
+    await adapter.startTransport();
+
+    expect(server.stdioConnections).toEqual([{ command: "codex", generation: 1 }]);
+    expect(server.websocketConnections).toEqual([]);
+    adapter.close();
+    store.close();
+  });
+
   it("invalidates persisted attachments and requests on restart", () => {
     const store = new Store(":memory:");
     store.upsertSession({
@@ -337,4 +397,19 @@ function config(): AppConfig {
 
 function logger(): never {
   return { debug() {}, warn() {}, error() {}, fatal() {} } as never;
+}
+
+class ConnectionRecordingAppServer extends FakeAppServer {
+  readonly websocketConnections: Array<{ url: string; token: string | undefined; generation: number | undefined }> = [];
+  readonly stdioConnections: Array<{ command: string; generation: number | undefined }> = [];
+
+  override async connectWebSocket(url: string, token?: string, generation?: number): Promise<number> {
+    this.websocketConnections.push({ url, token, generation });
+    return super.connectWebSocket(url, token, generation);
+  }
+
+  override async connectStdio(command: string, generation?: number): Promise<number> {
+    this.stdioConnections.push({ command, generation });
+    return super.connectStdio(command, generation);
+  }
 }

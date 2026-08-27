@@ -1,5 +1,5 @@
 const REDACTED = "[redacted]";
-const SENSITIVE_FIELD = /^(?:args?|answers?|decision|payload|params|chunk|cwd|path|workspaceRoot|botToken|token|url|input)$/i;
+const SENSITIVE_FIELD = /^(?:args?|answers?|decision|payload|params|chunk|cwd|path|workspaceRoot|botToken|appServerToken|TELE_CODEX_APP_SERVER_TOKEN|token|url|input)$/i;
 
 export function sanitizeDiagnosticText(value: string): string {
   return value
