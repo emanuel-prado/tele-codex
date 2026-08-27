@@ -11,6 +11,13 @@ The canonical issue tracker is GitHub Issues in
 - Express dependencies with GitHub issue references. Use `None` when an issue
   has no blockers.
 - Apply one triage-state label and any relevant type label.
-- Link pull requests to their owning issue. Use `Closes #...` only when the
-  pull request fully satisfies that issue.
-- Open pull requests as drafts unless a human explicitly requests otherwise.
+- When work starts, use the issue's Development control to create a linked
+  `agent/<issue-number>-<short-kebab-description>` branch from the default
+  `develop` branch.
+- Open issue pull requests against `develop` as drafts. Reference the owning
+  issue and use `Closes #...` only when that pull request fully satisfies it.
+- Use a Conventional Commit pull-request title. Squash issue pull requests into
+  `develop` so that title becomes the integration commit.
+- Only manual `develop` to `master` promotion pull requests and Release Please
+  pull requests target `master`. Stable releases come from immutable tags, not
+  an arbitrary branch head.
