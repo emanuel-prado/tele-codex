@@ -1,4 +1,7 @@
 import { describe, expect, it } from "vitest";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { SessionManager } from "../src/runtime/session-manager.js";
 import { Store } from "../src/store/store.js";
 import type { AppServerRuntime } from "../src/types/adapter.js";
@@ -77,6 +80,104 @@ describe("SessionManager approval acknowledgement", () => {
 });
 
 describe("SessionManager thread lifecycle", () => {
+  it("pauses and resumes input for the same selected thread", async () => {
+    const store = new Store(":memory:");
+    const manager = new SessionManager(fakeAppServer(store, [], []), store, silentLogger());
+    const session = store.upsertSession({
+      id: "session_1", adapter: "appserver", label: "one", codexThreadId: "thread_1"
+    }, "idle");
+    manager.setActiveSession(session.id);
+
+    expect(manager.pause()).toMatchObject({ changed: true, session: { id: session.id, paused: true } });
+
+    expect(manager.getActiveSession()).toBeUndefined();
+    await expect(manager.sendToActive("unsafe")).rejects.toThrow(/no active/i);
+    await expect(manager.sendToSession(session.id, "unsafe")).rejects.toThrow(/cannot receive input/i);
+
+    expect(manager.resume()).toMatchObject({ changed: true, session: { id: session.id, paused: false } });
+
+    expect(manager.getActiveSession()?.id).toBe(session.id);
+    expect(store.getSession(session.id)?.paused).toBe(false);
+    store.close();
+  });
+
+  it("reports repeated pause controls without changing the selected thread", () => {
+    const store = new Store(":memory:");
+    const manager = new SessionManager(fakeAppServer(store, [], []), store, silentLogger());
+    const session = store.upsertSession({
+      id: "session_1", adapter: "appserver", label: "one", codexThreadId: "thread_1"
+    }, "idle");
+    manager.setActiveSession(session.id);
+
+    expect(manager.pause().changed).toBe(true);
+    expect(manager.pause()).toMatchObject({ changed: false, session: { id: session.id, paused: true } });
+    expect(manager.resume().changed).toBe(true);
+    expect(manager.resume()).toMatchObject({ changed: false, session: { id: session.id, paused: false } });
+    expect(manager.getActiveSession()?.id).toBe(session.id);
+    store.close();
+  });
+
+  it.each([
+    ["detached", "detached or unavailable"],
+    ["archived", "archived"]
+  ] as const)("does not unpause a %s thread", (status, message) => {
+    const store = new Store(":memory:");
+    const manager = new SessionManager(fakeAppServer(store, [], []), store, silentLogger());
+    const session = store.upsertSession({
+      id: "session_1", adapter: "appserver", label: "one", codexThreadId: "thread_1"
+    }, "idle");
+    manager.setActiveSession(session.id);
+    manager.pause();
+    if (status === "detached") store.markThreadDetached(session.id);
+    else store.markThreadArchived(session.id);
+
+    expect(() => manager.resume(session.id)).toThrow(message);
+    expect(store.getSession(session.id)?.paused).toBe(true);
+    expect(manager.getActiveSession()).toBeUndefined();
+    store.close();
+  });
+
+  it("reports a forgotten paused thread and does not select another thread", () => {
+    const store = new Store(":memory:");
+    const manager = new SessionManager(fakeAppServer(store, [], []), store, silentLogger());
+    const session = store.upsertSession({
+      id: "session_1", adapter: "appserver", label: "one", codexThreadId: "thread_1"
+    }, "idle");
+    manager.setActiveSession(session.id);
+    manager.pause();
+    store.forgetThread(session.id);
+
+    expect(() => manager.resume()).toThrow(/no longer exists.*select or resume/i);
+    expect(manager.getActiveSession()).toBeUndefined();
+    store.close();
+  });
+
+  it("does not restore paused input or thread selection after restart", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "tele-codex-pause-restart-"));
+    const database = join(directory, "state.db");
+    const firstStore = new Store(database);
+    const firstManager = new SessionManager(fakeAppServer(firstStore, [], []), firstStore, silentLogger());
+    const session = firstStore.upsertSession({
+      id: "session_1", adapter: "appserver", label: "one", codexThreadId: "thread_1"
+    }, "idle");
+    firstManager.setActiveSession(session.id);
+    firstManager.pause();
+    firstStore.close();
+
+    const restartedStore = new Store(database);
+    const restartedManager = new SessionManager(fakeAppServer(restartedStore, [], []), restartedStore, silentLogger());
+
+    expect(restartedManager.getActiveSession()).toBeUndefined();
+    expect(() => restartedManager.resume()).toThrow(/no paused Codex thread.*explicitly/i);
+    expect(restartedStore.getSession(session.id)).toMatchObject({ status: "detached", paused: true });
+    await expect(restartedManager.sendToActive("unsafe")).rejects.toThrow(/no active/i);
+
+    await restartedManager.resumeSession(session.id);
+    expect(restartedManager.getActiveSession()).toMatchObject({ id: session.id, paused: false });
+    restartedStore.close();
+    await rm(directory, { recursive: true });
+  });
+
   it("interrupts without deleting the thread, then detaches, resumes, archives, and forgets explicitly", async () => {
     const store = new Store(":memory:");
     const calls: Array<{ operation: string; value?: unknown }> = [];

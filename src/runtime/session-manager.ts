@@ -19,6 +19,7 @@ export class SessionManager {
   private readonly queue = new AsyncQueue<CodexEvent>();
   private forwardPromise?: Promise<void>;
   private activeSessionId?: string;
+  private pausedSessionId?: string;
 
   constructor(
     private readonly appserver: AppServerRuntime,
@@ -159,21 +160,21 @@ export class SessionManager {
     const session = this.resolveSession(sessionId);
     await this.appserver.archiveThread(session.id);
     this.store.markThreadArchived(session.id);
-    this.clearActiveId(session.id);
+    this.clearSelectedId(session.id);
   }
 
   async detach(sessionId?: string): Promise<void> {
     const session = this.resolveSession(sessionId);
     await this.appserver.detach(session.id);
     this.store.markThreadDetached(session.id);
-    this.clearActiveId(session.id);
+    this.clearSelectedId(session.id);
   }
 
   async forget(sessionId?: string): Promise<void> {
     const session = this.resolveSession(sessionId);
     if (session.codexThreadId) await this.appserver.detach(session.id);
     this.store.forgetThread(session.id);
-    this.clearActiveId(session.id);
+    this.clearSelectedId(session.id);
   }
 
   async sendToActive(text: string): Promise<void> {
@@ -267,16 +268,24 @@ export class SessionManager {
     return expired;
   }
 
-  pause(sessionId?: string): void {
-    const session = this.resolveSession(sessionId);
-    this.store.setPaused(session.id, true);
+  pause(sessionId?: string): { session: StoredSession; changed: boolean } {
+    const session = this.resolveInputControlSession("pause", sessionId);
+    this.assertInputControlAvailable(session);
+    const changed = !session.paused;
+    if (changed) this.store.setPaused(session.id, true);
     this.clearActiveId(session.id);
+    this.pausedSessionId = session.id;
+    return { session: this.store.getSession(session.id) ?? session, changed };
   }
 
-  resume(sessionId?: string): void {
-    const session = this.resolveSession(sessionId);
-    this.store.setPaused(session.id, false);
+  resume(sessionId?: string): { session: StoredSession; changed: boolean } {
+    const session = this.resolveInputControlSession("resume", sessionId);
+    this.assertInputControlAvailable(session);
+    const changed = session.paused;
+    if (changed) this.store.setPaused(session.id, false);
+    if (this.pausedSessionId === session.id) delete this.pausedSessionId;
     this.setActiveId(session.id);
+    return { session: this.store.getSession(session.id) ?? session, changed };
   }
 
   async kill(sessionId?: string): Promise<void> {
@@ -328,6 +337,7 @@ export class SessionManager {
     if (!session || !this.canReceiveInput(session)) {
       throw new Error("This session cannot receive input. Resume it before selecting it.");
     }
+    delete this.pausedSessionId;
     this.activeSessionId = sessionId;
     this.store.setRuntimeValue("last_active_session_id", sessionId);
   }
@@ -336,6 +346,47 @@ export class SessionManager {
     if (this.activeSessionId === sessionId) delete this.activeSessionId;
     if (this.store.getRuntimeValue<string>("last_active_session_id") === sessionId) {
       this.store.deleteRuntimeValue("last_active_session_id");
+    }
+  }
+
+  private clearSelectedId(sessionId: string): void {
+    this.clearActiveId(sessionId);
+    if (this.pausedSessionId === sessionId) delete this.pausedSessionId;
+  }
+
+  private resolveInputControlSession(operation: "pause" | "resume", sessionId?: string): StoredSession {
+    if (sessionId) {
+      const session = this.store.getSession(sessionId);
+      if (!session) throw new Error("The selected Codex thread no longer exists. Select or resume a thread explicitly.");
+      return session;
+    }
+    if (operation === "resume" && this.pausedSessionId) {
+      const session = this.store.getSession(this.pausedSessionId);
+      if (session) return session;
+      delete this.pausedSessionId;
+      throw new Error("The paused Codex thread no longer exists. Select or resume a thread explicitly.");
+    }
+    const active = this.getActiveSession();
+    if (active) return active;
+    if (operation === "pause" && this.pausedSessionId) {
+      const session = this.store.getSession(this.pausedSessionId);
+      if (session) return session;
+      delete this.pausedSessionId;
+    }
+    throw new Error(operation === "pause"
+      ? "No Codex thread is selected. Select or resume a thread before pausing input."
+      : "No paused Codex thread is available. Select or resume a thread explicitly.");
+  }
+
+  private assertInputControlAvailable(session: StoredSession): void {
+    if (session.status === "archived") {
+      throw new Error("This Codex thread is archived. Restore it from Codex history before changing input forwarding.");
+    }
+    if (session.status === "detached" || session.status === "error" || session.status === "stopped") {
+      throw new Error("This Codex thread is detached or unavailable. Resume it explicitly before changing input forwarding.");
+    }
+    if (!["attached", "idle", "active", "blocked"].includes(session.status)) {
+      throw new Error("This Codex thread cannot change input forwarding in its current state.");
     }
   }
 
