@@ -66,4 +66,5 @@ npm run build
 - [Controller handbook](docs/user-guide.md)
 - [Technical design](docs/technical-design.md)
 - [App-server contract testing](docs/app-server-contract-testing.md)
+- [Versioning and releases](docs/versioning.md)
 - [Domain language](CONTEXT.md)
