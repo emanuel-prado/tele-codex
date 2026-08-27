@@ -15,9 +15,10 @@ A version has the form `MAJOR.MINOR.PATCH`:
 - `PATCH` changes for backward-compatible fixes, security hardening, and
   documentation-only corrections that need a release.
 
-Before `1.0.0`, the project is still establishing its compatibility contract.
-Breaking changes may therefore increment `MINOR`; release notes must call them
-out and provide migration instructions. A stable `0.x` release means that the
+Release Please derives the next version from Conventional Commits. A breaking
+change increments `MAJOR`, `feat` increments `MINOR`, and `fix` or `perf`
+increments `PATCH`. Other commit types do not trigger a release by themselves,
+but are included in the next changelog. A stable `0.x` release means that the
 tagged snapshot passed the release gate and is suitable for the supported
 single-Controller deployment model. It does not imply a stable public API.
 
@@ -36,15 +37,33 @@ pin an exact version tag or commit so that a deployment remains reproducible.
 Once published, a version tag is never moved or reused; corrections receive a
 new version.
 
+## Branch flow
+
+`develop` is the default integration branch. Work starts from an issue-linked
+`agent/<issue-number>-<short-kebab-description>` branch and returns to
+`develop` through a squash-merged pull request with a Conventional Commit
+title. When a release batch is ready, a maintainer opens a `develop` to
+`master` promotion pull request and merges it with a merge commit.
+
+`master` is the stable release branch. Release Please reacts to a promotion by
+opening or updating a release pull request against `master`. That pull request
+contains the synchronized `package.json`, `package-lock.json`, release
+manifest, and `CHANGELOG.md`. After a release, automation opens a `master` to
+`develop` synchronization pull request so new issue branches inherit the
+released version.
+
 ## Release procedure
 
-1. Start a release branch from the latest default branch.
-2. Choose the next version from the user-visible and operational impact since
-   the previous stable tag.
-3. Update `package.json` and `package-lock.json` together. Summarize behavior
-   changes, migrations, security considerations, and known limitations in the
-   pull request or release notes.
-4. Run the complete repository gate:
+1. Merge issue pull requests into `develop`. The Conventional Commit titles
+   determine the next version and changelog categories.
+2. Open and review a manual `develop` to `master` promotion pull request.
+3. Merge the promotion with a merge commit. Release Please then creates or
+   updates the release pull request against `master`.
+4. Confirm that the release pull request updates `package.json`, both root
+   version fields in `package-lock.json`, `.release-please-manifest.json`, and
+   `CHANGELOG.md` to one version.
+5. Run the complete repository gate on both promotion and release pull
+   requests:
 
    ```bash
    npm run typecheck
@@ -54,17 +73,17 @@ new version.
 
    Also run `npm run test:appserver` when the installed Codex app-server
    contract or adapter integration changed.
-5. Merge the reviewed release change into the default branch.
-6. Create the annotated tag on the merge commit and verify that its version
-   matches `package.json`:
+6. Merge the release pull request with a merge commit. Release Please creates
+   the immutable `vX.Y.Z` tag and stable GitHub Release from that exact commit;
+   this private package is not published to npm.
+7. Verify the tag, package metadata, changelog heading, and GitHub Release all
+   name the same version. Merge the generated synchronization pull request back
+   into `develop` after its checks pass.
 
-   ```bash
-   git tag -a vX.Y.Z -m "Release vX.Y.Z"
-   git push origin vX.Y.Z
-   ```
-
-7. Publish release notes from that exact tag. Record any check that could not be
-   run; never describe an unverified check as passing.
+Release automation authenticates with the repository-scoped
+`RELEASE_PLEASE_TOKEN` secret. Never print, log, or commit that credential.
+Record any check that could not be run; never describe an unverified check as
+passing.
 
 Urgent fixes follow the same procedure. If a published release must be
 withdrawn, document the reason and release a new version rather than changing
