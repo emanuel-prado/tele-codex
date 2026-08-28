@@ -117,6 +117,24 @@ describe("README documentation", () => {
     expect(documented).toEqual(expected);
     expect(await read(".env.example")).toMatch(/^TELE_CODEX_APP_SERVER_TOKEN=$/m);
   });
+
+  it("keeps release metadata synchronized and documents the protected branch flow", async () => {
+    const packageJson = JSON.parse(await read("package.json")) as { version: string };
+    const packageLock = JSON.parse(await read("package-lock.json")) as {
+      packages: Record<string, { version?: string }>;
+      version: string;
+    };
+    const releaseManifest = JSON.parse(await read(".release-please-manifest.json")) as Record<string, string>;
+    const versioning = await read("docs/versioning.md");
+    const agentRules = await read("AGENTS.md");
+
+    expect(packageLock.version).toBe(packageJson.version);
+    expect(packageLock.packages[""]?.version).toBe(packageJson.version);
+    expect(releaseManifest["."]).toBe(packageJson.version);
+    expect(versioning).toContain("`develop` is the default integration branch");
+    expect(versioning).toContain("`master` is the stable release branch");
+    expect(agentRules).toContain("`agent/<issue-number>-<short-kebab-description>`");
+  });
 });
 
 async function read(path: string): Promise<string> {

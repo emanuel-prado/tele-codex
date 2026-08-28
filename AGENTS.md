@@ -4,14 +4,15 @@ These instructions apply to the entire repository. Repository-specific security 
 
 ## Shared Delivery Contract
 
-- Never implement directly on `main`, `master`, or another default branch.
-- Start each implementation slice from an up-to-date default branch and create `agent/<issue-or-slice>-<short-kebab-description>`.
+- Never implement directly on `develop`, `master`, or another protected branch.
+- Start each implementation slice from the owning GitHub issue's Development control. Create `agent/<issue-number>-<short-kebab-description>` from the up-to-date `develop` default branch so the branch and pull request remain linked to the issue.
 - Keep one coherent implementation slice per branch, worktree, commit series, and pull request.
 - Use a separate git worktree for concurrent or unfinished agent sessions. Never reuse a dirty worktree or overwrite unrelated user work.
 - Use Conventional Commits: `<type>(optional-scope): <imperative summary>`.
 - Run the narrowest relevant checks while developing, then the complete documented verification suite before publishing.
 - Report exactly which checks ran, their results, and anything skipped. Never claim an unrun check passed.
-- Open pull requests as drafts by default. Link the owning issue and use `Closes #...` only when the pull request fully satisfies it.
+- Open issue pull requests against `develop` as drafts by default. Reference the owning issue and use `Closes #...` only when the pull request fully satisfies it.
+- Squash issue pull requests into `develop`. Only reviewed `develop` promotion pull requests and Release Please pull requests may target `master`; merge those with merge commits. Post-release synchronization pull requests flow from `master` back to `develop`.
 - Do not expand scope, perform drive-by refactors, merge, enable auto-merge, mark ready for review, force-push, rewrite published history, resolve review threads, or dismiss feedback unless explicitly asked.
 
 ## Security and Trust Boundary

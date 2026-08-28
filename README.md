@@ -67,4 +67,5 @@ npm run build
 - [Technical design](docs/technical-design.md)
 - [App-server contract testing](docs/app-server-contract-testing.md)
 - [Versioning and releases](docs/versioning.md)
+- [Changelog](CHANGELOG.md)
 - [Domain language](CONTEXT.md)
