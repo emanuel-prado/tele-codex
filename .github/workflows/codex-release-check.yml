@@ -1,0 +1,115 @@
+name: Codex release compatibility
+
+on:
+  schedule:
+    - cron: "17 13 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: codex-release-compatibility
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      classification: ${{ steps.release.outputs.classification }}
+    steps:
+      - name: Checkout develop
+        uses: actions/checkout@v4
+        with:
+          ref: develop
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install project dependencies
+        run: npm ci
+
+      - name: Check newest stable Codex release
+        id: release
+        run: npm run check:codex-release
+        env:
+          CODEX_RELEASE_OUTPUT_DIR: codex-release-result
+
+      - name: Upload contract result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-release-result
+          path: |
+            codex-release-result/
+            contracts/app-server/contract.json
+            src/adapters/app-server-contract.ts
+          if-no-files-found: error
+          retention-days: 30
+
+  compatible:
+    needs: check
+    if: needs.check.outputs.classification == 'compatible'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout develop
+        uses: actions/checkout@v4
+        with:
+          ref: develop
+
+      - name: Restore checked contract refresh
+        uses: actions/download-artifact@v4
+        with:
+          name: codex-release-result
+          path: .
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install project dependencies
+        run: npm ci
+
+      - name: Verify compatible refresh
+        run: |
+          npm run typecheck
+          npm test
+          npm run build
+          npm run contract:fixture
+
+      - name: Create or reuse draft update pull request
+        run: node --experimental-strip-types scripts/codex-release.ts publish-compatible
+        env:
+          CODEX_RELEASE_OUTPUT_DIR: codex-release-result
+          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+
+  incompatible:
+    needs: check
+    if: needs.check.outputs.classification == 'incompatible'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Checkout develop
+        uses: actions/checkout@v4
+        with:
+          ref: develop
+
+      - name: Restore compatibility report
+        uses: actions/download-artifact@v4
+        with:
+          name: codex-release-result
+          path: .
+
+      - name: Create or update compatibility issue
+        run: node --experimental-strip-types scripts/codex-release.ts publish-incompatible
+        env:
+          CODEX_RELEASE_OUTPUT_DIR: codex-release-result
+          GH_TOKEN: ${{ github.token }}
