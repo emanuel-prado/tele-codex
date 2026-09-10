@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { describe, expect, it } from "vitest";
 import { formatDoctorReport, runDoctor, runDoctorFromEnv } from "../src/runtime/doctor.js";
 import type { AppConfig } from "../src/config.js";
+import { APP_SERVER_CONTRACT_VERSION } from "../src/adapters/app-server-contract.js";
 import { Store } from "../src/store/store.js";
 
 describe("doctor", () => {
@@ -22,7 +23,7 @@ describe("doctor", () => {
     expect(report.ok).toBe(true);
     expect(report.checks.some((check) => check.name.toLowerCase().includes("tmux"))).toBe(false);
     expect(report.checks.find((check) => check.name === "Codex app-server")?.detail)
-      .toBe("installed codex 1.0.0; checked contract codex-cli 0.148.0");
+      .toBe(`installed codex 1.0.0; checked contract ${APP_SERVER_CONTRACT_VERSION}`);
     expect(formatDoctorReport(report)).toContain("tele-codex doctor: ok");
   });
 
