@@ -1,8 +1,9 @@
 name: PR policy
-
 on:
   pull_request:
     types: [opened, edited, synchronize, reopened]
+
+cache-mode: none
 
 permissions:
   contents: read
