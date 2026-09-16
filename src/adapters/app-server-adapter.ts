@@ -32,6 +32,7 @@ export class AppServerAdapter implements AppServerRuntime {
   private readonly queue = new AsyncQueue<CodexEvent>();
   private readonly sessionsByThread = new Map<string, { sessionId: string; generation: number }>();
   private readonly activeTurns = new Map<string, string>();
+  private readonly completedTurns = new Map<string, string>();
   private readonly sessionModels = new Map<string, string>();
   private readonly recoveringSessionIds = new Set<string>();
   private connected = false;
@@ -529,6 +530,7 @@ export class AppServerAdapter implements AppServerRuntime {
     this.connectionGeneration = undefined;
     this.health.appServer({ state: "reconnecting", pid: undefined, detail: "App-server transport disconnected." });
     this.activeTurns.clear();
+    this.completedTurns.clear();
     const openActions = this.store.listOpenActions(generation);
     const orphaned = this.store.orphanOpenActions(generation);
     const detachedSessionIds = new Set(this.store.clearSessionAttachments(generation));
@@ -744,11 +746,35 @@ export class AppServerAdapter implements AppServerRuntime {
       return;
     }
 
+    if (message.method === "item/plan/delta") {
+      // Proposed plans are delivered once, from the authoritative final item.
+      // Deltas can differ from that final text and must not enter the Transcript.
+      return;
+    }
+
+    if (message.method === "item/completed") {
+      const item = asRecord(params.item);
+      if (item.type === "plan" && typeof item.id === "string" && typeof item.text === "string" &&
+          item.text.trim() && typeof params.turnId === "string" &&
+          this.activeTurns.get(sessionId) === params.turnId) {
+        this.queue.push({
+          type: "proposedPlan", sessionId, turnId: params.turnId, itemId: item.id, text: item.text,
+          connectionGeneration: generation,
+          ...(this.sessionModels.get(sessionId) ? { model: this.sessionModels.get(sessionId)! } : {})
+        });
+      }
+      return;
+    }
+
     if (message.method === "turn/completed") {
       const turn = asRecord(params.turn);
+      if (typeof turn.id !== "string" || this.completedTurns.get(sessionId) === turn.id) return;
+      const activeTurn = this.activeTurns.get(sessionId);
+      if (activeTurn && activeTurn !== turn.id) return;
       const status = turn.status === "failed" || turn.status === "interrupted" ? turn.status : "completed";
       this.store.setActiveTurn(sessionId, null, status === "failed" ? "error" : "idle");
       this.activeTurns.delete(sessionId);
+      this.completedTurns.set(sessionId, turn.id);
       const event: CodexEvent = {
         type: "taskCompleted",
         sessionId,
@@ -756,6 +782,8 @@ export class AppServerAdapter implements AppServerRuntime {
         summary: `Turn ${status}.`
       };
       if (typeof turn.id === "string") event.turnId = turn.id;
+      const sessionVersion = this.store.getSessionResourceVersion(sessionId);
+      if (sessionVersion !== undefined) event.sessionVersion = sessionVersion;
       this.queue.push(event);
       return;
     }

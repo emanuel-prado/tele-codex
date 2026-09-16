@@ -285,6 +285,14 @@ Routine starts and clean restarts do not send a generic recovery card. Durable n
 
 ## Telegram command reference
 
+When a planning turn completes, Telegram delivers the finalized plan followed by three choices:
+
+- **Implement** switches the original thread to default mode and starts implementation.
+- **Clear and implement** starts a fresh thread in the same workspace using the same model and the final plan. The original thread is preserved. New threads use the bridge's standard approval and sandbox settings.
+- **Keep planning** keeps plan mode and routes your next message to the original thread as feedback (within five minutes).
+
+Plan buttons expire after ten minutes and cannot be reused after another turn, a disconnect, or a restart. If an action cannot be confirmed, inspect `/sessions` and select the thread explicitly with `/send` before trying again. The bridge does not automatically retry implementation. Failed plan-message delivery can be inspected with `/health` and retried with `/retrydelivery`.
+
 The table has one row for each root command registered with Telegram. Optional arguments are shown in the purpose column so the root command remains unambiguous.
 
 | Command | Purpose |

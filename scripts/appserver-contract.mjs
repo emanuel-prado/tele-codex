@@ -39,13 +39,18 @@ try {
     const schema = JSON.parse(await readFile(join(jsonDirectory, path), "utf8"));
     requiredFields[path] = [...(schema.required ?? [])].sort();
   }
+  const itemSchema = JSON.parse(await readFile(join(jsonDirectory, "v2/ItemCompletedNotification.json"), "utf8"));
+  const itemVariants = itemSchema.definitions?.ThreadItem;
+  const planVariant = (itemVariants?.oneOf ?? itemVariants?.anyOf ?? []).find((item) => item.properties?.type?.enum?.includes("plan"));
+  const planItemFields = [...(planVariant?.required ?? [])].sort();
   const generated = {
     codexVersion: version,
     generatedAt: new Date().toISOString().slice(0, 10),
     clientMethods: fixture.clientMethods,
     serverMethods: fixture.serverMethods,
     notifications: fixture.notifications,
-    requiredFields
+    requiredFields,
+    planItemFields
   };
   if (refresh) {
     await writeFile(fixtureUrl, `${JSON.stringify(generated, null, 2)}\n`);
@@ -64,6 +69,9 @@ try {
         ? []
         : [`shape ${path}: expected [${fixture.requiredFields[path].join(", ")}], received [${fields.join(", ")}]`]
     );
+    if (JSON.stringify(planItemFields) !== JSON.stringify(fixture.planItemFields) || planVariant?.properties?.text?.type !== "string") {
+      changedShapes.push("proposed plan item shape changed");
+    }
     if (missing.length > 0 || changedShapes.length > 0) {
       const details = [...missing, ...changedShapes].map((line) => `  ${line}`).join("\n");
       throw new Error(`installed app-server contract differs from ${fixture.codexVersion}:\n${details}\nRun npm run contract:refresh and review the protocol changes.`);

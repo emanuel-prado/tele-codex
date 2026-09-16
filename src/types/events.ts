@@ -1,5 +1,14 @@
 import type { RateLimitSummary, ThreadGoalSummary } from "./control.js";
 
+export interface ProposedPlan {
+  sessionId: string;
+  turnId: string;
+  itemId: string;
+  text: string;
+  model?: string;
+  connectionGeneration: number;
+}
+
 export type SessionStatus =
   | "starting"
   | "attached"
@@ -65,6 +74,7 @@ export interface PendingAction {
 }
 
 export type CodexEvent =
+  | ({ type: "proposedPlan" } & ProposedPlan)
   | {
       type: "approvalRequested";
       sessionId: string;
@@ -89,6 +99,7 @@ export type CodexEvent =
       summary: string;
       status: "completed" | "failed" | "interrupted";
       turnId?: string;
+      sessionVersion?: number;
     }
   | {
       type: "error";

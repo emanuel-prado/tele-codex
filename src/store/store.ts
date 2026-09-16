@@ -4,6 +4,7 @@ import type { RateLimitSummary, SessionProgress, SessionTokenUsage, ThreadGoalSu
 import type { LogEntry, PendingAction, SessionRef, SessionStatus } from "../types/events.js";
 import { sanitizeDiagnosticText } from "../runtime/diagnostics.js";
 import { createId } from "../utils/ids.js";
+import { ProposedPlanRepository } from "./proposed-plan-repository.js";
 import { migrateDatabase, schemaVersion } from "./migrations.js";
 import {
   InteractionRepository,
@@ -64,6 +65,7 @@ export interface OutboxMessage {
   actionId?: string;
   payload: {
     text: string;
+    sessionId?: string;
     parseMode?: "MarkdownV2";
     keyboard?: unknown[][];
   };
@@ -149,6 +151,7 @@ export class Store {
   readonly transcripts: TranscriptRepository;
   readonly runtimeState: RuntimeStateRepository;
   readonly threadRuntime: ThreadRuntimeRepository;
+  readonly proposedPlans: ProposedPlanRepository;
 
   constructor(path: string) {
     this.path = path;
@@ -167,6 +170,7 @@ export class Store {
     this.transcripts = new TranscriptRepository(this.db);
     this.runtimeState = new RuntimeStateRepository(this.db);
     this.threadRuntime = new ThreadRuntimeRepository(this.db);
+    this.proposedPlans = new ProposedPlanRepository(this.db);
     this.reconcilePersistedAppServerRuntime();
     this.releaseStaleCallbackClaims(Date.now() + 1);
   }
@@ -290,6 +294,7 @@ export class Store {
         this.db.prepare(`delete from ${table} where session_id = ?`).run(sessionId);
       }
       this.threadRuntime.deleteSession(sessionId);
+      this.db.prepare("delete from proposed_plans where session_id = ?").run(sessionId);
       for (const table of ["routing_composes", "sticky_routes", "session_chats", "telegram_thread_messages"]) {
         this.db.prepare(`delete from ${table} where session_id = ?`).run(sessionId);
       }
@@ -786,6 +791,9 @@ export class Store {
       const transcripts = policy.transcriptRetentionMs === undefined ? 0 : this.db.prepare(
         "delete from transcript_chunks where timestamp < ? and finalized_at is not null"
       ).run(now - policy.transcriptRetentionMs).changes;
+      if (policy.transcriptRetentionMs !== undefined) {
+        this.db.prepare("delete from proposed_plans where recorded_at < ?").run(now - policy.transcriptRetentionMs);
+      }
       return { callbackTokens, interactionDrafts, sentOutbox, logs, actions, transcripts };
     })();
   }

@@ -37,6 +37,8 @@
     "error",
     "guardianWarning",
     "item/agentMessage/delta",
+    "item/completed",
+    "item/plan/delta",
     "model/rerouted",
     "serverRequest/resolved",
     "thread/goal/cleared",
@@ -50,7 +52,20 @@
     "turn/started",
     "warning"
   ],
+  "planItemFields": ["id", "text", "type"],
   "requiredFields": {
+    "v2/ItemCompletedNotification.json": [
+      "completedAtMs",
+      "item",
+      "threadId",
+      "turnId"
+    ],
+    "v2/PlanDeltaNotification.json": [
+      "delta",
+      "itemId",
+      "threadId",
+      "turnId"
+    ],
     "CommandExecutionRequestApprovalParams.json": [
       "itemId",
       "startedAtMs",

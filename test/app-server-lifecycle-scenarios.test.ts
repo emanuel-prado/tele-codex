@@ -8,6 +8,33 @@ import { FakeAppServer } from "./support/fake-app-server.js";
 afterEach(() => vi.useRealTimers());
 
 describe("app-server lifecycle scenarios", () => {
+  it.each([true, false])("publishes authoritative plan text with deltas=%s and accepts the next turn", async (deltas) => {
+    const scenario = createScenario();
+    scenario.server.respondTo("thread/start", { thread: { id: "thread-a" }, model: "gpt-test" });
+    scenario.server.respondTo("turn/start", { turn: { id: "turn-a" } });
+    const session = await scenario.adapter.start({ cwd: "/tmp", prompt: "plan" });
+    if (deltas) scenario.server.notification("item/plan/delta", {
+      threadId: "thread-a", turnId: "turn-a", itemId: "plan-a", delta: "draft that differs"
+    });
+    scenario.server.notification("item/completed", {
+      threadId: "thread-a", turnId: "old-turn", item: { type: "plan", id: "old-plan", text: "stale" }
+    });
+    scenario.server.notification("item/completed", {
+      threadId: "thread-a", turnId: "turn-a", item: { type: "plan", id: "plan-a", text: "Final plan" }
+    });
+    scenario.server.notification("turn/completed", { threadId: "thread-a", turn: { id: "turn-a", status: "completed" } });
+    const completedVersion = scenario.store.getSessionResourceVersion(session.id);
+    scenario.server.notification("turn/completed", { threadId: "thread-a", turn: { id: "turn-a", status: "completed" } });
+    expect(scenario.store.getSessionResourceVersion(session.id)).toBe(completedVersion);
+    expect(await takeEvents(scenario.adapter.events(), 2)).toMatchObject([
+      { type: "proposedPlan", sessionId: session.id, turnId: "turn-a", itemId: "plan-a", text: "Final plan", model: "gpt-test", connectionGeneration: 1 },
+      { type: "taskCompleted", status: "completed" }
+    ]);
+    await scenario.adapter.sendUserText(session.id, "implement");
+    expect(scenario.server.messages("turn/start")).toHaveLength(2);
+    scenario.close();
+  });
+
   it("rejects a user-input request without explicit blocking semantics", async () => {
     const scenario = createScenario();
     scenario.server.respondTo("thread/start", { thread: { id: "thread-a" } });
