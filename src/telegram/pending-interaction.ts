@@ -206,16 +206,16 @@ export class PendingInteractionManager {
       return { kind: "notice", text: "That request no longer exists. Start again from /pending." };
     }
     if (action.expiresAt <= Date.now() || action.status === "expired") {
-      return { kind: "notice", text: "That request expired. Run /pending to review current requests." };
+      return { kind: "notice", text: "That request expired. Run /pending to review requests, or /cancelanswer to leave answer entry." };
     }
     if (action.status === "failed") {
-      return { kind: "notice", text: "The previous submission failed. Run /pending to retry it explicitly." };
+      return { kind: "notice", text: "The previous submission failed. Run /pending to retry it explicitly, or /cancelanswer to leave answer entry." };
     }
     if (action.status === "submitting") {
       return { kind: "notice", text: "That answer is already being submitted. Wait for Codex confirmation." };
     }
     if (action.status !== "pending") {
-      return { kind: "notice", text: "That request is no longer pending. Run /pending to review current requests." };
+      return { kind: "notice", text: "That request is no longer pending. Run /cancelanswer to leave answer entry, then /send to select a thread. This message was not sent." };
     }
     return this.recordAnswer(action, draft, text, false);
   }

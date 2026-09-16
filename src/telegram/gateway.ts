@@ -252,6 +252,7 @@ export class TelegramGateway {
           "/log [n] - recent logs",
           "/usage - current token usage",
           "/pending - pending questions and approvals",
+          "/cancelanswer - leave answer entry without answering or sending text",
           "/health - app-server and delivery health",
           "/retrydelivery - retry failed high-signal notifications",
           "/search <term> - search previous Codex sessions",
@@ -328,6 +329,11 @@ export class TelegramGateway {
       }
       await this.sessions.setModel(model);
       await ctx.reply(`Model changed for subsequent turns:\n${model}`);
+    });
+
+    this.bot.command("cancelanswer", async (ctx) => {
+      this.store.clearInteractionDraftsForUser(ctx.chat.id, ctx.from!.id);
+      await ctx.reply("Answer entry cleared. No answer or instruction was sent. Run /send to select a thread, or /pending to answer a pending request.");
     });
 
     this.bot.command("plan", async (ctx) => {

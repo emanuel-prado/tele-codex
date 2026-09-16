@@ -309,6 +309,7 @@ The table has one row for each root command registered with Telegram. Optional a
 | `/log` | Show recent sanitized Event Log entries; accepts a count. |
 | `/usage` | Show the active thread's latest token usage. |
 | `/pending` | Show unresolved Codex questions and approvals. |
+| `/cancelanswer` | Leave question answer entry without submitting anything. Then use `/send` to select a thread, or `/pending` to reopen a request. Also recovers stuck answer entry from earlier versions. |
 | `/health` | Show supervised runtime, app-server, Telegram, and delivery health. |
 | `/retrydelivery` | Requeue failed high-signal notifications. |
 | `/search` | Search previous Codex Threads by term. |
