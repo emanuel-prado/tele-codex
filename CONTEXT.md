@@ -67,6 +67,10 @@ Avoid: remembered Telegram approval, local session grant.
 
 > “Session-level Approval is disabled unless the Controller opts in.”
 
+### Proposed Plan
+
+The finalized plan text emitted by Codex in a plan item, distinct from an Active Turn's progress checklist. Successful completion makes its Telegram continuation choices available for the originating Codex Thread. A choice never implies permission to replay an uncertain implementation request.
+
 ### Transcript
 
 Durable agent-output history intended for the Controller to read or export.

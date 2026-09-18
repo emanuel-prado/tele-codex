@@ -36,6 +36,7 @@ import { createId } from "../utils/ids.js";
 import { TelegramRouting } from "./routing.js";
 import { TelegramCallbackController } from "./callback-controller.js";
 import { TelegramPickerController } from "./picker-controller.js";
+import { TelegramPlanController } from "./plan-controller.js";
 import type { RuntimeHealth, RuntimeHealthReporter } from "../runtime/health.js";
 import { noopRuntimeHealth } from "../runtime/health.js";
 import type { SupervisedSubsystem } from "../runtime/supervisor.js";
@@ -97,8 +98,11 @@ export class TelegramGateway {
     this.routing = new TelegramRouting(store, sessions);
     this.callbacks = new TelegramCallbackController(store);
     this.pickers = new TelegramPickerController(config.workspaceRoot, store, sessions, this.callbacks);
+    this.plans = new TelegramPlanController(config.workspaceRoot, store, sessions, this.callbacks);
     this.registerHandlers();
   }
+
+  private readonly plans: TelegramPlanController;
 
   async startPolling(): Promise<void> {
     await this.sendStartupPicker();
@@ -640,6 +644,17 @@ export class TelegramGateway {
       }
     });
 
+    this.bot.callbackQuery(/^plan:/, async (ctx) => {
+      await ctx.answerCallbackQuery();
+      try {
+        const result = await this.plans.choose(String(ctx.callbackQuery.data).slice(5), { chatId: ctx.chat!.id, userId: ctx.from.id });
+        await ctx.reply(result);
+      } catch (error) {
+        this.logger.warn({ error: sanitizedDeliveryError(error), type: "plan.action.failed" }, "Plan action failed");
+        await ctx.reply(callbackError(error, "Plan action failed. Use /sessions and /send to continue explicitly."));
+      }
+    });
+
     this.bot.callbackQuery(/^send:/, async (ctx) => {
       const token = String(ctx.callbackQuery.data).slice(5);
       const chatId = ctx.chat?.id;
@@ -1153,6 +1168,10 @@ export class TelegramGateway {
   }
 
   private async handleCodexEvent(event: CodexEvent): Promise<void> {
+    if (event.type === "proposedPlan") {
+      this.plans.record(event);
+      return;
+    }
     if (event.type === "agentMessage") {
       this.store.appendTranscript(event.sessionId, event.text, { turnId: event.turnId, itemId: event.itemId });
       const session = this.store.getSession(event.sessionId);
@@ -1195,6 +1214,8 @@ export class TelegramGateway {
 
     if (event.type === "taskCompleted" || event.type === "error" || event.type === "blocked") {
       if (event.type === "taskCompleted") await this.flushAgentMessage(event.sessionId);
+      if (event.type === "taskCompleted" && event.status === "completed" && event.turnId &&
+          this.plans.publish(event.sessionId, event.turnId, this.deliveryChatsForSession(event.sessionId), this.config.controllerUserId, event.sessionVersion)) return;
       const text =
         event.type === "taskCompleted"
           ? `Codex task ${event.status}: ${event.summary}`
@@ -1258,6 +1279,9 @@ export class TelegramGateway {
           if (message.payload.parseMode) options.parse_mode = message.payload.parseMode;
           if (message.payload.keyboard) options.reply_markup = { inline_keyboard: message.payload.keyboard };
           const sent = await this.bot.api.sendMessage(message.chatId, message.payload.text, options as never);
+          if (message.payload.sessionId && this.store.getSession(message.payload.sessionId)) {
+            this.store.setMessageThread(message.chatId, sent.message_id, message.payload.sessionId);
+          }
           this.store.markOutboxSent(message.id);
           this.health.deliverySuccess();
           if (message.actionId) this.store.setTelegramMessage(message.actionId, message.chatId, sent.message_id);

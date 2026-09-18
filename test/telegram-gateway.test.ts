@@ -8,7 +8,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AppConfig } from "../src/config.js";
 import { RuntimeHealth } from "../src/runtime/health.js";
 import { createLogger } from "../src/runtime/logger.js";
-import type { SessionManager } from "../src/runtime/session-manager.js";
+import { SessionManager } from "../src/runtime/session-manager.js";
+import { AppServerAdapter } from "../src/adapters/app-server-adapter.js";
+import { FakeAppServer } from "./support/fake-app-server.js";
 import { PolicyEngine } from "../src/security/policy.js";
 import { Store } from "../src/store/store.js";
 import type { StoredSession } from "../src/store/store.js";
@@ -169,6 +171,82 @@ describe("TelegramGateway dispatch", () => {
     vi.clearAllTimers();
     vi.useRealTimers();
     store.close();
+  });
+
+  it("delivers questions, the finalized plan, and implements from its Telegram card", async () => {
+    runtime = new FakeTelegramRuntime();
+    const server = new FakeAppServer();
+    const config = testConfig();
+    const logger = pino({ level: "silent" });
+    server.respondTo("thread/start", { thread: { id: "plan-thread" }, model: "gpt-test" });
+    let turns = 0;
+    server.respondTo("turn/start", () => ({ turn: { id: `turn-${++turns}` } }));
+    server.respondTo("thread/settings/update", {});
+    const adapter = new AppServerAdapter(config, store, logger, undefined, server);
+    const manager = new SessionManager(adapter, store, logger);
+    const planGateway = new TelegramGateway(config, manager, store, new PolicyEngine(config), logger, undefined, runtime);
+    const session = await manager.newSession({ cwd: "/tmp", prompt: "Plan a change" });
+    store.rememberSessionChat(session.id, 100);
+    const events = adapter.events()[Symbol.asyncIterator]();
+    const forward = async () => {
+      const event = await events.next();
+      if (event.done) throw new Error("missing event");
+      await handleCodexEvent(planGateway, event.value);
+      return event.value;
+    };
+    const click = async (label: string) => {
+      const button = runtime.calls.flatMap((call) => {
+        const keyboard = (call.payload.reply_markup as { inline_keyboard?: Array<Array<{ text: string; callback_data: string }>> } | undefined)?.inline_keyboard;
+        return keyboard?.flat() ?? [];
+      }).filter((entry) => entry.text === label).at(-1);
+      if (!button) throw new Error(`missing ${label} button`);
+      await runtime.bot.handleUpdate(callbackUpdate(button.callback_data, nextUpdateId()));
+    };
+    server.serverRequest(42, "item/tool/requestUserInput", {
+      threadId: "plan-thread", turnId: "turn-1", itemId: "question", isBlocking: true,
+      questions: [{ id: "choice", header: "Choice", question: "Which approach?", isOther: false, isSecret: false, options: [{ label: "A", description: "First" }] }]
+    });
+    const question = await forward();
+    if (question.type !== "questionAsked") throw new Error("missing question");
+    await drainOutbox(planGateway);
+    await click("Answer");
+    await click("A");
+    expect(store.getPendingAction(question.action.id)?.status).toBe("submitting");
+    server.notification("serverRequest/resolved", { threadId: "plan-thread", requestId: 42 });
+    await forward();
+    server.notification("item/plan/delta", { threadId: "plan-thread", turnId: "turn-1", itemId: "plan", delta: "Unfinished draft" });
+    server.notification("item/completed", { threadId: "plan-thread", turnId: "turn-1", completedAtMs: Date.now(), item: { type: "plan", id: "plan", text: "Final reviewed plan" } });
+    server.notification("turn/completed", { threadId: "plan-thread", turn: { id: "turn-1", status: "completed" } });
+    server.notification("turn/completed", { threadId: "plan-thread", turn: { id: "turn-1", status: "completed" } });
+    await forward();
+    await forward();
+    runtime.messageFailures.set(100, { remaining: 1, description: "temporary delivery failure" });
+    await drainOutbox(planGateway);
+    expect(store.outboxCounts().pending).toBe(1);
+    // Retry through the persisted outbox after its backoff.
+    vi.useFakeTimers();
+    vi.setSystemTime(Date.now() + 60_000);
+    await drainOutbox(planGateway);
+    expect(store.outboxCounts().pending).toBe(0);
+    expect(sentTexts(runtime)).toContainEqual(expect.stringContaining("Final reviewed plan"));
+    expect(store.getMessageThread(100, runtime.sentMessageIds.get(100)!)).toBe(session.id);
+    expect(store.getTranscript(session.id)).not.toContain("Unfinished draft");
+    await click("Implement");
+    expect(server.messages("thread/settings/update")[0]?.message).toMatchObject({ params: { threadId: "plan-thread", collaborationMode: { mode: "default" } } });
+    expect(server.messages("turn/start").at(-1)?.message).toMatchObject({ params: { threadId: "plan-thread", input: [{ text: "Implement the following plan:\n\nFinal reviewed plan" }] } });
+    expect(turns).toBe(2);
+    await click("Clear and implement");
+    expect(turns).toBe(2);
+    expect(sentTexts(runtime)).toContainEqual(expect.stringMatching(/used|changed/));
+    adapter.close();
+  });
+
+  it.each(["failed", "interrupted"] as const)("does not offer plan implementation for a %s turn", async (status) => {
+    store.upsertSession({ id: "s", adapter: "appserver", codexThreadId: "t", label: "plan", connectionGeneration: 1 }, "idle");
+    await handleCodexEvent(gateway, { type: "proposedPlan", sessionId: "s", turnId: "t", itemId: "p", text: "Unsuccessful plan", connectionGeneration: 1 });
+    await handleCodexEvent(gateway, { type: "taskCompleted", sessionId: "s", turnId: "t", status, summary: `Turn ${status}.` });
+    expect(store.dueOutbox().some((row) => row.payload.keyboard)).toBe(false);
+    expect(store.proposedPlans.get("s")?.ready).toBe(false);
   });
 
   it.each([

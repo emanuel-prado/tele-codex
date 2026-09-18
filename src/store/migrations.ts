@@ -1,7 +1,7 @@
 import type Database from "better-sqlite3";
 import { RuntimeStateRepository, ThreadRuntimeRepository } from "./repositories.js";
 
-export const CURRENT_SCHEMA_VERSION = 8;
+export const CURRENT_SCHEMA_VERSION = 9;
 
 export interface Migration {
   version: number;
@@ -389,6 +389,19 @@ export const MIGRATIONS: readonly Migration[] = [
         drop table if exists legacy_tmux_observations;
         drop table if exists legacy_tmux_attachments;
       `);
+    }
+  },
+  {
+    version: 9,
+    name: "proposed-plan-handoff",
+    up(db) {
+      db.exec(`create table if not exists proposed_plans (
+        session_id text primary key,
+        data text not null,
+        ready integer not null default 0,
+        used integer not null default 0,
+        recorded_at integer not null
+      )`);
     }
   }
 ];

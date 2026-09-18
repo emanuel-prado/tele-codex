@@ -52,7 +52,7 @@ describe("doctor", () => {
     });
 
     expect(report.checks.find((check) => check.name === "Database integrity")?.detail)
-      .toMatch(/^schema v8, database .* MiB, WAL .* MiB$/);
+      .toMatch(/^schema v9, database .* MiB, WAL .* MiB$/);
   });
 
   it("diagnoses missing configuration without creating runtime state", async () => {
