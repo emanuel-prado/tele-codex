@@ -5,6 +5,8 @@ on:
     - cron: "17 13 * * 1"
   workflow_dispatch:
 
+cache-mode: none
+
 concurrency:
   group: codex-release-compatibility
   cancel-in-progress: false
@@ -12,6 +14,7 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
+    cache-mode: write
     permissions:
       contents: read
     outputs:
@@ -53,6 +56,7 @@ jobs:
     needs: check
     if: needs.check.outputs.classification == 'compatible'
     runs-on: ubuntu-latest
+    cache-mode: read
     permissions:
       contents: read
     steps:
@@ -94,6 +98,7 @@ jobs:
     needs: check
     if: needs.check.outputs.classification == 'incompatible'
     runs-on: ubuntu-latest
+    cache-mode: none
     permissions:
       contents: read
       issues: write

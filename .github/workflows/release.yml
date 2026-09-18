@@ -5,6 +5,8 @@ on:
     branches: [master]
   workflow_dispatch:
 
+cache-mode: none
+
 permissions:
   contents: write
   issues: write

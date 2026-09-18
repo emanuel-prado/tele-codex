@@ -38,4 +38,26 @@ describe("Codex release policy", () => {
       "          token: ${{ secrets.RELEASE_PLEASE_TOKEN }}"
     ].join("\n"));
   });
+
+  it("keeps Actions cache access least-privileged", async () => {
+    const [ci, compatibility, prPolicy, release] = await Promise.all([
+      readFile(new URL("../.github/workflows/ci.yml", import.meta.url), "utf8"),
+      readFile(new URL("../.github/workflows/codex-release-check.yml", import.meta.url), "utf8"),
+      readFile(new URL("../.github/workflows/pr-policy.yml", import.meta.url), "utf8"),
+      readFile(new URL("../.github/workflows/release.yml", import.meta.url), "utf8")
+    ]);
+
+    expect(ci).toContain("\ncache-mode: read\n");
+    expect(prPolicy).toContain("\ncache-mode: none\n");
+    expect(release).toContain("\ncache-mode: none\n");
+    expect(compatibility).toContain("\ncache-mode: none\n");
+
+    const checkJob = compatibility.split("\n  check:\n", 2)[1]?.split("\n  compatible:\n", 1)[0] ?? "";
+    const compatibleJob = compatibility.split("\n  compatible:\n", 2)[1]?.split("\n  incompatible:\n", 1)[0] ?? "";
+    const incompatibleJob = compatibility.split("\n  incompatible:\n", 2)[1] ?? "";
+
+    expect(checkJob).toContain("\n    cache-mode: write\n");
+    expect(compatibleJob).toContain("\n    cache-mode: read\n");
+    expect(incompatibleJob).toContain("\n    cache-mode: none\n");
+  });
 });
