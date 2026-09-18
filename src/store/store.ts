@@ -803,6 +803,11 @@ export class Store {
   }
 
   private scrubTerminalAction(actionId: string, status: "resolved" | "expired" | "cancelled" | "orphaned"): void {
+    // A confirmed submission ends answer routing. Keep unsubmitted drafts as
+    // guards against forwarding late answers after Codex resolves a question.
+    if (status === "resolved" && this.getPendingAction(actionId)?.status === "submitting") {
+      this.deleteInteractionDraft(actionId);
+    }
     this.db.prepare(
       "update pending_actions set status = ?, body = '', payload_json = '{}', failure_reason = null, resolved_at = ? where id = ?"
     ).run(status, Date.now(), actionId);
