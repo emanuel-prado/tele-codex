@@ -108,7 +108,7 @@ describe("Store reliability state", () => {
     store.resolvePendingAction(sensitive.id, "resolved");
 
     expect(store.getPendingAction(sensitive.id)).toMatchObject({ status: "resolved", body: "", payload: {} });
-    expect(store.getInteractionDraft(sensitive.id, 1, 2)?.answers).toEqual({});
+    expect(store.getInteractionDraft(sensitive.id, 1, 2)).toBeUndefined();
     expect(store.claimCallbackToken("sensitive-control", 1, 2, "claim")?.payload).toEqual({});
     store.close();
   });

@@ -21,6 +21,7 @@ export const TELEGRAM_COMMAND_CATALOG: readonly TelegramCommandDefinition[] = [
   { command: "log", description: "Show recent session log" },
   { command: "usage", description: "Show active session token usage" },
   { command: "pending", description: "Show pending Codex interactions" },
+  { command: "cancelanswer", description: "Leave question answer entry without sending" },
   { command: "health", description: "Show unattended-operation health" },
   { command: "retrydelivery", description: "Retry failed notifications" },
   { command: "search", description: "Search previous Codex sessions" },

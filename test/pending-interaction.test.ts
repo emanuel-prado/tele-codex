@@ -1,9 +1,41 @@
 import { describe, expect, it } from "vitest";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { PendingInteractionManager } from "../src/telegram/pending-interaction.js";
 import { Store } from "../src/store/store.js";
 import type { PendingAction } from "../src/types/events.js";
 
 describe("PendingInteractionManager", () => {
+  it("keeps confirmed answer routes released after reopening the store", () => {
+    const path = join(mkdtempSync(join(tmpdir(), "tele-codex-answer-")), "store.db");
+    const initial = new Store(path);
+    const action = questionAction();
+    initial.putPendingAction(action);
+    initial.putInteractionDraft(awaitingDraft(action.id));
+    initial.claimPendingAction(action.id);
+    initial.resolvePendingAction(action.id, "resolved");
+    initial.close();
+    const reopened = new Store(path);
+    expect(new PendingInteractionManager(reopened, true).handleText(10, 20, "Implement")).toBeUndefined();
+    reopened.close();
+  });
+  it("releases completed button-answer routes only after Codex confirmation", async () => {
+    const store = new Store(":memory:");
+    const action = questionAction();
+    store.putPendingAction(action);
+    const manager = new PendingInteractionManager(store, true);
+    const submit = async () => { store.claimPendingAction(action.id); };
+    const first = await manager.handleCallback(callback(manager.actionView(action, 10, 20)), { chatId: 10, userId: 20 }, submit);
+    const second = await manager.handleCallback(callbackWithLabel(first, "A"), { chatId: 10, userId: 20 }, submit);
+    await manager.handleCallback(callbackWithLabel(second, "B"), { chatId: 10, userId: 20 }, submit);
+    expect(manager.handleText(10, 20, "duplicate answer")).toMatchObject({ kind: "notice" });
+    store.resolvePendingAction(action.id, "resolved");
+    expect(manager.handleText(10, 20, "Implement the plan")).toBeUndefined();
+    expect(store.getInteractionDraft(action.id, 10, 20)).toBeUndefined();
+    store.close();
+  });
+
   it("collects several questions and submits one answer map", async () => {
     const store = new Store(":memory:");
     const action = questionAction();
@@ -219,6 +251,8 @@ describe("PendingInteractionManager", () => {
       kind: "notice",
       text: expect.stringMatching(/already being submitted/i)
     });
+    store.resolvePendingAction(action.id, "resolved");
+    expect(manager.handleText(10, 20, "Implement the plan")).toBeUndefined();
     store.close();
   });
 });

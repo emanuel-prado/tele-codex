@@ -309,6 +309,25 @@ describe("TelegramGateway dispatch", () => {
     expect(sentTexts(runtime)).toContain("Attached app-server thread:\nsession_1");
   });
 
+  it("explicitly exits a persisted terminal answer route without forwarding the rejected message", async () => {
+    const session = store.upsertSession({ id: "session_1", adapter: "appserver", label: "one", codexThreadId: "thread_1" }, "idle");
+    store.setStickyRoute(100, 100, session.id);
+    const action: PendingAction = { id: "old-question", kind: "question", sessionId: session.id, title: "Question", body: "", payload: {}, expiresAt: Date.now() + 60_000 };
+    store.putPendingAction(action);
+    store.resolvePendingAction(action.id, "resolved");
+    store.putInteractionDraft({ actionId: action.id, chatId: 100, userId: 100, questionIndex: 1, answers: {}, awaitingText: true });
+    store.putInteractionDraft({ actionId: action.id, chatId: 200, userId: 100, questionIndex: 1, answers: {}, awaitingText: true });
+    await runtime.bot.handleUpdate(messageUpdate("Implement the plan", nextUpdateId()));
+    expect(forwardedText).toEqual([]);
+    expect(sentTexts(runtime)).toContainEqual(expect.stringContaining("/cancelanswer"));
+    await runtime.bot.handleUpdate(messageUpdate("/cancelanswer", nextUpdateId()));
+    expect(store.getAwaitingInteractionDraft(100, 100)).toBeUndefined();
+    expect(store.getAwaitingInteractionDraft(200, 100)).toBeDefined();
+    expect(forwardedText).toEqual([]);
+    await runtime.bot.handleUpdate(messageUpdate("Implement the plan", nextUpdateId()));
+    expect(forwardedText).toEqual(["Implement the plan"]);
+  });
+
   it("passes only the canonical contained workspace path to session launch", async () => {
     const parent = await mkdtemp(join(tmpdir(), "tele-codex-gateway-workspace-"));
     const project = join(parent, "project");
