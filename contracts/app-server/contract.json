@@ -1,6 +1,6 @@
 {
-  "codexVersion": "codex-cli 0.154.0",
-  "generatedAt": "2026-09-11",
+  "codexVersion": "codex-cli 0.155.1",
+  "generatedAt": "2026-09-21",
   "clientMethods": [
     "account/rateLimits/read",
     "initialize",
@@ -52,7 +52,6 @@
     "turn/started",
     "warning"
   ],
-  "planItemFields": ["id", "text", "type"],
   "requiredFields": {
     "v2/ItemCompletedNotification.json": [
       "completedAtMs",
@@ -110,5 +109,10 @@
     "v2/TurnStartResponse.json": [
       "turn"
     ]
-  }
+  },
+  "planItemFields": [
+    "id",
+    "text",
+    "type"
+  ]
 }
