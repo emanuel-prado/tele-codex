@@ -1,6 +1,6 @@
 {
-  "codexVersion": "codex-cli 0.148.0",
-  "generatedAt": "2026-08-19",
+  "codexVersion": "codex-cli 0.158.0",
+  "generatedAt": "2026-09-28",
   "clientMethods": [
     "account/rateLimits/read",
     "initialize",
@@ -37,6 +37,8 @@
     "error",
     "guardianWarning",
     "item/agentMessage/delta",
+    "item/completed",
+    "item/plan/delta",
     "model/rerouted",
     "serverRequest/resolved",
     "thread/goal/cleared",
@@ -51,6 +53,18 @@
     "warning"
   ],
   "requiredFields": {
+    "v2/ItemCompletedNotification.json": [
+      "completedAtMs",
+      "item",
+      "threadId",
+      "turnId"
+    ],
+    "v2/PlanDeltaNotification.json": [
+      "delta",
+      "itemId",
+      "threadId",
+      "turnId"
+    ],
     "CommandExecutionRequestApprovalParams.json": [
       "itemId",
       "startedAtMs",
@@ -95,5 +109,10 @@
     "v2/TurnStartResponse.json": [
       "turn"
     ]
-  }
+  },
+  "planItemFields": [
+    "id",
+    "text",
+    "type"
+  ]
 }

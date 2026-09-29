@@ -1,6 +1,20 @@
 # App-server contract testing
 
-The checked fixture in `contracts/app-server/contract.json` records the Codex CLI version, every app-server method tele-codex calls or handles, and the required fields of critical lifecycle messages. It currently targets Codex CLI 0.148.0, including the required `isBlocking` field on `ToolRequestUserInputParams`. `npm run contract:check` regenerates TypeScript and JSON schemas from the installed experimental app-server API and rejects missing methods or changed required shapes. Use `npm run contract:refresh` only for an intentional Codex upgrade, then review the protocol changes and update `APP_SERVER_CONTRACT_VERSION`.
+The checked fixture in `contracts/app-server/contract.json` records the Codex CLI version, every app-server method tele-codex calls or handles, and the required fields of critical lifecycle messages. Its `codexVersion` field names the exact tested CLI release. `npm run contract:check` regenerates TypeScript and JSON schemas from the installed experimental app-server API and rejects missing methods or changed required shapes. Use `npm run contract:refresh` only for an intentional Codex upgrade, then review the protocol changes and update `APP_SERVER_CONTRACT_VERSION`.
+
+## Automated stable-release checks
+
+The `Codex release compatibility` GitHub Actions workflow checks for updates every Monday at 13:17 UTC and can also be started with **Run workflow**. It reads all published `@openai/codex` versions, ignores invalid versions and versions with prerelease suffixes, and compares the newest stable version with the checked contract version. It requires no Codex or Telegram credentials. The compatible path uses the repository's existing `RELEASE_PLEASE_TOKEN` only to push its update branch and open the draft pull request; using that automation credential also allows the pull request's normal checks to run.
+
+When a newer stable version exists, the workflow installs that exact package version into a temporary npm prefix and runs the repository contract checker against its generated app-server protocol. The temporary installation is removed after the check.
+
+- A compatible contract is refreshed intentionally and passed through `npm run typecheck`, `npm test`, `npm run build`, and `npm run contract:fixture`. The workflow then creates one draft pull request for that release, or reuses the existing release branch or pull request without overwriting it.
+- An incompatible contract leaves the checked fixture untouched. The workflow uploads the checker report and creates one compatibility issue per release containing the old and new versions, the differences, and the workflow-run link. Later runs add a run-specific update to that issue while preserving human edits.
+- If the checked version is already current, the workflow records a successful no-update result and makes no repository change.
+
+The workflow serializes runs to avoid races. Registry values are validated as stable semantic versions and passed to child processes as argument-array values, not executable shell text. Its check, pull-request, and issue paths have separate least-privilege permissions.
+
+To recover from an installation, registry, or transient GitHub failure, open the failed run, download the `codex-release-result` artifact when one exists, correct the external failure, and manually rerun the workflow. A failed compatible verification does not publish a pull request. If a compatible release branch was pushed before pull-request creation failed, the next run opens the draft pull request from that existing branch rather than replacing it. Resolve protocol incompatibilities in the linked issue; after adapting the runtime contract, use **Run workflow** again to confirm the release.
 
 CI runs `npm run contract:fixture`, which compares the adapter's method registry and reported version with the checked fixture without requiring Codex. The default test suite does not need Codex, Telegram, credentials, or network access. Its lifecycle coverage is split by ownership:
 

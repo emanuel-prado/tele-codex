@@ -95,7 +95,7 @@ describe("versioned SQLite storage", () => {
       );
     `);
 
-    expect(migrateDatabase(db)).toBe(8);
+    expect(migrateDatabase(db)).toBe(9);
     expect(db.prepare("select token, action_id, resource_kind, expected_version, user_id from callback_tokens order by token").all()).toEqual([
       { token: "owned", action_id: "b", resource_kind: "legacy", expected_version: null, user_id: 20 },
       { token: "project", action_id: "/workspace/one", resource_kind: "workspace-project", expected_version: 42, user_id: 20 }
@@ -127,7 +127,7 @@ describe("versioned SQLite storage", () => {
     }
     if (tables().has("callback_tokens")) insertLegacyCallback(db);
 
-    expect(migrateDatabase(db)).toBe(8);
+    expect(migrateDatabase(db)).toBe(9);
     expect(tables().has("legacy_tmux_attachments")).toBe(false);
     expect(tables().has("legacy_tmux_observations")).toBe(false);
     expect(db.prepare(`select count(*) as count from callback_tokens
@@ -278,7 +278,7 @@ describe("versioned SQLite storage", () => {
     expect(store.claimCallbackToken("active-control", 1, 2, "claim")).toBeUndefined();
     expect(store.dueOutbox()).toHaveLength(1);
     expect(store.outboxCounts()).toEqual({ pending: 1, failed: 1 });
-    expect(store.diagnostics()).toMatchObject({ schemaVersion: 8, walBytes: 0 });
+    expect(store.diagnostics()).toMatchObject({ schemaVersion: 9, walBytes: 0 });
     store.close();
   });
 

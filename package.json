@@ -22,6 +22,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "check:pr-policy": "node --experimental-strip-types scripts/pr-policy.ts",
+    "check:codex-release": "node --experimental-strip-types scripts/codex-release.ts check",
     "contract:check": "node scripts/appserver-contract.mjs",
     "contract:fixture": "node scripts/appserver-contract.mjs --fixture-only",
     "contract:refresh": "node scripts/appserver-contract.mjs --refresh",
