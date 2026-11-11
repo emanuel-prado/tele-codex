@@ -1,6 +1,6 @@
 {
-  "codexVersion": "codex-cli 0.166.0",
-  "generatedAt": "2026-11-02",
+  "codexVersion": "codex-cli 0.167.0",
+  "generatedAt": "2026-11-09",
   "clientMethods": [
     "account/rateLimits/read",
     "initialize",
