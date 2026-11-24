@@ -1,2 +1,2 @@
-export const APP_SERVER_CONTRACT_VERSION = "codex-cli 0.169.0";
+export const APP_SERVER_CONTRACT_VERSION = "codex-cli 0.172.0";
 
